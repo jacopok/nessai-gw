@@ -40,9 +40,30 @@ The reference phase ``phase`` is unchanged by every element.  The four
 rotations and the two reflection states give ``4 x 2 = 8`` elements; the
 group is :math:`\\mathbb{Z}_4 \\times \\mathbb{Z}_2` (abelian).
 
+Unlike LISA, a ground-based triangle sits at an appreciable offset
+``r_ET`` from the geocenter, so the sky degeneracy is only a degeneracy of
+the *detector-frame* arrival time, not of the geocentric time ``geocent_time``
+that bilby samples.  With ``n`` the unit vector towards the source,
+
+    geocent_time = t_det + (n . r_ET) / c
+
+(Eq. 22 of Santoliquido et al. 2025, arXiv:2504.21087), so every element of
+the group -- and in particular the plane reflection, which sends
+``n . r_ET -> -n . r_ET`` for a near-radial site and thus produces the
+bimodal ``geocent_time`` posterior of that paper -- must carry
+``geocent_time`` along by the change in the geocenter-to-detector delay::
+
+    geocent_time -> geocent_time + delay(n) - delay(n')
+
+where ``n'`` is the transformed source direction and
+``delay(n) = -(n . r_ET) / c`` is bilby's ``time_delay_from_geocenter``.  This is an additive shift
+that depends only on the (already transformed) sky position, so it leaves the
+Jacobian of the whole action equal to one.
+
 The transformations act on the *geocentric* parameters used by bilby, but in
 the measure-preserving coordinates ``ra``, ``sin_dec`` (``= sin(dec)``),
-``cos_theta_jn`` (``= cos(theta_jn)``), ``psi`` and ``phase``.  The sky
+``cos_theta_jn`` (``= cos(theta_jn)``), ``psi``, ``phase`` and
+``geocent_time``.  The sky
 rotations/reflection are isometries of the sphere, so they preserve
 ``d(ra) d(sin_dec)``; the reflection sends ``cos_theta_jn -> -cos_theta_jn``;
 and ``psi`` only picks up constant shifts and a sign flip.  The whole action
@@ -71,10 +92,29 @@ logger = nessai_logger.getChild(__name__)
 #: are the *measure-preserving* coordinates: ``sin_dec = sin(dec)`` and
 #: ``cos_theta_jn = cos(theta_jn)`` rather than the raw angles, so the action
 #: has unit Jacobian (see the module docstring).
-ET_TRIANGLE_PARAMETERS = ["ra", "sin_dec", "cos_theta_jn", "psi", "phase"]
+ET_TRIANGLE_PARAMETERS = [
+    "ra",
+    "sin_dec",
+    "cos_theta_jn",
+    "psi",
+    "phase",
+    "geocent_time",
+]
 
 #: Number of group elements.
 ET_TRIANGLE_GROUP_SIZE = 8
+
+#: Speed of light in m / s (CODATA / bilby ``speed_of_light``).
+_SPEED_OF_LIGHT = 299792458.0
+
+#: Geocentric position (metres, Earth-fixed frame) of the ``ET-EMR`` site,
+#: WGS84 geodetic ``(lat, lon, height) = (50 deg 43' 23", 5 deg 55' 14", 0)``.
+#: Used to convert between the detector-frame arrival time and bilby's
+#: ``geocent_time``.  Recompute with :func:`detector_vertex` for a different
+#: geometry.
+ET_EMR_VERTEX = np.array(
+    [4024345.21150611, 417334.87759012, 4914098.18878217]
+)
 
 #: Unit normal to the ET-EMR detector plane in the Earth-fixed (geocentric)
 #: frame, ``mean_i normalise(x_arm_i x y_arm_i)`` for the three nested
@@ -111,6 +151,52 @@ def detector_plane_normal(interferometers) -> np.ndarray:
         normals.append(n / np.linalg.norm(n))
     n = np.mean(normals, axis=0)
     return n / np.linalg.norm(n)
+
+
+def detector_vertex(interferometers) -> np.ndarray:
+    """Mean geocentric vertex position (metres) of a triangular interferometer.
+
+    Parameters
+    ----------
+    interferometers : iterable
+        Iterable of bilby / bilby_xG ``Interferometer`` objects, each exposing
+        ``geometry.vertex`` (its Earth-fixed position in metres).
+
+    Returns
+    -------
+    numpy.ndarray
+        The mean of the three vertex positions.
+    """
+    vertices = [
+        np.asarray(ifo.geometry.vertex, dtype=float) for ifo in interferometers
+    ]
+    return np.mean(vertices, axis=0)
+
+
+def detector_vertex_from_geodetic(
+    latitude: float, longitude: float, height: float = 0.0
+) -> np.ndarray:
+    """Earth-fixed position (metres) from WGS84 geodetic coordinates.
+
+    Parameters
+    ----------
+    latitude, longitude : float
+        Geodetic latitude and longitude in radians.
+    height : float, optional
+        Height above the WGS84 ellipsoid in metres (default 0).
+    """
+    a = 6378137.0
+    f = 1.0 / 298.257223563
+    e2 = f * (2.0 - f)
+    sin_lat = np.sin(latitude)
+    n = a / np.sqrt(1.0 - e2 * sin_lat**2)
+    return np.array(
+        [
+            (n + height) * np.cos(latitude) * np.cos(longitude),
+            (n + height) * np.cos(latitude) * np.sin(longitude),
+            (n * (1.0 - e2) + height) * sin_lat,
+        ]
+    )
 
 
 def _greenwich_mean_sidereal_time(gps_time: float) -> float:
@@ -180,12 +266,17 @@ class ETTriangleGroupAction:
         Unit normal to the detector plane in the Earth-fixed frame.  Defaults
         to :data:`ET_EMR_PLANE_NORMAL`.  Use :func:`detector_plane_normal` to
         build one from a bilby interferometer list.
+    vertex : array_like, optional
+        Geocentric position of the detector (metres, Earth-fixed frame), used
+        to carry ``geocent_time`` along with the sky transformation.  Defaults
+        to :data:`ET_EMR_VERTEX`.  Use :func:`detector_vertex` to build one
+        from a bilby interferometer list.
     """
 
     parameters = ET_TRIANGLE_PARAMETERS
     group_size = ET_TRIANGLE_GROUP_SIZE
 
-    def __init__(self, reference_time, plane_normal=None):
+    def __init__(self, reference_time, plane_normal=None, vertex=None):
         self.reference_time = float(reference_time)
         self.gmst = _greenwich_mean_sidereal_time(self.reference_time)
         if plane_normal is None:
@@ -193,6 +284,10 @@ class ETTriangleGroupAction:
         self.plane_normal = np.asarray(plane_normal, dtype=float)
         self._basis_np = _detector_frame_basis(self.plane_normal)
         self._basis = torch.as_tensor(self._basis_np, dtype=torch.float64)
+        if vertex is None:
+            vertex = ET_EMR_VERTEX
+        self.vertex = np.asarray(vertex, dtype=float)
+        self._vertex = torch.as_tensor(self.vertex, dtype=torch.float64)
 
     # -- coordinate maps ------------------------------------------------
 
@@ -229,6 +324,22 @@ class ETTriangleGroupAction:
         psi = torch.remainder(_polarisation_angle(m, u, v), np.pi)
         return ra, dec, psi
 
+    def _geocenter_delay(self, ra, dec):
+        """Geocenter-to-detector light-travel delay ``t_det - geocent_time``.
+
+        Equal to ``-(n . r_ET) / c`` with ``n`` the unit vector towards the
+        source, matching bilby's ``time_delay_from_geocenter`` convention.
+        """
+        vertex = self._vertex.to(ra.dtype)
+        phi = ra - self.gmst
+        theta = 0.5 * np.pi - dec
+        st = torch.sin(theta)
+        n = torch.stack(
+            [st * torch.cos(phi), st * torch.sin(phi), torch.cos(theta)],
+            dim=-1,
+        )
+        return -(n * vertex).sum(-1) / _SPEED_OF_LIGHT
+
     # -- group action -------------------------------------------------
 
     @staticmethod
@@ -252,6 +363,7 @@ class ETTriangleGroupAction:
         psi = point_dict["psi"]
         cos_theta_jn = point_dict["cos_theta_jn"]
         phase = point_dict["phase"]
+        geocent_time = point_dict["geocent_time"]
 
         dec = torch.asin(torch.clamp(sin_dec, -1.0, 1.0))
 
@@ -275,12 +387,22 @@ class ETTriangleGroupAction:
 
         ra_t, dec_t, psi_t = self._from_frame(lam_f, beta_f, psi_f)
 
+        # The sky degeneracy fixes the detector-frame arrival time, not the
+        # geocentric one: shift geocent_time by the change in the
+        # geocenter-to-detector delay (Santoliquido et al. 2025, Eq. 22).
+        geocent_time_t = (
+            geocent_time
+            + self._geocenter_delay(ra, dec)
+            - self._geocenter_delay(ra_t, dec_t)
+        )
+
         return {
             "ra": ra_t,
             "sin_dec": torch.sin(dec_t),
             "cos_theta_jn": cos_theta_jn,
             "psi": psi_t,
             "phase": phase,
+            "geocent_time": geocent_time_t,
         }
 
     def in_fundamental_domain(self, point_dict: dict) -> torch.Tensor:
@@ -299,7 +421,7 @@ class ETTriangleGroupAction:
 
 
 def make_et_triangle_group_mixture_flow(
-    reference_time, plane_normal=None, parameters=None
+    reference_time, plane_normal=None, vertex=None, parameters=None
 ):
     """Build a group-mixture ``FlowModel`` class for a triangular detector.
 
@@ -314,6 +436,9 @@ def make_et_triangle_group_mixture_flow(
     plane_normal : array_like, optional
         Earth-fixed unit normal to the detector plane; defaults to
         :data:`ET_EMR_PLANE_NORMAL`.
+    vertex : array_like, optional
+        Geocentric detector position (metres); defaults to
+        :data:`ET_EMR_VERTEX`.
     parameters : list of str, optional
         Override the acted-on parameter names/order (default
         :data:`ET_TRIANGLE_PARAMETERS`).  The flow must be given exactly
@@ -329,7 +454,9 @@ def make_et_triangle_group_mixture_flow(
     from nessai.flowmodel.group_mixture import make_group_mixture_flow
 
     action = ETTriangleGroupAction(
-        reference_time=reference_time, plane_normal=plane_normal
+        reference_time=reference_time,
+        plane_normal=plane_normal,
+        vertex=vertex,
     )
     names = list(parameters) if parameters is not None else action.parameters
     return make_group_mixture_flow(

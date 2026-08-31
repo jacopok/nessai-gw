@@ -40,6 +40,9 @@ def random_points():
         "cos_theta_jn": torch.as_tensor(rng.uniform(-1, 1, n)),
         "psi": torch.as_tensor(rng.uniform(0, np.pi, n)),
         "phase": torch.as_tensor(rng.uniform(0, 2 * np.pi, n)),
+        "geocent_time": torch.as_tensor(
+            REFERENCE_TIME + rng.uniform(-0.1, 0.1, n)
+        ),
     }
 
 
@@ -50,6 +53,7 @@ METRICS = {
     "cos_theta_jn": ("lin", None),
     "psi": ("circ", np.pi),
     "phase": ("circ", 2 * np.pi),
+    "geocent_time": ("lin", None),
 }
 
 
@@ -66,7 +70,7 @@ def _np(d):
     return {k: v.numpy() for k, v in d.items()}
 
 
-def _to_coords(ra, dec, psi, theta_jn, phase):
+def _to_coords(ra, dec, psi, theta_jn, phase, geocent_time=REFERENCE_TIME):
     """Physical angles -> the measure-preserving coordinates of the action."""
     return {
         "ra": np.asarray(ra),
@@ -74,6 +78,9 @@ def _to_coords(ra, dec, psi, theta_jn, phase):
         "cos_theta_jn": np.cos(theta_jn),
         "psi": np.asarray(psi),
         "phase": np.asarray(phase),
+        "geocent_time": np.broadcast_to(
+            np.asarray(geocent_time, dtype=float), np.shape(ra)
+        ).copy(),
     }
 
 
@@ -86,6 +93,7 @@ def test_metadata(action):
         "cos_theta_jn",
         "psi",
         "phase",
+        "geocent_time",
     ]
     assert np.isclose(np.linalg.norm(action.plane_normal), 1.0)
 
@@ -322,6 +330,66 @@ def test_long_wavelength_response_invariance():
             phase = float(out["phase"])
             c1 = coeffs(ra, dec, psi, iota, phase)
             assert np.abs(c1 - c0).max() / np.abs(c0).max() < 0.02
+
+
+@pytest.mark.requires("bilby")
+def test_geocent_time_preserves_detector_arrival_time():
+    """Each element carries geocent_time so the arrival time at the ET
+    vertex is unchanged (Santoliquido et al. 2025, Eq. 22)."""
+    import bilby
+
+    from nessai_gw.group_mixture import detector_plane_normal, detector_vertex
+
+    ifos = bilby.gw.detector.InterferometerList(["ET"])
+    vertex = detector_vertex(ifos)
+    action = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME,
+        plane_normal=detector_plane_normal(ifos),
+        vertex=vertex,
+    )
+
+    def arrival(ra, dec, t):
+        # geocenter -> ET vertex light-travel, bilby convention.
+        gmst = action.gmst
+        theta, phi = np.pi / 2 - dec, ra - gmst
+        n = np.array(
+            [
+                np.sin(theta) * np.cos(phi),
+                np.sin(theta) * np.sin(phi),
+                np.cos(theta),
+            ]
+        )
+        return t - np.dot(n, vertex) / 299792458.0
+
+    rng = np.random.default_rng(3)
+    for _ in range(30):
+        ra = rng.uniform(0, 2 * np.pi)
+        dec = np.arcsin(rng.uniform(-1, 1))
+        t = REFERENCE_TIME + rng.uniform(-0.05, 0.05)
+        pt = {
+            k: torch.tensor([v], dtype=torch.float64)
+            for k, v in {
+                "ra": ra,
+                "sin_dec": np.sin(dec),
+                "cos_theta_jn": 0.3,
+                "psi": 1.0,
+                "phase": 2.0,
+                "geocent_time": t,
+            }.items()
+        }
+        t0 = arrival(ra, dec, t)
+        flipped = False
+        for g in range(ET_TRIANGLE_GROUP_SIZE):
+            out = action(pt, torch.tensor([g]))
+            ra_t = float(out["ra"])
+            dec_t = float(np.arcsin(np.clip(float(out["sin_dec"]), -1, 1)))
+            t_t = float(out["geocent_time"])
+            # the single-triangle sky degeneracy is only approximate for a
+            # real (finite-size) detector, like the antenna response itself.
+            assert abs(arrival(ra_t, dec_t, t_t) - t0) < 1e-3
+            if abs(t_t - t) > 1e-4:
+                flipped = True
+        assert flipped, "reflection should shift geocent_time"
 
 
 def test_make_flow_factory():

@@ -40,6 +40,7 @@ def main() -> None:
         "cos_theta_jn": np.cos(post["theta_jn"]),
         "psi": np.asarray(post["psi"]),
         "phase": np.asarray(post["phase"]),
+        "geocent_time": np.asarray(post["geocent_time"]),
     }
     tp = {k: torch.as_tensor(coords[k]) for k in keys}
 
