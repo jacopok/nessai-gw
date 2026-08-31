@@ -40,11 +40,22 @@ The reference phase ``phase`` is unchanged by every element.  The four
 rotations and the two reflection states give ``4 x 2 = 8`` elements; the
 group is :math:`\\mathbb{Z}_4 \\times \\mathbb{Z}_2` (abelian).
 
-The transformations act on the *geocentric* parameters used by bilby
-(``ra``, ``dec``, ``psi``, ``theta_jn``, ``phase``).  They are carried into
-the detector-plane frame, transformed there, and carried back, using exactly
-bilby's polarisation-tensor convention (Nishizawa et al. 2009), so a
-transformed point reproduces the antenna response of the original one.
+The transformations act on the *geocentric* parameters used by bilby, but in
+the measure-preserving coordinates ``ra``, ``sin_dec`` (``= sin(dec)``),
+``cos_theta_jn`` (``= cos(theta_jn)``), ``psi`` and ``phase``.  The sky
+rotations/reflection are isometries of the sphere, so they preserve
+``d(ra) d(sin_dec)``; the reflection sends ``cos_theta_jn -> -cos_theta_jn``;
+and ``psi`` only picks up constant shifts and a sign flip.  The whole action
+therefore has unit Jacobian in these coordinates -- which is what
+:class:`nessai.flowmodel.group_mixture.DiscreteGroupMixtureFlowWrapper`
+assumes (it treats the action as measure-preserving).  In the raw angles
+``dec`` / ``theta_jn`` it would *not* be, and the omitted ``cos(dec)`` /
+``sin(theta_jn)`` factors wreck the importance weights.
+
+Points are carried into the detector-plane frame, transformed there, and
+carried back, using exactly bilby's polarisation-tensor convention (Nishizawa
+et al. 2009), so a transformed point reproduces the antenna response of the
+original one.
 """
 
 from __future__ import annotations
@@ -56,8 +67,11 @@ from . import nessai_logger
 
 logger = nessai_logger.getChild(__name__)
 
-#: Parameters the group acts on, in the order expected by the flow.
-ET_TRIANGLE_PARAMETERS = ["ra", "dec", "psi", "theta_jn", "phase"]
+#: Parameters the group acts on, in the order expected by the flow.  These
+#: are the *measure-preserving* coordinates: ``sin_dec = sin(dec)`` and
+#: ``cos_theta_jn = cos(theta_jn)`` rather than the raw angles, so the action
+#: has unit Jacobian (see the module docstring).
+ET_TRIANGLE_PARAMETERS = ["ra", "sin_dec", "cos_theta_jn", "psi", "phase"]
 
 #: Number of group elements.
 ET_TRIANGLE_GROUP_SIZE = 8
@@ -234,10 +248,12 @@ class ETTriangleGroupAction:
     def __call__(self, point_dict: dict, modes, inverse: bool = False) -> dict:
         """Apply the group element ``modes`` (or its inverse) to each point."""
         ra = point_dict["ra"]
-        dec = point_dict["dec"]
+        sin_dec = point_dict["sin_dec"]
         psi = point_dict["psi"]
-        theta_jn = point_dict["theta_jn"]
+        cos_theta_jn = point_dict["cos_theta_jn"]
         phase = point_dict["phase"]
+
+        dec = torch.asin(torch.clamp(sin_dec, -1.0, 1.0))
 
         modes = torch.as_tensor(modes, device=ra.device)
         if inverse:
@@ -251,15 +267,19 @@ class ETTriangleGroupAction:
         lam_f = lam_f + quarter
         beta_f = torch.where(reflected, -beta_f, beta_f)
         psi_f = torch.where(reflected, np.pi - psi_f, psi_f) + quarter
-        theta_jn = torch.where(reflected, np.pi - theta_jn, theta_jn)
+        # theta_jn -> pi - theta_jn under a reflection, i.e. a sign flip of
+        # cos(theta_jn) -- unit Jacobian in this coordinate.
+        cos_theta_jn = torch.where(
+            reflected, -cos_theta_jn, cos_theta_jn
+        )
 
         ra_t, dec_t, psi_t = self._from_frame(lam_f, beta_f, psi_f)
 
         return {
             "ra": ra_t,
-            "dec": dec_t,
+            "sin_dec": torch.sin(dec_t),
+            "cos_theta_jn": cos_theta_jn,
             "psi": psi_t,
-            "theta_jn": theta_jn,
             "phase": phase,
         }
 
@@ -270,8 +290,9 @@ class ETTriangleGroupAction:
         ``[0, pi / 2)`` and which sits on the ``beta >= 0`` side of the
         detector plane -- exactly one of the eight images of a generic point.
         """
+        dec = torch.asin(torch.clamp(point_dict["sin_dec"], -1.0, 1.0))
         lam_f, beta_f, _ = self._to_frame(
-            point_dict["ra"], point_dict["dec"], point_dict["psi"]
+            point_dict["ra"], dec, point_dict["psi"]
         )
         in_quarter = torch.remainder(lam_f, _TWO_PI) < 0.5 * np.pi
         return in_quarter & (beta_f >= 0.0)

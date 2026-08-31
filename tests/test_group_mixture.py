@@ -36,34 +36,57 @@ def random_points():
     n = 5000
     return {
         "ra": torch.as_tensor(rng.uniform(0, 2 * np.pi, n)),
-        "dec": torch.as_tensor(np.arcsin(rng.uniform(-1, 1, n))),
+        "sin_dec": torch.as_tensor(rng.uniform(-1, 1, n)),
+        "cos_theta_jn": torch.as_tensor(rng.uniform(-1, 1, n)),
         "psi": torch.as_tensor(rng.uniform(0, np.pi, n)),
-        "theta_jn": torch.as_tensor(np.arccos(rng.uniform(-1, 1, n))),
         "phase": torch.as_tensor(rng.uniform(0, 2 * np.pi, n)),
     }
 
 
-def _ang_dist(a, b, period):
-    d = np.abs(np.asarray(a) - np.asarray(b)) % period
-    return np.minimum(d, period - d)
-
-
-PERIODS = {
-    "ra": 2 * np.pi,
-    "dec": np.pi,
-    "psi": np.pi,
-    "theta_jn": np.pi,
-    "phase": 2 * np.pi,
+# How to compare each acted-on coordinate: circular (with period) or linear.
+METRICS = {
+    "ra": ("circ", 2 * np.pi),
+    "sin_dec": ("lin", None),
+    "cos_theta_jn": ("lin", None),
+    "psi": ("circ", np.pi),
+    "phase": ("circ", 2 * np.pi),
 }
+
+
+def _dist(key, a, b):
+    kind, period = METRICS[key]
+    d = np.abs(np.asarray(a) - np.asarray(b))
+    if kind == "lin":
+        return d
+    d = d % period
+    return np.minimum(d, period - d)
 
 
 def _np(d):
     return {k: v.numpy() for k, v in d.items()}
 
 
+def _to_coords(ra, dec, psi, theta_jn, phase):
+    """Physical angles -> the measure-preserving coordinates of the action."""
+    return {
+        "ra": np.asarray(ra),
+        "sin_dec": np.sin(dec),
+        "cos_theta_jn": np.cos(theta_jn),
+        "psi": np.asarray(psi),
+        "phase": np.asarray(phase),
+    }
+
+
 def test_metadata(action):
     assert action.group_size == ET_TRIANGLE_GROUP_SIZE == 8
     assert action.parameters == ET_TRIANGLE_PARAMETERS
+    assert ET_TRIANGLE_PARAMETERS == [
+        "ra",
+        "sin_dec",
+        "cos_theta_jn",
+        "psi",
+        "phase",
+    ]
     assert np.isclose(np.linalg.norm(action.plane_normal), 1.0)
 
 
@@ -71,8 +94,8 @@ def test_identity_element(action, random_points):
     modes = torch.zeros(len(random_points["ra"]), dtype=torch.long)
     out = _np(action(random_points, modes))
     ref = _np(random_points)
-    for key, period in PERIODS.items():
-        assert _ang_dist(out[key], ref[key], period).max() < 1e-9
+    for key in METRICS:
+        assert _dist(key, out[key], ref[key]).max() < 1e-9
 
 
 @pytest.mark.parametrize("g", range(ET_TRIANGLE_GROUP_SIZE))
@@ -81,8 +104,8 @@ def test_inverse_round_trip(action, random_points, g):
     transformed = action(random_points, modes)
     recovered = _np(action(transformed, modes, inverse=True))
     ref = _np(random_points)
-    for key, period in PERIODS.items():
-        assert _ang_dist(recovered[key], ref[key], period).max() < 1e-8
+    for key in METRICS:
+        assert _dist(key, recovered[key], ref[key]).max() < 1e-8
 
 
 def test_outputs_in_prior_ranges(action, random_points):
@@ -90,9 +113,37 @@ def test_outputs_in_prior_ranges(action, random_points):
         modes = torch.full((len(random_points["ra"]),), g, dtype=torch.long)
         out = _np(action(random_points, modes))
         assert np.all((out["ra"] >= 0) & (out["ra"] <= 2 * np.pi))
-        assert np.all((out["dec"] >= -np.pi / 2) & (out["dec"] <= np.pi / 2))
+        assert np.all(np.abs(out["sin_dec"]) <= 1 + 1e-9)
         assert np.all((out["psi"] >= 0) & (out["psi"] <= np.pi))
-        assert np.all((out["theta_jn"] >= 0) & (out["theta_jn"] <= np.pi))
+        assert np.all(np.abs(out["cos_theta_jn"]) <= 1 + 1e-9)
+
+
+def test_action_is_measure_preserving(action, random_points):
+    """The action has unit Jacobian in ``(ra, sin_dec, cos_theta_jn, psi)``.
+
+    Estimated by finite differences on a handful of points for every element.
+    """
+    keys = ["ra", "sin_dec", "cos_theta_jn", "psi"]
+    base = {k: random_points[k][:64].clone() for k in METRICS}
+    eps = 1e-6
+    for g in range(ET_TRIANGLE_GROUP_SIZE):
+        n = len(base["ra"])
+        modes = torch.full((n,), g, dtype=torch.long)
+        f0 = _np(action(base, modes))
+        jac = np.zeros((n, len(keys), len(keys)))
+        for j, kj in enumerate(keys):
+            pert = {k: v.clone() for k, v in base.items()}
+            pert[kj] = pert[kj] + eps
+            f1 = _np(action(pert, modes))
+            for i, ki in enumerate(keys):
+                d = f1[ki] - f0[ki]
+                # unwrap circular coordinates
+                if METRICS[ki][0] == "circ":
+                    p = METRICS[ki][1]
+                    d = (d + p / 2) % p - p / 2
+                jac[:, i, j] = d / eps
+        det = np.abs(np.linalg.det(jac))
+        assert np.allclose(det, 1.0, atol=1e-3), (g, det.min(), det.max())
 
 
 def test_fundamental_domain_partitions_every_orbit(action, random_points):
@@ -114,14 +165,13 @@ def test_group_closure(action, random_points):
             mg = torch.full((n,), g, dtype=torch.long)
             mh = torch.full((n,), h, dtype=torch.long)
             composed = _np(action(action(random_points, mh), mg))
-            # find the single element reproducing the composition
             matches = 0
             for k in range(ET_TRIANGLE_GROUP_SIZE):
                 mk = torch.full((n,), k, dtype=torch.long)
                 cand = _np(action(random_points, mk))
                 if all(
-                    _ang_dist(cand[p], composed[p], per).max() < 1e-7
-                    for p, per in PERIODS.items()
+                    _dist(p, cand[p], composed[p]).max() < 1e-7
+                    for p in METRICS
                 ):
                     matches += 1
             assert matches == 1, (g, h, matches)
@@ -162,7 +212,6 @@ def test_detector_frame_azimuth_modes_are_quarter_turns(
         posterior["log_likelihood"] - posterior["log_likelihood"].max()
     )
 
-    # Folding the azimuth modulo pi/2 collapses the four longitude peaks.
     def circ_std(x, period):
         ang = x * (2 * np.pi / period)
         c = np.average(np.cos(ang), weights=weights)
@@ -172,7 +221,6 @@ def test_detector_frame_azimuth_modes_are_quarter_turns(
     assert circ_std(lam % (np.pi / 2), np.pi / 2) < 0.5 * circ_std(
         lam, 2 * np.pi
     )
-    # Both sides of the detector plane are populated.
     frac_north = np.average(beta > 0, weights=weights)
     assert 0.15 < frac_north < 0.85
 
@@ -183,9 +231,16 @@ def test_folding_concentrates_the_posterior(posterior, posterior_action):
     action = posterior_action
     keys = ET_TRIANGLE_PARAMETERS
     n = len(posterior["ra"])
-    tp = {k: torch.as_tensor(posterior[k]) for k in keys}
+    base = _to_coords(
+        posterior["ra"],
+        posterior["dec"],
+        posterior["psi"],
+        posterior["theta_jn"],
+        posterior["phase"],
+    )
+    tp = {k: torch.as_tensor(base[k]) for k in keys}
 
-    folded = {k: np.array(posterior[k]) for k in keys}
+    folded = {k: np.array(base[k]) for k in keys}
     assigned = action.in_fundamental_domain(tp).numpy()
     for g in range(1, ET_TRIANGLE_GROUP_SIZE):
         modes = torch.full((n,), g, dtype=torch.long)
@@ -198,17 +253,14 @@ def test_folding_concentrates_the_posterior(posterior, posterior_action):
         assigned |= take
     assert assigned.all()
 
-    # every folded point really is canonical
     assert action.in_fundamental_domain(
         {k: torch.as_tensor(v) for k, v in folded.items()}
     ).numpy().all()
 
-    # the sky localisation is much tighter after folding
-    assert np.std(folded["ra"]) < 0.6 * np.std(posterior["ra"])
-    assert np.std(folded["dec"]) < 0.6 * np.std(posterior["dec"])
-    assert np.std(folded["theta_jn"]) < 0.6 * np.std(posterior["theta_jn"])
+    assert np.std(folded["ra"]) < 0.6 * np.std(base["ra"])
+    assert np.std(folded["sin_dec"]) < 0.6 * np.std(base["sin_dec"])
+    assert np.std(folded["cos_theta_jn"]) < 0.6 * np.std(base["cos_theta_jn"])
 
-    # spreading the folded set back over the orbit recovers the sky extent
     orbit_ra = np.concatenate(
         [
             _np(
@@ -220,7 +272,7 @@ def test_folding_concentrates_the_posterior(posterior, posterior_action):
             for g in range(ET_TRIANGLE_GROUP_SIZE)
         ]
     )
-    assert np.std(orbit_ra) > 0.9 * np.std(posterior["ra"])
+    assert np.std(orbit_ra) > 0.9 * np.std(base["ra"])
 
 
 @pytest.mark.requires("bilby")
@@ -259,10 +311,16 @@ def test_long_wavelength_response_invariance():
             phase=rng.uniform(0, 2 * np.pi),
         )
         c0 = coeffs(p["ra"], p["dec"], p["psi"], p["theta_jn"], p["phase"])
-        pt = {k: torch.tensor([v]) for k, v in p.items()}
+        coords = _to_coords(**p)
+        pt = {k: torch.tensor([float(v)]) for k, v in coords.items()}
         for g in range(ET_TRIANGLE_GROUP_SIZE):
             out = action(pt, torch.tensor([g]))
-            c1 = coeffs(*[float(out[k]) for k in ET_TRIANGLE_PARAMETERS])
+            ra = float(out["ra"])
+            dec = float(np.arcsin(np.clip(float(out["sin_dec"]), -1, 1)))
+            psi = float(out["psi"])
+            iota = float(np.arccos(np.clip(float(out["cos_theta_jn"]), -1, 1)))
+            phase = float(out["phase"])
+            c1 = coeffs(ra, dec, psi, iota, phase)
             assert np.abs(c1 - c0).max() / np.abs(c0).max() < 0.02
 
 
