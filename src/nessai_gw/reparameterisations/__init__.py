@@ -8,7 +8,10 @@ from nessai.reparameterisations import (
 )
 
 from .distance import DistanceReparameterisation
-from .phase import DeltaPhaseReparameterisation
+from .phase import (
+    DeltaPhaseReparameterisation,
+    PolarisationPhaseReparameterisation,
+)
 from .spin import AlignedSpinReparameterisation
 
 known_reparameterisations = ReparameterisationDict()
@@ -65,6 +68,11 @@ known_reparameterisations.add_reparameterisation(
     "delta-phase",
     DeltaPhaseReparameterisation,
     {},
+)
+known_reparameterisations.add_reparameterisation(
+    "polarisation-phase",
+    PolarisationPhaseReparameterisation,
+    {"scale": 1.0, "prior": "uniform"},
 )
 
 known_reparameterisations.update(base_reparameterisations)

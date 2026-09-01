@@ -1,5 +1,7 @@
 """Reparameterisations for spin parameters."""
 
+import inspect
+
 import numpy as np
 from nessai.reparameterisations import Reparameterisation
 from scipy.interpolate import PchipInterpolator
@@ -64,13 +66,15 @@ class AlignedSpinReparameterisation(Reparameterisation):
         rng=None,
         **kwargs,
     ):
-        super().__init__(
-            parameters=parameters,
-            input_parameters=input_parameters,
-            prior_bounds=prior_bounds,
-            rng=rng,
-            **kwargs,
-        )
+        parent_params = inspect.signature(Reparameterisation.__init__).parameters
+        call = dict(parameters=parameters, prior_bounds=prior_bounds, rng=rng)
+        # ``input_parameters`` / other kwargs are only accepted by newer nessai
+        if input_parameters is not None and "input_parameters" in parent_params:
+            call["input_parameters"] = input_parameters
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
 
         if len(self.parameters) > 1:
             raise RuntimeError(

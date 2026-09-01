@@ -10,6 +10,7 @@ from nessai.utils.testing import assert_structured_arrays_equal
 
 from nessai_gw.reparameterisations import (
     DeltaPhaseReparameterisation,
+    PolarisationPhaseReparameterisation,
 )
 
 
@@ -114,3 +115,71 @@ def test_delta_phase_inverse_invertible():
     assert_structured_arrays_equal(x_prime_i, x_prime_f)
     assert_structured_arrays_equal(x_i, x, rtol=1e-10)
     np.testing.assert_array_equal(log_j_i, log_j_f)
+
+
+class TestPolarisationPhase:
+    """Tests for :class:`PolarisationPhaseReparameterisation`."""
+
+    prior_bounds = {"phase": [0.0, 2 * np.pi]}
+
+    def _reparam(self):
+        return PolarisationPhaseReparameterisation(
+            parameters="phase", prior_bounds=self.prior_bounds
+        )
+
+    def test_init(self):
+        reparam = self._reparam()
+        assert reparam.prime_parameters == ["delta_phase_x", "delta_phase_y"]
+        assert reparam.requires == ["psi"]
+        assert reparam.scale == 1.0
+        assert reparam._zero_bound is True
+        assert reparam.radial == "delta_phase_radial"
+
+    def test_reparameterise_values(self):
+        reparam = self._reparam()
+        n = 20
+        phase = np.random.uniform(0, 2 * np.pi, n)
+        psi = np.random.uniform(0, np.pi, n)
+        x = dict_to_live_points({"phase": phase, "psi": psi})
+        x_prime = empty_structured_array(
+            n, names=["delta_phase_x", "delta_phase_y", "psi"]
+        )
+        x_prime["psi"] = psi
+        log_j = np.zeros(n)
+        _, x_prime, _ = reparam.reparameterise(x, x_prime, log_j)
+
+        radius = np.hypot(x_prime["delta_phase_x"], x_prime["delta_phase_y"])
+        angle = np.arctan2(
+            x_prime["delta_phase_y"], x_prime["delta_phase_x"]
+        ) % (2 * np.pi)
+        np.testing.assert_allclose(angle, (phase + psi) % (2 * np.pi), atol=1e-9)
+        assert np.all(radius > 0)
+
+    @pytest.mark.integration_test
+    def test_invertible(self):
+        reparam = self._reparam()
+        n = 50
+        phase = np.random.uniform(0, 2 * np.pi, n)
+        psi = np.random.uniform(0, np.pi, n)
+        x = dict_to_live_points(
+            {
+                "phase": phase,
+                "psi": psi,
+                "delta_phase_radial": np.zeros(n),
+            }
+        )
+        names = ["delta_phase_x", "delta_phase_y", "psi"]
+        x_prime = empty_structured_array(n, names=names)
+        x_prime["psi"] = psi
+        log_j = np.zeros(n)
+
+        x_f, x_prime_f, log_j_f = reparam.reparameterise(
+            x.copy(), x_prime.copy(), log_j.copy()
+        )
+        x_in = x_f.copy()
+        x_in["phase"] = np.nan
+        x_i, _, log_j_i = reparam.inverse_reparameterise(
+            x_in, x_prime_f.copy(), log_j_f.copy()
+        )
+        np.testing.assert_allclose(x_i["phase"], phase, rtol=1e-10)
+        np.testing.assert_allclose(log_j_i, log_j, atol=1e-10)

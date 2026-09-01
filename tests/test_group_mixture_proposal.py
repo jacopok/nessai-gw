@@ -1,9 +1,9 @@
 """Tests for the ET group-mixture proposal wiring in :mod:`nessai_gw.group_mixture`.
 
 These exercise the prime-space adapter, the reparameterisation profile, the
-prime-name probe and the proposal factory.  The factory / probe need a version
-of nessai that ships ``nessai.flowmodel.group_mixture`` and are skipped
-otherwise.
+prime-name probe and the proposal factory.  Only the proposal-factory tests
+need a version of nessai that ships ``nessai.flowmodel.group_mixture``; they
+skip otherwise.
 """
 
 import numpy as np
@@ -43,13 +43,25 @@ PRIME_NAMES = [
     "ra_dec_z",
     "psi_x",
     "psi_y",
-    "phase_x",
-    "phase_y",
+    "delta_phase_x",
+    "delta_phase_y",
     "theta_jn_prime",
     "geocent_time_prime",
 ]
 
-_group_mixture = pytest.importorskip("nessai.flowmodel.group_mixture")
+def _has_group_mixture():
+    try:
+        import nessai.flowmodel.group_mixture  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+requires_group_mixture = pytest.mark.skipif(
+    not _has_group_mixture(),
+    reason="nessai.flowmodel.group_mixture not available",
+)
 
 
 def test_et_group_reparameterisations():
@@ -64,8 +76,10 @@ def test_et_group_reparameterisations():
     }
     assert reps["geocent_time"]["reparameterisation"] == "scaleandshift"
     assert reps["geocent_time"]["shift"] == pytest.approx(REFERENCE_TIME)
+    assert reps["phase"] == {"reparameterisation": "polarisation-phase"}
     # parameters that get the default GW reparameterisation are not listed
     assert "ra" not in reps
+    assert "psi" not in reps
     assert "chirp_mass" not in reps
 
 
@@ -79,16 +93,16 @@ def prime_points():
     cos_dec = np.cos(dec)
     psi = rng.uniform(0, np.pi, n)
     r_psi = rng.uniform(0.5, 1.5, n)
-    phase = rng.uniform(0, 2 * np.pi, n)
-    r_phase = rng.uniform(0.5, 1.5, n)
+    delta_phase = rng.uniform(0, 2 * np.pi, n)
+    r_dphase = rng.uniform(0.5, 1.5, n)
     return {
         "ra_dec_x": torch.as_tensor(r_sky * cos_dec * np.cos(ra)),
         "ra_dec_y": torch.as_tensor(r_sky * cos_dec * np.sin(ra)),
         "ra_dec_z": torch.as_tensor(r_sky * np.sin(dec)),
         "psi_x": torch.as_tensor(r_psi * np.cos(2.0 * psi)),
         "psi_y": torch.as_tensor(r_psi * np.sin(2.0 * psi)),
-        "phase_x": torch.as_tensor(r_phase * np.cos(phase)),
-        "phase_y": torch.as_tensor(r_phase * np.sin(phase)),
+        "delta_phase_x": torch.as_tensor(r_dphase * np.cos(delta_phase)),
+        "delta_phase_y": torch.as_tensor(r_dphase * np.sin(delta_phase)),
         "theta_jn_prime": torch.as_tensor(rng.uniform(-1, 1, n)),
         "geocent_time_prime": torch.as_tensor(rng.uniform(-20, 20, n)),
     }
@@ -128,13 +142,31 @@ def test_prime_space_action_identity(prime_action, prime_points):
         ), name
 
 
-def test_prime_space_action_phase_invariant(prime_action, prime_points):
+def _decode_pair(px, py, scale):
+    r = torch.hypot(px, py)
+    ang = torch.remainder(torch.atan2(py, px), 2 * np.pi) / scale
+    return ang, r
+
+
+def _physical_phase(points):
+    """phase = delta_phase - psi from a prime-space dict."""
+    psi, _ = _decode_pair(points["psi_x"], points["psi_y"], 2.0)
+    dphase, _ = _decode_pair(
+        points["delta_phase_x"], points["delta_phase_y"], 1.0
+    )
+    return torch.remainder(dphase - psi, 2 * np.pi)
+
+
+def test_prime_space_action_physical_phase_invariant(prime_action, prime_points):
+    """The group-invariant physical ``phase`` is unchanged by every element."""
     n = len(prime_points["ra_dec_x"])
+    phase0 = _physical_phase(prime_points)
     for g in range(ETTriangleGroupAction.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         mapped = prime_action(prime_points, modes)
-        assert torch.equal(mapped["phase_x"], prime_points["phase_x"])
-        assert torch.equal(mapped["phase_y"], prime_points["phase_y"])
+        d = torch.remainder(_physical_phase(mapped) - phase0, 2 * np.pi)
+        d = torch.minimum(d, 2 * np.pi - d)
+        assert d.max() < 1e-5, g
 
 
 def test_prime_space_action_preserves_radii(prime_action, prime_points):
@@ -144,6 +176,9 @@ def test_prime_space_action_preserves_radii(prime_action, prime_points):
         prime_points["ra_dec_z"],
     )
     r_psi = torch.hypot(prime_points["psi_x"], prime_points["psi_y"])
+    r_dphase = torch.hypot(
+        prime_points["delta_phase_x"], prime_points["delta_phase_y"]
+    )
     for g in range(ETTriangleGroupAction.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         mapped = prime_action(prime_points, modes)
@@ -152,8 +187,32 @@ def test_prime_space_action_preserves_radii(prime_action, prime_points):
             mapped["ra_dec_z"],
         )
         r_psi_t = torch.hypot(mapped["psi_x"], mapped["psi_y"])
+        r_dphase_t = torch.hypot(
+            mapped["delta_phase_x"], mapped["delta_phase_y"]
+        )
         assert torch.allclose(r_sky_t, r_sky, atol=1e-6)
         assert torch.allclose(r_psi_t, r_psi, atol=1e-6)
+        assert torch.allclose(r_dphase_t, r_dphase, atol=1e-6)
+
+
+def test_prime_space_action_delta_phase_matches_physical(
+    prime_action, prime_points
+):
+    """delta_phase_out from the adapter == phase' + psi' from the raw action."""
+    n = len(prime_points["ra_dec_x"])
+    base = prime_action._action
+    acted, _ = prime_action._decode(prime_points)
+    for g in range(ETTriangleGroupAction.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        phys = base(acted, modes)
+        want = torch.remainder(phys["phase"] + phys["psi"], 2 * np.pi)
+        mapped = prime_action(prime_points, modes)
+        got, _ = _decode_pair(
+            mapped["delta_phase_x"], mapped["delta_phase_y"], 1.0
+        )
+        d = torch.remainder(got - want, 2 * np.pi)
+        d = torch.minimum(d, 2 * np.pi - d)
+        assert d.max() < 1e-5, g
 
 
 def test_prime_parameter_names():
@@ -162,11 +221,13 @@ def test_prime_parameter_names():
         pytest.skip("probe fell back to the name-order heuristic")
     assert {"ra_dec_x", "ra_dec_y", "ra_dec_z"} <= set(prime)
     assert "psi_x" in prime and "psi_y" in prime
-    assert "phase_x" in prime and "phase_y" in prime
+    assert "delta_phase_x" in prime and "delta_phase_y" in prime
+    assert "phase_x" not in prime and "phase_y" not in prime
     # every physical parameter contributes at least one prime coordinate
     assert len(prime) >= len(BNS_PARAMETERS)
 
 
+@requires_group_mixture
 @pytest.mark.parametrize("prime_space", [True, False])
 def test_make_et_group_flow_proposal(prime_space):
     cls = make_et_group_flow_proposal(
@@ -189,6 +250,7 @@ def test_make_et_group_flow_proposal(prime_space):
     assert getattr(gm, "ETGroupFlowProposal") is cls
 
 
+@requires_group_mixture
 def test_make_et_group_flow_proposal_missing_parameter():
     with pytest.raises(RuntimeError, match="missing"):
         make_et_group_flow_proposal(["ra", "dec", "psi"], REFERENCE_TIME)

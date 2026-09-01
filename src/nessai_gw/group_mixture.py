@@ -40,6 +40,24 @@ The reference phase ``phase`` is unchanged by every element.  The four
 rotations and the two reflection states give ``4 x 2 = 8`` elements; the
 group is :math:`\\mathbb{Z}_4 \\times \\mathbb{Z}_2` (abelian).
 
+Polarisation-phase coordinate
+-----------------------------
+For the dominant (2, 2) mode the extrinsic likelihood constrains only
+``phase + sign(cos theta_jn) * psi`` (``phase + psi`` face-on, ``phase - psi``
+face-off); the orthogonal combination is nearly flat.  The ET group wiring
+therefore carries ``phase`` as the periodic coordinate
+``delta_phase = phase + psi`` (:class:`~nessai_gw.reparameterisations.phase.PolarisationPhaseReparameterisation`,
+``polarisation-phase``) so that ridge is an explicit flow axis and ``psi`` is
+left as the broad orthogonal coordinate.  The map is *sign-free*: ``phase`` is
+group-invariant, so with ``phase_inv = delta_phase_in - psi_in`` fixed,
+:class:`PrimeSpaceETGroupAction` sets ``delta_phase_out = phase_inv + psi_out``
+from the group-transformed ``psi`` (which the action returns).  A rotation gives
+``psi_out ~ psi_in + k*pi/2`` hence ``delta_phase_out ~ delta_phase_in + k*pi/2``;
+a reflection gives ``psi_out ~ pi - psi_in`` hence the face-on constrained
+combination for the now-folded point -- no ``sign(cos theta_jn)`` branch, no
+edge-on discontinuity.  It is a rotation of the Cartesian pair at fixed radius,
+so the Jacobian stays 1.
+
 Unlike LISA, a ground-based triangle sits at an appreciable offset
 ``r_ET`` from the geocenter, so the sky degeneracy is only a degeneracy of
 the *detector-frame* arrival time, not of the geocentric time ``geocent_time``
@@ -132,8 +150,11 @@ _EPS = 1e-30
 
 #: nessai ``Angle`` reparameterisation convention: the Cartesian angle stored by
 #: the flow is ``physical_angle * scale``.  ``angle-pi`` (used for ``psi``) has
-#: ``scale = 2``; ``angle-2pi`` (used for ``phase``) has ``scale = 1``.
-_ANGLE_SCALE = {"psi": 2.0, "phase": 1.0}
+#: ``scale = 2``; ``angle-2pi`` (used for ``phase``) has ``scale = 1``.  The ET
+#: group wiring replaces ``phase`` with ``delta_phase = phase + psi``
+#: (``polarisation-phase``, also an ``angle-2pi``-style periodic coordinate);
+#: the ``"phase"`` key is kept so :func:`_decode_pair` stays generic.
+_ANGLE_SCALE = {"psi": 2.0, "phase": 1.0, "delta_phase": 1.0}
 
 #: ``geocent_time`` prime coordinate is ``(geocent_time - reference_time) /
 #: _GEOCENT_SCALE``.  A fixed scale (rather than data-driven bounds) keeps the
@@ -575,7 +596,8 @@ class PrimeSpaceETGroupAction:
                 self._sky = tuple(trip)
                 break
 
-        # psi / phase: name_{x,y} from the angle-pi / angle-2pi Angle reparams
+        # psi / delta_phase: name_{x,y} from the angle-pi / polarisation-phase
+        # Angle reparams
         self._pair = {}
         for base in _ANGLE_SCALE:
             x, y = f"{base}_x", f"{base}_y"
@@ -601,6 +623,8 @@ class PrimeSpaceETGroupAction:
             missing.append("sky-ra-dec (ra_dec_x/_y/_z)")
         if "psi" not in self._pair:
             missing.append("psi (psi_x/_y)")
+        if "delta_phase" not in self._pair:
+            missing.append("delta_phase (delta_phase_x/_y)")
         if self._theta_jn is None:
             missing.append("theta_jn")
         if self._geocent_time is None:
@@ -611,7 +635,7 @@ class PrimeSpaceETGroupAction:
                 "needs; the prime-space path only applies to a single-site "
                 "ET-triangle run with the standard extrinsic parameters and "
                 "the nessai-gw reparameterisations (sky-ra-dec, angle-pi, "
-                "angle-2pi, angle-sine)."
+                "polarisation-phase, angle-sine)."
             )
 
     # -- decode / encode -------------------------------------------------
@@ -637,13 +661,14 @@ class PrimeSpaceETGroupAction:
         # :meth:`_encode`; the value passed to the action is a dummy.
         cos_theta_jn = torch.zeros_like(ra)
 
-        # phase is group-invariant: a dummy keeps the action interface happy.
-        if "phase" in self._pair:
-            phase, _ = _decode_pair(
-                point_dict, self._pair["phase"], _ANGLE_SCALE["phase"]
-            )
-        else:
-            phase = torch.zeros_like(ra)
+        # phase is group-invariant, but the flow carries delta_phase = phase +
+        # psi (polarisation-phase).  Recover the invariant physical phase and
+        # feed it through; :meth:`_encode` rebuilds delta_phase from the mapped
+        # psi so the reflection's psi -> pi - psi flows into it automatically.
+        delta_phase, r_dphase = _decode_pair(
+            point_dict, self._pair["delta_phase"], _ANGLE_SCALE["delta_phase"]
+        )
+        phase = delta_phase - psi
 
         # prime -> seconds; the action uses geocent_time only additively, so the
         # constant reference_time offset need not be restored -- only the scale.
@@ -657,7 +682,12 @@ class PrimeSpaceETGroupAction:
             "phase": phase,
             "geocent_time": geocent_time,
         }
-        aux = {"r_sky": r_sky, "r_psi": r_psi}
+        aux = {
+            "r_sky": r_sky,
+            "r_psi": r_psi,
+            "r_dphase": r_dphase,
+            "phase_inv": phase,
+        }
         return acted, aux
 
     def _encode(self, point_dict, mapped, aux):
@@ -677,11 +707,18 @@ class PrimeSpaceETGroupAction:
             mapped["psi"], aux["r_psi"], _ANGLE_SCALE["psi"]
         )
 
+        # delta_phase = phase_invariant + psi_out.  No sign / reflected term:
+        # the reflection's psi -> pi - psi arrives through mapped["psi"].
+        dpx, dpy = self._pair["delta_phase"]
+        delta_phase_new = aux["phase_inv"] + mapped["psi"]
+        out[dpx], out[dpy] = _pair_from_angle(
+            delta_phase_new, aux["r_dphase"], _ANGLE_SCALE["delta_phase"]
+        )
+
         u = point_dict[self._theta_jn]
         out[self._theta_jn] = torch.where(aux["reflected"], -u, u)
 
         out[self._geocent_time] = mapped["geocent_time"] / _GEOCENT_SCALE
-        # phase pair left untouched (group-invariant).
         return {n: out[n] for n in self._prime_names}
 
     # -- interface ------------------------------------------------------
@@ -723,11 +760,15 @@ def et_group_reparameterisations(sampling_parameters, reference_time):
     * ``geocent_time`` -> constant ``reference_time`` shift with a fixed
       :data:`_GEOCENT_SCALE` (keeps the GPS epoch off the flow; the group's own
       additive light-travel-delay shift is unaffected by a constant offset).
+    * ``phase`` -> ``polarisation-phase`` (periodic ``delta_phase = phase + psi``
+      pair): makes the likelihood-constrained polarisation/phase combination an
+      explicit flow axis instead of a thin diagonal ridge across four prime
+      coordinates.  ``psi`` (``angle-pi``) is a prerequisite of this coordinate.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
-    (``sky-ra-dec`` for ``ra``/``dec``, ``angle-pi`` for ``psi``, ``angle-2pi``
-    for ``phase``, ``distance`` / ``mass`` for the intrinsic parameters, ...).
+    (``sky-ra-dec`` for ``ra``/``dec``, ``angle-pi`` for ``psi``,
+    ``distance`` / ``mass`` for the intrinsic parameters, ...).
 
     Parameters
     ----------
@@ -761,6 +802,11 @@ def et_group_reparameterisations(sampling_parameters, reference_time):
                 "scale": _GEOCENT_SCALE,
                 "shift": float(reference_time),
             }
+        elif name == "phase":
+            # delta_phase = phase + psi (polarisation-phase): makes the
+            # likelihood-constrained polarisation/phase combination an explicit
+            # flow axis.  ``psi`` (its default ``angle-pi``) is a prerequisite.
+            reps[name] = {"reparameterisation": "polarisation-phase"}
     return reps
 
 
@@ -775,6 +821,8 @@ _DUMMY_PRIOR_BOUNDS = {
     "tilt_1": (0.0, np.pi),
     "tilt_2": (0.0, np.pi),
     "psi": (0.0, np.pi),
+    # ``phase`` bounds also serve the derived ``delta_phase`` coordinate
+    # (``polarisation-phase``), which needs no entry of its own.
     "phase": (0.0, _TWO_PI),
     "phi_12": (0.0, _TWO_PI),
     "phi_jl": (0.0, _TWO_PI),
@@ -860,10 +908,12 @@ def _prime_parameter_names(sampling_parameters, reference_time):
     for name in names:
         if name in ("ra", "dec"):
             continue
-        if name in _ANGLE_SCALE:
-            out += [f"{name}_x", f"{name}_y"]
+        # the ET wiring reparameterises ``phase`` as ``delta_phase = phase + psi``
+        coord = "delta_phase" if name == "phase" else name
+        if coord in _ANGLE_SCALE:
+            out += [f"{coord}_x", f"{coord}_y"]
         else:
-            out.append(f"{name}_prime")
+            out.append(f"{coord}_prime")
     return out
 
 
