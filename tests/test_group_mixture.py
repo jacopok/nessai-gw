@@ -98,6 +98,21 @@ def test_metadata(action):
     assert np.isclose(np.linalg.norm(action.plane_normal), 1.0)
 
 
+def test_public_mode_helpers_match_private(action):
+    modes = torch.arange(ET_TRIANGLE_GROUP_SIZE)
+    k_pub, refl_pub = action.decode_modes(modes)
+    k_priv, refl_priv = ETTriangleGroupAction._decode(modes)
+    assert torch.equal(k_pub, k_priv)
+    assert torch.equal(refl_pub, refl_priv)
+    assert torch.equal(
+        action.invert_modes(modes), ETTriangleGroupAction._invert_modes(modes)
+    )
+    # every element composed with its inverse is the identity
+    assert torch.equal(
+        action.invert_modes(action.invert_modes(modes)), modes
+    )
+
+
 def test_identity_element(action, random_points):
     modes = torch.zeros(len(random_points["ra"]), dtype=torch.long)
     out = _np(action(random_points, modes))

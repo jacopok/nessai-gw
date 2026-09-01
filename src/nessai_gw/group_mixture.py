@@ -127,6 +127,24 @@ ET_EMR_PLANE_NORMAL = np.array(
 
 _TWO_PI = 2.0 * np.pi
 
+#: Small offset guarding divisions by a vector norm in the prime-space adapter.
+_EPS = 1e-30
+
+#: nessai ``Angle`` reparameterisation convention: the Cartesian angle stored by
+#: the flow is ``physical_angle * scale``.  ``angle-pi`` (used for ``psi``) has
+#: ``scale = 2``; ``angle-2pi`` (used for ``phase``) has ``scale = 1``.
+_ANGLE_SCALE = {"psi": 2.0, "phase": 1.0}
+
+#: ``geocent_time`` prime coordinate is ``(geocent_time - reference_time) /
+#: _GEOCENT_SCALE``.  A fixed scale (rather than data-driven bounds) keeps the
+#: group's additive light-travel-delay shift exact under a constant offset.
+_GEOCENT_SCALE = 5e-3
+
+#: Floor for the group-mixture wrapper's per-element canonical std.  Lowered
+#: from nessai's ``1e-2`` default so a genuinely narrow prime dimension
+#: (``geocent_time``) is standardised by its real width, not the floor.
+_MIN_CANON_STD = 1e-3
+
 
 def detector_plane_normal(interferometers) -> np.ndarray:
     """Unit normal to the plane of a triangular interferometer.
@@ -356,6 +374,19 @@ class ETTriangleGroupAction:
         refl = torch.div(modes, 4, rounding_mode="floor")
         return refl * 4 + torch.remainder(-k, 4)
 
+    # Public aliases of the mode helpers, for callers (e.g.
+    # :class:`PrimeSpaceETGroupAction`) that need to inspect group elements
+    # without reaching into private names.
+    @staticmethod
+    def decode_modes(modes):
+        """Split a mode index in ``0..7`` into ``(k, reflected)``."""
+        return ETTriangleGroupAction._decode(torch.as_tensor(modes))
+
+    @staticmethod
+    def invert_modes(modes):
+        """Index of the inverse element (the group is abelian)."""
+        return ETTriangleGroupAction._invert_modes(torch.as_tensor(modes))
+
     def __call__(self, point_dict: dict, modes, inverse: bool = False) -> dict:
         """Apply the group element ``modes`` (or its inverse) to each point."""
         ra = point_dict["ra"]
@@ -465,3 +496,490 @@ def make_et_triangle_group_mixture_flow(
         param_names=names,
         in_fundamental_domain=action.in_fundamental_domain,
     )
+
+
+# ---------------------------------------------------------------------------
+# Prime-space adapter + proposal wiring
+#
+# nessai's :class:`~nessai.flowmodel.group_mixture.GroupFlowProposalMixin` can
+# run :class:`ETTriangleGroupAction` directly in the *physical* parameter space
+# and bridge to the flow's *prime* space with a
+# :class:`~nessai.flowmodel.group_mixture.ReparamBridge` (non-affine
+# reparameterisations handled exactly).  That is the ``prime_space=False`` path
+# of :func:`make_et_group_flow_proposal` and needs no code here.
+#
+# The ``prime_space=True`` path instead maps the acted physical coordinates out
+# of the nessai-gw prime vector, runs the unchanged group action, and re-encodes
+# onto vectors of the *same* radii -- an exact unit-Jacobian prime-space map with
+# no per-call numpy round-trip through the reparameterisation.  This mirrors the
+# wiring tuned in the ``xG_inference`` ET replay optimisation.
+# ---------------------------------------------------------------------------
+
+
+def _angle_from_pair(x, y, scale):
+    """Physical angle from a nessai ``Angle`` Cartesian pair (radius returned)."""
+    radius = torch.hypot(x, y)
+    angle = torch.remainder(torch.atan2(y, x), _TWO_PI) / scale
+    return angle, radius
+
+
+def _pair_from_angle(angle, radius, scale):
+    """Inverse of :func:`_angle_from_pair`."""
+    a = angle * scale
+    return radius * torch.cos(a), radius * torch.sin(a)
+
+
+def _decode_pair(point_dict, pair, scale):
+    x, y = point_dict[pair[0]], point_dict[pair[1]]
+    return _angle_from_pair(x, y, scale)
+
+
+class PrimeSpaceETGroupAction:
+    """Apply :class:`ETTriangleGroupAction` in the nessai-gw *prime* space.
+
+    Discovers the sky / ``psi`` / ``phase`` / ``theta_jn`` / ``geocent_time``
+    prime coordinates from the flow's actual ``prime_parameters`` and threads
+    the acted subset through the unchanged group action, re-encoding onto
+    same-radius vectors so the prime-space map is exactly a rotation /
+    reflection / constant shift with unit Jacobian.
+
+    Instances are passed to
+    :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow` as the
+    ``prime_space_action`` / ``prime_space_in_domain`` pair.
+
+    Parameters
+    ----------
+    action : ETTriangleGroupAction
+        The physical-space group action.
+    prime_names : list of str
+        The flow's prime-parameter names, in order.  Re-bind after the proposal
+        is initialised with :meth:`bind`.
+    """
+
+    def __init__(self, action, prime_names):
+        self._action = action
+        self.bind(prime_names)
+
+    # -- binding -----------------------------------------------------------
+
+    def bind(self, prime_names):
+        """(Re)bind to the flow's actual prime-parameter order."""
+        self._prime_names = list(prime_names)
+        names = set(self._prime_names)
+
+        # sky: ra_dec_{x,y,z} from the sky-ra-dec AnglePair
+        self._sky = None
+        for prefix in ("ra_dec", "dec_ra"):
+            trip = [f"{prefix}_{c}" for c in ("x", "y", "z")]
+            if all(t in names for t in trip):
+                self._sky = tuple(trip)
+                break
+
+        # psi / phase: name_{x,y} from the angle-pi / angle-2pi Angle reparams
+        self._pair = {}
+        for base in _ANGLE_SCALE:
+            x, y = f"{base}_x", f"{base}_y"
+            if x in names and y in names:
+                self._pair[base] = (x, y)
+
+        # theta_jn: single linear angle-sine coordinate
+        self._theta_jn = None
+        for cand in ("theta_jn_prime", "theta_jn"):
+            if cand in names:
+                self._theta_jn = cand
+                break
+
+        # geocent_time: single constant-shifted coordinate
+        self._geocent_time = None
+        for cand in ("geocent_time_prime", "geocent_time"):
+            if cand in names:
+                self._geocent_time = cand
+                break
+
+        missing = []
+        if self._sky is None:
+            missing.append("sky-ra-dec (ra_dec_x/_y/_z)")
+        if "psi" not in self._pair:
+            missing.append("psi (psi_x/_y)")
+        if self._theta_jn is None:
+            missing.append("theta_jn")
+        if self._geocent_time is None:
+            missing.append("geocent_time")
+        if missing:
+            raise RuntimeError(
+                f"prime space is missing {missing}, which the ET group action "
+                "needs; the prime-space path only applies to a single-site "
+                "ET-triangle run with the standard extrinsic parameters and "
+                "the nessai-gw reparameterisations (sky-ra-dec, angle-pi, "
+                "angle-2pi, angle-sine)."
+            )
+
+    # -- decode / encode -------------------------------------------------
+
+    def _decode(self, point_dict):
+        """nessai-gw prime dict -> ``ETTriangleGroupAction`` coordinate dict.
+
+        Returns ``(acted, aux)`` where ``aux`` carries the radii needed to
+        re-encode.
+        """
+        sx, sy, sz = (point_dict[n] for n in self._sky)
+        r_sky = torch.sqrt(sx * sx + sy * sy + sz * sz + _EPS)
+        ra = torch.remainder(torch.atan2(sy, sx), _TWO_PI)
+        sin_dec = torch.clamp(sz / r_sky, -1.0, 1.0)
+
+        psi, r_psi = _decode_pair(
+            point_dict, self._pair["psi"], _ANGLE_SCALE["psi"]
+        )
+
+        # theta_jn is decoupled from the frame rotation: the group only ever
+        # sends cos(theta_jn) -> -cos(theta_jn) under a reflection, i.e. the
+        # angle-sine coordinate u -> -u (centre 0).  Handled directly in
+        # :meth:`_encode`; the value passed to the action is a dummy.
+        cos_theta_jn = torch.zeros_like(ra)
+
+        # phase is group-invariant: a dummy keeps the action interface happy.
+        if "phase" in self._pair:
+            phase, _ = _decode_pair(
+                point_dict, self._pair["phase"], _ANGLE_SCALE["phase"]
+            )
+        else:
+            phase = torch.zeros_like(ra)
+
+        # prime -> seconds; the action uses geocent_time only additively, so the
+        # constant reference_time offset need not be restored -- only the scale.
+        geocent_time = point_dict[self._geocent_time] * _GEOCENT_SCALE
+
+        acted = {
+            "ra": ra,
+            "sin_dec": sin_dec,
+            "cos_theta_jn": cos_theta_jn,
+            "psi": psi,
+            "phase": phase,
+            "geocent_time": geocent_time,
+        }
+        aux = {"r_sky": r_sky, "r_psi": r_psi}
+        return acted, aux
+
+    def _encode(self, point_dict, mapped, aux):
+        out = dict(point_dict)
+
+        ra_t = mapped["ra"]
+        sin_dec_t = torch.clamp(mapped["sin_dec"], -1.0, 1.0)
+        cos_dec_t = torch.sqrt(torch.clamp(1.0 - sin_dec_t ** 2, min=0.0))
+        r = aux["r_sky"]
+        sx, sy, sz = self._sky
+        out[sx] = r * cos_dec_t * torch.cos(ra_t)
+        out[sy] = r * cos_dec_t * torch.sin(ra_t)
+        out[sz] = r * sin_dec_t
+
+        px, py = self._pair["psi"]
+        out[px], out[py] = _pair_from_angle(
+            mapped["psi"], aux["r_psi"], _ANGLE_SCALE["psi"]
+        )
+
+        u = point_dict[self._theta_jn]
+        out[self._theta_jn] = torch.where(aux["reflected"], -u, u)
+
+        out[self._geocent_time] = mapped["geocent_time"] / _GEOCENT_SCALE
+        # phase pair left untouched (group-invariant).
+        return {n: out[n] for n in self._prime_names}
+
+    # -- interface ------------------------------------------------------
+
+    def _reflected_mask(self, modes, inverse):
+        modes = torch.as_tensor(modes)
+        if inverse:
+            modes = self._action.invert_modes(modes)
+        _, reflected = self._action.decode_modes(modes)
+        return reflected
+
+    def __call__(self, point_dict, modes, inverse: bool = False):
+        acted, aux = self._decode(point_dict)
+        mapped = self._action(acted, modes, inverse=inverse)
+        aux["reflected"] = self._reflected_mask(modes, inverse)
+        return self._encode(point_dict, mapped, aux)
+
+    def in_fundamental_domain(self, point_dict):
+        acted, _ = self._decode(point_dict)
+        return self._action.in_fundamental_domain(acted)
+
+
+def et_group_reparameterisations(sampling_parameters, reference_time):
+    """Reparameterisation overrides that keep the acted parameters isometric.
+
+    The ET group action has unit Jacobian in
+    ``(ra, sin_dec, cos_theta_jn, psi, phase, geocent_time)``.  Each of those
+    maps to the nessai-gw prime coordinates by an isometry *provided* the right
+    reparameterisation is used:
+
+    * ``chi_1`` / ``chi_2`` -> ``aligned-spin`` (nessai-gw CDF -> inverse-normal
+      map; standard-normal prime prior, removes the log cusp at ``chi = 0``).
+    * ``lambda_1`` / ``lambda_2`` -> ``logit`` with ``update_bounds=False``
+      (fixed hard bounds, prime coordinate on the whole real line).
+    * ``theta_jn`` -> ``angle-sine`` with ``update_bounds=False``.  The fixed,
+      symmetric bounds keep the group's ``theta_jn -> pi - theta_jn`` reflection
+      an exact sign flip of the prime coordinate; ``update_bounds=True`` would
+      let the empirical bounds drift off ``pi/2`` and break that.
+    * ``geocent_time`` -> constant ``reference_time`` shift with a fixed
+      :data:`_GEOCENT_SCALE` (keeps the GPS epoch off the flow; the group's own
+      additive light-travel-delay shift is unaffected by a constant offset).
+
+    Every other parameter is left to
+    :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
+    (``sky-ra-dec`` for ``ra``/``dec``, ``angle-pi`` for ``psi``, ``angle-2pi``
+    for ``phase``, ``distance`` / ``mass`` for the intrinsic parameters, ...).
+
+    Parameters
+    ----------
+    sampling_parameters : iterable of str
+        Every parameter nessai samples.
+    reference_time : float
+        Geocentric GPS time subtracted from ``geocent_time`` in prime space.
+
+    Returns
+    -------
+    dict
+        A ``reparameterisations`` mapping for ``bilby.run_sampler`` / nessai.
+    """
+    reps = {}
+    for name in sampling_parameters:
+        if name in ("chi_1", "chi_2"):
+            reps[name] = {"reparameterisation": "aligned-spin"}
+        elif name in ("lambda_1", "lambda_2"):
+            reps[name] = {
+                "reparameterisation": "logit",
+                "update_bounds": False,
+            }
+        elif name == "theta_jn":
+            reps[name] = {
+                "reparameterisation": "angle-sine",
+                "update_bounds": False,
+            }
+        elif name == "geocent_time":
+            reps[name] = {
+                "reparameterisation": "scaleandshift",
+                "scale": _GEOCENT_SCALE,
+                "shift": float(reference_time),
+            }
+    return reps
+
+
+#: Dummy prior bounds for the throwaway reparameterisation build in
+#: :func:`_prime_parameter_names`.  Values are irrelevant; each just has to be a
+#: finite range valid for that parameter's reparameterisation.
+_DUMMY_PRIOR_BOUNDS = {
+    "ra": (0.0, _TWO_PI),
+    "dec": (-np.pi / 2, np.pi / 2),
+    "theta_jn": (0.0, np.pi),
+    "iota": (0.0, np.pi),
+    "tilt_1": (0.0, np.pi),
+    "tilt_2": (0.0, np.pi),
+    "psi": (0.0, np.pi),
+    "phase": (0.0, _TWO_PI),
+    "phi_12": (0.0, _TWO_PI),
+    "phi_jl": (0.0, _TWO_PI),
+    "a_1": (0.0, 0.99),
+    "a_2": (0.0, 0.99),
+    "chi_1": (-0.99, 0.99),
+    "chi_2": (-0.99, 0.99),
+    "luminosity_distance": (10.0, 5000.0),
+    "chirp_mass": (1.0, 2.0),
+    "mass_ratio": (0.125, 1.0),
+    "mass_1": (1.0, 3.0),
+    "mass_2": (1.0, 3.0),
+    "lambda_1": (0.0, 2500.0),
+    "lambda_2": (0.0, 2500.0),
+}
+
+
+def _prime_parameter_names(sampling_parameters, reference_time):
+    """Prime-parameter names *and order* nessai produces for this wiring.
+
+    Computed by configuring a throwaway
+    :class:`nessai_gw.proposals.GWFlowProposal` with the same
+    reparameterisation dict / fallback the real proposal uses and reading back
+    ``prime_parameters``.  The order matters: the group-mixture wrapper builds
+    its base-flow ``point_dict`` from ``param_names`` before
+    :meth:`ETGroupFlowProposal.initialise` re-binds to the live
+    ``prime_parameters``.
+
+    Falls back to a name-order heuristic (right count, order not guaranteed) if
+    the throwaway build fails.
+    """
+    names = list(sampling_parameters)
+
+    try:
+        from nessai.model import Model
+
+        from .proposals import GWFlowProposal
+
+        bounds = {
+            name: np.asarray(
+                _DUMMY_PRIOR_BOUNDS.get(name, (0.0, 1.0)), dtype=float
+            )
+            for name in names
+        }
+
+        class _StubModel(Model):
+            def __init__(self):
+                self.names = list(names)
+                self.bounds = bounds
+
+            def log_prior(self, x):
+                return np.zeros(len(np.atleast_1d(x)))
+
+            def log_likelihood(self, x):
+                return np.zeros(len(np.atleast_1d(x)))
+
+        probe = GWFlowProposal(
+            _StubModel(),
+            poolsize=100,
+            reparameterisations=et_group_reparameterisations(
+                names, reference_time
+            ),
+            fallback_reparameterisation="zscore",
+        )
+        probe.set_rescaling()
+        prime = list(probe.prime_parameters)
+        if prime:
+            return prime
+    except Exception as exc:  # pragma: no cover - defensive
+        import warnings
+
+        warnings.warn(
+            "Could not probe nessai for the real prime-parameter order "
+            f"({exc!r}); falling back to a name-order heuristic. Buffers are "
+            "re-bound at initialise, so only the pre-bind placeholder is "
+            "affected.",
+            RuntimeWarning,
+        )
+
+    out = []
+    if "ra" in names and "dec" in names:
+        out += ["ra_dec_x", "ra_dec_y", "ra_dec_z"]
+    for name in names:
+        if name in ("ra", "dec"):
+            continue
+        if name in _ANGLE_SCALE:
+            out += [f"{name}_x", f"{name}_y"]
+        else:
+            out.append(f"{name}_prime")
+    return out
+
+
+def make_et_group_flow_proposal(
+    sampling_parameters,
+    reference_time,
+    plane_normal=None,
+    vertex=None,
+    prime_space=True,
+):
+    """Build a ``FlowProposal`` subclass wired for the ET-triangle group mixture.
+
+    The returned class combines :class:`nessai_gw.proposals.GWReparamMixin`
+    (GW reparameterisations by parameter name),
+    :class:`nessai.flowmodel.group_mixture.GroupFlowProposalMixin` (group-mixture
+    wiring) and :class:`nessai.proposal.FlowProposal`, with
+    :class:`ETTriangleGroupAction` as the group action.  Pass it as
+    ``flow_proposal_class`` to ``bilby.run_sampler(sampler="nessai", ...)``
+    together with :func:`et_group_reparameterisations`.
+
+    Parameters
+    ----------
+    sampling_parameters : list of str
+        Every parameter nessai samples, in order.  Must contain ``ra``, ``dec``,
+        ``theta_jn``, ``psi``, ``phase`` and ``geocent_time``.
+    reference_time : float
+        Geocentric GPS time of the event.
+    plane_normal : array_like, optional
+        Earth-fixed unit normal to the detector plane; defaults to
+        :data:`ET_EMR_PLANE_NORMAL`.
+    vertex : array_like, optional
+        Geocentric detector position (metres); defaults to :data:`ET_EMR_VERTEX`.
+    prime_space : bool, optional
+        If ``True`` (default) run the action in the flow's prime space via
+        :class:`PrimeSpaceETGroupAction` (exact unit Jacobian, no per-call numpy
+        round-trip).  If ``False`` run it in physical coordinates and let
+        nessai's ``GroupFlowProposalMixin`` bridge to prime space with a
+        ``ReparamBridge``.
+    """
+    try:
+        from nessai.proposal import FlowProposal
+        from nessai.flowmodel.group_mixture import (
+            GroupFlowProposalMixin,
+            make_group_mixture_flow,
+        )
+    except ImportError as exc:  # pragma: no cover - depends on nessai version
+        raise RuntimeError(
+            "make_et_group_flow_proposal requires a version of nessai that "
+            "ships nessai.flowmodel.group_mixture (GroupFlowProposalMixin, "
+            "make_group_mixture_flow)."
+        ) from exc
+
+    from .proposals import GWReparamMixin
+
+    names = list(sampling_parameters)
+    missing = sorted(
+        {"ra", "dec", "theta_jn", "psi", "phase", "geocent_time"} - set(names)
+    )
+    if missing:
+        raise RuntimeError(
+            f"The sampling space is missing {missing}, which the ET group "
+            "action needs; this proposal only applies to a single-site "
+            "ET-triangle run with the standard extrinsic parameters."
+        )
+
+    base_action = ETTriangleGroupAction(
+        reference_time=reference_time,
+        plane_normal=plane_normal,
+        vertex=vertex,
+    )
+
+    if prime_space:
+        prime_names = _prime_parameter_names(names, reference_time)
+        action = PrimeSpaceETGroupAction(base_action, prime_names)
+        flow_model_cls = make_group_mixture_flow(
+            group_action_fn=action,  # ignored on the prime-space path
+            group_size=ETTriangleGroupAction.group_size,
+            param_names=prime_names,
+            prime_space_action=action,
+            prime_space_in_domain=action.in_fundamental_domain,
+            min_canon_std=_MIN_CANON_STD,
+        )
+    else:
+        action = None
+        flow_model_cls = make_group_mixture_flow(
+            group_action_fn=base_action,
+            group_size=base_action.group_size,
+            param_names=base_action.parameters,
+            in_fundamental_domain=base_action.in_fundamental_domain,
+            min_canon_std=_MIN_CANON_STD,
+        )
+
+    class ETGroupFlowProposal(
+        GWReparamMixin, GroupFlowProposalMixin, FlowProposal
+    ):
+        """``FlowProposal`` wired for the ET-triangle group-mixture flow with
+        the nessai-gw GW reparameterisations."""
+
+        _FlowModelClass = flow_model_cls
+
+        def initialise(self, *args, **kwargs):
+            super().initialise(*args, **kwargs)
+            if action is None:
+                return
+            # Realign the prime-space action to nessai's actual prime parameter
+            # order (do not assume the reparameterisation-dict order).
+            model = getattr(self.flow, "model", None)
+            prime = list(getattr(self, "prime_parameters", []) or [])
+            if model is not None and prime:
+                action.bind(prime)
+                model.param_names = prime
+
+    # nessai checkpoints the sampler (hence the proposal *instance*) with
+    # ``pickle``, which resolves an instance's class by ``module.__qualname__``.
+    # Publish this otherwise-local class at module scope under a stable name.
+    ETGroupFlowProposal.__module__ = __name__
+    ETGroupFlowProposal.__qualname__ = "ETGroupFlowProposal"
+    globals()["ETGroupFlowProposal"] = ETGroupFlowProposal
+    return ETGroupFlowProposal
