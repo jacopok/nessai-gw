@@ -46,17 +46,27 @@ For the dominant (2, 2) mode the extrinsic likelihood constrains only
 ``phase + sign(cos theta_jn) * psi`` (``phase + psi`` face-on, ``phase - psi``
 face-off); the orthogonal combination is nearly flat.  The ET group wiring
 therefore carries ``phase`` as the periodic coordinate
-``delta_phase = phase + psi`` (:class:`~nessai_gw.reparameterisations.phase.PolarisationPhaseReparameterisation`,
+``delta_phase = phase + sign(cos theta_jn) * psi``
+(:class:`~nessai_gw.reparameterisations.phase.PolarisationPhaseReparameterisation`,
 ``polarisation-phase``) so that ridge is an explicit flow axis and ``psi`` is
-left as the broad orthogonal coordinate.  The map is *sign-free*: ``phase`` is
-group-invariant, so with ``phase_inv = delta_phase_in - psi_in`` fixed,
-:class:`PrimeSpaceETGroupAction` sets ``delta_phase_out = phase_inv + psi_out``
-from the group-transformed ``psi`` (which the action returns).  A rotation gives
-``psi_out ~ psi_in + k*pi/2`` hence ``delta_phase_out ~ delta_phase_in + k*pi/2``;
-a reflection gives ``psi_out ~ pi - psi_in`` hence the face-on constrained
-combination for the now-folded point -- no ``sign(cos theta_jn)`` branch, no
-edge-on discontinuity.  It is a rotation of the Cartesian pair at fixed radius,
-so the Jacobian stays 1.
+left as the broad orthogonal coordinate.
+
+The sign must be taken from ``cos theta_jn``: the fundamental domain used above
+canonicalises the detector-plane hemisphere (``beta_f >= 0``), *not*
+face-on/off, so the folded posterior keeps a face-on/off mix and a sign-free
+``phase + psi`` is the *flat* direction for the face-off part (a flow-fit study
+on the ET BNS posterior, ``examples/validate_polarisation_phase.py``, made this
+concrete: ``phase + psi`` fit worse than the plain ``phase`` pair, while
+``phase + sign(cos theta_jn) * psi`` cut the flow NLL by ~1.5 nat).
+
+``phase`` is group-invariant, so :class:`PrimeSpaceETGroupAction` fixes
+``phase_inv = delta_phase_in - sign(cos theta_jn)_in * psi_in`` on decode and
+sets ``delta_phase_out = phase_inv + sign(cos theta_jn)_out * psi_out`` on
+encode, from the group-transformed ``psi`` and ``cos theta_jn`` sign (a
+reflection flips the sign and sends ``psi -> pi - psi``; a rotation shifts
+``psi`` by ``k*pi/2``).  It is a rotation of the Cartesian pair at fixed radius,
+so the Jacobian stays 1.  With the default period ``2*pi`` the map is an exact
+bijection; ``delta_phase`` is additionally invariant modulo ``pi``.
 
 Unlike LISA, a ground-based triangle sits at an appreciable offset
 ``r_ET`` from the geocenter, so the sky degeneracy is only a degeneracy of
@@ -151,9 +161,10 @@ _EPS = 1e-30
 #: nessai ``Angle`` reparameterisation convention: the Cartesian angle stored by
 #: the flow is ``physical_angle * scale``.  ``angle-pi`` (used for ``psi``) has
 #: ``scale = 2``; ``angle-2pi`` (used for ``phase``) has ``scale = 1``.  The ET
-#: group wiring replaces ``phase`` with ``delta_phase = phase + psi``
-#: (``polarisation-phase``, also an ``angle-2pi``-style periodic coordinate);
-#: the ``"phase"`` key is kept so :func:`_decode_pair` stays generic.
+#: group wiring replaces ``phase`` with
+#: ``delta_phase = phase + sign(cos theta_jn) * psi`` (``polarisation-phase``,
+#: an ``angle-2pi``-style periodic coordinate); the ``"phase"`` key is kept so
+#: :func:`_decode_pair` stays generic.
 _ANGLE_SCALE = {"psi": 2.0, "phase": 1.0, "delta_phase": 1.0}
 
 #: ``geocent_time`` prime coordinate is ``(geocent_time - reference_time) /
@@ -657,18 +668,22 @@ class PrimeSpaceETGroupAction:
 
         # theta_jn is decoupled from the frame rotation: the group only ever
         # sends cos(theta_jn) -> -cos(theta_jn) under a reflection, i.e. the
-        # angle-sine coordinate u -> -u (centre 0).  Handled directly in
-        # :meth:`_encode`; the value passed to the action is a dummy.
+        # angle-sine coordinate ``u = 2 theta_jn / pi - 1`` -> ``-u`` (centre 0).
+        # Handled directly in :meth:`_encode`; the value passed to the action is
+        # a dummy.  ``sign(cos theta_jn) = -sign(u)`` is what the phase
+        # coordinate needs.
+        u_theta = point_dict[self._theta_jn]
+        sign_ct = -torch.sign(u_theta)
         cos_theta_jn = torch.zeros_like(ra)
 
-        # phase is group-invariant, but the flow carries delta_phase = phase +
-        # psi (polarisation-phase).  Recover the invariant physical phase and
-        # feed it through; :meth:`_encode` rebuilds delta_phase from the mapped
-        # psi so the reflection's psi -> pi - psi flows into it automatically.
+        # The flow carries delta_phase = phase + sign(cos theta_jn) * psi
+        # (polarisation-phase).  ``phase`` itself is group-invariant, so recover
+        # the invariant piece and let :meth:`_encode` rebuild delta_phase from
+        # the group-transformed psi and cos(theta_jn) sign.
         delta_phase, r_dphase = _decode_pair(
             point_dict, self._pair["delta_phase"], _ANGLE_SCALE["delta_phase"]
         )
-        phase = delta_phase - psi
+        phase = delta_phase - sign_ct * psi
 
         # prime -> seconds; the action uses geocent_time only additively, so the
         # constant reference_time offset need not be restored -- only the scale.
@@ -687,6 +702,7 @@ class PrimeSpaceETGroupAction:
             "r_psi": r_psi,
             "r_dphase": r_dphase,
             "phase_inv": phase,
+            "sign_ct": sign_ct,
         }
         return acted, aux
 
@@ -707,16 +723,20 @@ class PrimeSpaceETGroupAction:
             mapped["psi"], aux["r_psi"], _ANGLE_SCALE["psi"]
         )
 
-        # delta_phase = phase_invariant + psi_out.  No sign / reflected term:
-        # the reflection's psi -> pi - psi arrives through mapped["psi"].
+        u = point_dict[self._theta_jn]
+        out[self._theta_jn] = torch.where(aux["reflected"], -u, u)
+
+        # delta_phase = phase_invariant + sign(cos theta_jn)_out * psi_out.
+        # The reflection flips both sign(cos theta_jn) and psi (psi -> pi - psi,
+        # via mapped["psi"]); a rotation leaves the sign and shifts psi.
+        sign_ct_out = torch.where(
+            aux["reflected"], -aux["sign_ct"], aux["sign_ct"]
+        )
         dpx, dpy = self._pair["delta_phase"]
-        delta_phase_new = aux["phase_inv"] + mapped["psi"]
+        delta_phase_new = aux["phase_inv"] + sign_ct_out * mapped["psi"]
         out[dpx], out[dpy] = _pair_from_angle(
             delta_phase_new, aux["r_dphase"], _ANGLE_SCALE["delta_phase"]
         )
-
-        u = point_dict[self._theta_jn]
-        out[self._theta_jn] = torch.where(aux["reflected"], -u, u)
 
         out[self._geocent_time] = mapped["geocent_time"] / _GEOCENT_SCALE
         return {n: out[n] for n in self._prime_names}
@@ -760,10 +780,12 @@ def et_group_reparameterisations(sampling_parameters, reference_time):
     * ``geocent_time`` -> constant ``reference_time`` shift with a fixed
       :data:`_GEOCENT_SCALE` (keeps the GPS epoch off the flow; the group's own
       additive light-travel-delay shift is unaffected by a constant offset).
-    * ``phase`` -> ``polarisation-phase`` (periodic ``delta_phase = phase + psi``
-      pair): makes the likelihood-constrained polarisation/phase combination an
-      explicit flow axis instead of a thin diagonal ridge across four prime
-      coordinates.  ``psi`` (``angle-pi``) is a prerequisite of this coordinate.
+    * ``phase`` -> ``polarisation-phase`` (periodic
+      ``delta_phase = phase + sign(cos theta_jn) * psi`` pair): makes the
+      likelihood-constrained polarisation/phase combination an explicit flow
+      axis instead of a thin diagonal ridge across four prime coordinates.
+      ``psi`` (``angle-pi``) and ``theta_jn`` (``angle-sine``) are prerequisites
+      of this coordinate.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
@@ -803,9 +825,10 @@ def et_group_reparameterisations(sampling_parameters, reference_time):
                 "shift": float(reference_time),
             }
         elif name == "phase":
-            # delta_phase = phase + psi (polarisation-phase): makes the
-            # likelihood-constrained polarisation/phase combination an explicit
-            # flow axis.  ``psi`` (its default ``angle-pi``) is a prerequisite.
+            # delta_phase = phase + sign(cos theta_jn) * psi (polarisation-phase):
+            # makes the likelihood-constrained polarisation/phase combination an
+            # explicit flow axis.  ``psi`` (angle-pi) and ``theta_jn``
+            # (angle-sine) are prerequisites.
             reps[name] = {"reparameterisation": "polarisation-phase"}
     return reps
 

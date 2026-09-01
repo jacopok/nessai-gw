@@ -315,3 +315,53 @@ docstrings). On approval, copy this plan to
 `nessai-gw/docs/plans/polarisation-phase-reparameterisation.md` (new `docs/plans/`
 dir), and fold the "Math" section into the `group_mixture.py` module docstring
 next to the existing group-action derivation.
+
+---
+
+## CORRECTION (after the flow-fit validation)
+
+`examples/validate_polarisation_phase.py` folds the octomodal ET BNS posterior
+and fits an identical RealNVP to each prime-space variant (the phase-pair
+coordinate change has unit Jacobian, so validation NLLs are comparable).
+Result, best val NLL (lower = better), seed 0, 300 epochs:
+
+| fundamental domain | `phase` (period 2pi) | `phase+psi` | `phase-psi` | `phase` period-pi | `phase+sign(cos th_jn)*psi` period-pi |
+|---|---|---|---|---|---|
+| `beta_f >= 0` (**what the wrapper uses**) | -1.55 | **-0.95** | -2.24 | -1.26* | **-0.18*** (best) |
+| `cos theta_jn >= 0` (face-on) | -1.90 | -2.51 | -1.42 | -1.17* | **-0.66*** (best) |
+
+(* 12-epoch numbers.)
+
+**The plan's `delta_phase = phase + psi` is the one combination that is actively
+bad** (~0.6 nat *worse* than the plain `phase` pair) with the fold the
+group-mixture wrapper actually uses. Cause: `ETTriangleGroupAction.in_fundamental_domain`
+canonicalises the **detector-plane hemisphere** (`beta_f >= 0`), *not*
+face-on/off — so the folded posterior stays a face-on/off mix, is in fact
+face-off dominated for this event (`cos theta_jn` mean -0.69, 0% with
+`cos theta_jn > 0`, **no** edge-on mass), and `phase + psi` is the *flat*
+direction. The plan's "sign-free via the fold" premise (decision 2) does not
+hold for this fold.
+
+### What was implemented instead
+
+`polarisation-phase` = `delta_phase = phase + sign(cos theta_jn) * psi`
+(the existing `DeltaPhaseReparameterisation` combination) as a **period-2pi**
+`Angle` pair:
+
+* `PolarisationPhaseReparameterisation.requires = ["psi", "theta_jn"]`;
+  `_rescale_angle` / `inverse_reparameterise` use
+  `sign = np.sign(np.cos(x["theta_jn"]))`.
+* `PrimeSpaceETGroupAction._decode` recovers `sign_ct = -sign(theta_jn_prime)`
+  (angle-sine `u = 2 theta_jn/pi - 1`) and `phase_inv = delta_phase - sign_ct*psi`;
+  `_encode` sets `delta_phase_out = phase_inv + sign_ct_out * psi_out` with
+  `sign_ct_out = where(reflected, -sign_ct, sign_ct)`.
+* R4 revisited: the sign flip has no edge-on discontinuity problem here (no
+  edge-on mass), and its `+/- pi` shift is invisible mod pi.
+* **Period stays 2pi** (`scale=1.0`) to keep the map an exact bijection for the
+  importance weights. Period pi (`scale=2.0`) fits ~0.7 nat tighter still by
+  folding out the `phase -> phase + pi` (2,2) degeneracy but is 2->1 and only
+  valid if the likelihood truly cannot resolve it — left as an opt-in via the
+  registered `scale`.
+
+R2/R3/R6 stand as written (R6: the probe now needs both `psi` and `theta_jn`
+inverted first, still falls back to the name heuristic; `initialise` rebinds).

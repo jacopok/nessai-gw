@@ -148,23 +148,47 @@ def _decode_pair(px, py, scale):
     return ang, r
 
 
-def _physical_phase(points):
-    """phase = delta_phase - psi from a prime-space dict."""
+def _to_physical(points):
+    """prime-space dict -> physical (ra, sin_dec, cos_theta_jn, psi, phase)."""
+    sx, sy, sz = (points[n] for n in ("ra_dec_x", "ra_dec_y", "ra_dec_z"))
+    r_sky = torch.sqrt(sx * sx + sy * sy + sz * sz)
+    ra = torch.remainder(torch.atan2(sy, sx), 2 * np.pi)
+    sin_dec = torch.clamp(sz / r_sky, -1.0, 1.0)
     psi, _ = _decode_pair(points["psi_x"], points["psi_y"], 2.0)
     dphase, _ = _decode_pair(
         points["delta_phase_x"], points["delta_phase_y"], 1.0
     )
-    return torch.remainder(dphase - psi, 2 * np.pi)
+    u = points["theta_jn_prime"]
+    # angle-sine: u = 2 theta_jn / pi - 1  ->  cos(theta_jn) sign = -sign(u)
+    cos_theta_jn = torch.cos(0.5 * np.pi * (u + 1.0))
+    sign_ct = -torch.sign(u)
+    phase = torch.remainder(dphase - sign_ct * psi, 2 * np.pi)
+    return {
+        "ra": ra,
+        "sin_dec": sin_dec,
+        "cos_theta_jn": cos_theta_jn,
+        "psi": psi,
+        "phase": phase,
+        "geocent_time": points["geocent_time_prime"] * 0.0
+        + ETTriangleGroupAction(reference_time=REFERENCE_TIME).reference_time,
+    }
+
+
+def _delta_phase_from_physical(phys):
+    return torch.remainder(
+        phys["phase"] + torch.sign(phys["cos_theta_jn"]) * phys["psi"],
+        2 * np.pi,
+    )
 
 
 def test_prime_space_action_physical_phase_invariant(prime_action, prime_points):
     """The group-invariant physical ``phase`` is unchanged by every element."""
     n = len(prime_points["ra_dec_x"])
-    phase0 = _physical_phase(prime_points)
+    phase0 = _to_physical(prime_points)["phase"]
     for g in range(ETTriangleGroupAction.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         mapped = prime_action(prime_points, modes)
-        d = torch.remainder(_physical_phase(mapped) - phase0, 2 * np.pi)
+        d = torch.remainder(_to_physical(mapped)["phase"] - phase0, 2 * np.pi)
         d = torch.minimum(d, 2 * np.pi - d)
         assert d.max() < 1e-5, g
 
@@ -198,14 +222,15 @@ def test_prime_space_action_preserves_radii(prime_action, prime_points):
 def test_prime_space_action_delta_phase_matches_physical(
     prime_action, prime_points
 ):
-    """delta_phase_out from the adapter == phase' + psi' from the raw action."""
+    """The adapter's delta_phase == (decode fully -> run the physical action ->
+    apply ``phase' + sign(cos theta_jn') * psi'``)."""
     n = len(prime_points["ra_dec_x"])
     base = prime_action._action
-    acted, _ = prime_action._decode(prime_points)
+    phys0 = _to_physical(prime_points)
     for g in range(ETTriangleGroupAction.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
-        phys = base(acted, modes)
-        want = torch.remainder(phys["phase"] + phys["psi"], 2 * np.pi)
+        phys = base(phys0, modes)
+        want = _delta_phase_from_physical(phys)
         mapped = prime_action(prime_points, modes)
         got, _ = _decode_pair(
             mapped["delta_phase_x"], mapped["delta_phase_y"], 1.0

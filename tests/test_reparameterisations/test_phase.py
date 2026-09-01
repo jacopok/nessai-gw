@@ -130,21 +130,24 @@ class TestPolarisationPhase:
     def test_init(self):
         reparam = self._reparam()
         assert reparam.prime_parameters == ["delta_phase_x", "delta_phase_y"]
-        assert reparam.requires == ["psi"]
+        assert reparam.requires == ["psi", "theta_jn"]
         assert reparam.scale == 1.0
         assert reparam._zero_bound is True
         assert reparam.radial == "delta_phase_radial"
 
-    def test_reparameterise_values(self):
+    @pytest.mark.parametrize("theta_jn, sign", [(0.6, 1.0), (2.5, -1.0)])
+    def test_reparameterise_values(self, theta_jn, sign):
         reparam = self._reparam()
         n = 20
         phase = np.random.uniform(0, 2 * np.pi, n)
         psi = np.random.uniform(0, np.pi, n)
-        x = dict_to_live_points({"phase": phase, "psi": psi})
+        tjn = np.full(n, theta_jn)
+        x = dict_to_live_points({"phase": phase, "psi": psi, "theta_jn": tjn})
         x_prime = empty_structured_array(
-            n, names=["delta_phase_x", "delta_phase_y", "psi"]
+            n, names=["delta_phase_x", "delta_phase_y", "psi", "theta_jn"]
         )
         x_prime["psi"] = psi
+        x_prime["theta_jn"] = tjn
         log_j = np.zeros(n)
         _, x_prime, _ = reparam.reparameterise(x, x_prime, log_j)
 
@@ -152,25 +155,31 @@ class TestPolarisationPhase:
         angle = np.arctan2(
             x_prime["delta_phase_y"], x_prime["delta_phase_x"]
         ) % (2 * np.pi)
-        np.testing.assert_allclose(angle, (phase + psi) % (2 * np.pi), atol=1e-9)
+        np.testing.assert_allclose(
+            angle, (phase + sign * psi) % (2 * np.pi), atol=1e-9
+        )
         assert np.all(radius > 0)
 
     @pytest.mark.integration_test
-    def test_invertible(self):
+    @pytest.mark.parametrize("theta_jn", [0.6, 2.5])
+    def test_invertible(self, theta_jn):
         reparam = self._reparam()
         n = 50
         phase = np.random.uniform(0, 2 * np.pi, n)
         psi = np.random.uniform(0, np.pi, n)
+        tjn = np.full(n, theta_jn)
         x = dict_to_live_points(
             {
                 "phase": phase,
                 "psi": psi,
+                "theta_jn": tjn,
                 "delta_phase_radial": np.zeros(n),
             }
         )
-        names = ["delta_phase_x", "delta_phase_y", "psi"]
+        names = ["delta_phase_x", "delta_phase_y", "psi", "theta_jn"]
         x_prime = empty_structured_array(n, names=names)
         x_prime["psi"] = psi
+        x_prime["theta_jn"] = tjn
         log_j = np.zeros(n)
 
         x_f, x_prime_f, log_j_f = reparam.reparameterise(

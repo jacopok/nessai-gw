@@ -86,31 +86,40 @@ class DeltaPhaseReparameterisation(Reparameterisation):
 
 
 class PolarisationPhaseReparameterisation(Angle):
-    """Periodic ``delta_phase = phase + psi`` coordinate for the ET group flow.
+    """Periodic ``delta_phase = phase + sign(cos theta_jn) * psi`` coordinate.
 
     For the dominant (2, 2) GW mode the extrinsic likelihood constrains only the
     combination ``phase + sign(cos theta_jn) * psi`` (``phase + psi`` face-on,
     ``phase - psi`` face-off); the orthogonal combination is nearly flat.  This
     reparameterisation replaces the ``phase`` Cartesian pair of
     :class:`~nessai.reparameterisations.angle.Angle` (``angle-2pi``) with a
-    single periodic coordinate ``delta_phase = phase + psi``, so the constrained
-    ridge is an explicit axis and ``psi`` is left as the broad orthogonal
-    coordinate.
+    single periodic coordinate ``delta_phase``, so the constrained ridge is an
+    explicit flow axis and ``psi`` is left as the broad orthogonal coordinate.
 
-    The map is **sign-free**: it does not read ``sign(cos theta_jn)`` (which is
-    discontinuous at edge-on).  The face-on / face-off distinction is instead
-    carried by the group fold -- a face-off point is assigned to a reflected
-    branch, whose ``psi -> pi - psi`` turns ``phase + psi`` into
-    ``phase - psi + pi`` automatically -- and
+    The sign is taken from ``cos theta_jn`` (this is the same combination as
+    :class:`DeltaPhaseReparameterisation`).  A flow-fit study on the octomodal
+    ET BNS posterior (``examples/validate_polarisation_phase.py``) showed that
+
+    * the *sign-free* ``phase + psi`` is worse than the plain ``phase`` pair
+      when the group fold canonicalises the detector-plane hemisphere
+      (``beta_f >= 0``, what :meth:`ETTriangleGroupAction.in_fundamental_domain`
+      does) rather than face-on/off -- that fold leaves the folded posterior
+      face-off dominated, so ``phase + psi`` is the *flat* direction;
+    * ``phase + sign(cos theta_jn) * psi`` picks the constrained combination
+      regardless of which reflection the fold chose (~1.5 nat lower flow NLL),
+      and is exactly invariant modulo ``pi`` under the group reflection
+      (``cos theta_jn -> -cos theta_jn``, ``psi -> pi - psi``).
+
     :class:`nessai_gw.group_mixture.PrimeSpaceETGroupAction` recomputes
-    ``delta_phase`` from the group-transformed ``psi`` on the encode side.
+    ``delta_phase`` from the group-transformed ``psi`` and ``cos theta_jn`` on
+    the encode side.
 
     The transformation is a rotation of the Cartesian pair at fixed radius, so
     its Jacobian determinant is 1 (the ``chi(2)`` auxiliary radius is inherited
     from :class:`~nessai.reparameterisations.angle.Angle` unchanged).
 
-    Requires ``psi`` (both to build ``delta_phase`` on the forward pass and to
-    recover ``phase`` on the inverse).
+    Requires ``psi`` and ``theta_jn`` (to build ``delta_phase`` on the forward
+    pass and to recover ``phase`` on the inverse).
 
     Parameters
     ----------
@@ -120,7 +129,11 @@ class PolarisationPhaseReparameterisation(Angle):
         Prior bounds for the parameters; ``phase`` must have a lower bound of 0.
     scale : float, optional
         Angle rescaling before the Cartesian conversion.  ``1.0`` (default)
-        gives period ``2*pi``, matching ``angle-2pi`` for ``phase``.
+        gives period ``2*pi`` and keeps the map an exact bijection.  ``2.0``
+        (period ``pi``) fits noticeably tighter still by folding out the
+        ``phase -> phase + pi`` (2, 2)-mode degeneracy, at the cost of
+        discarding that (weak, for BNS) distinction -- only use it if the
+        likelihood really cannot resolve it.
     prior : {"uniform", "sine", None}, optional
         Passed through to :class:`~nessai.reparameterisations.angle.Angle` on
         versions of nessai that accept it.
@@ -149,13 +162,14 @@ class PolarisationPhaseReparameterisation(Angle):
                 call[key] = value
         super().__init__(**call)
 
-        # psi is needed on the forward pass (delta_phase = phase + psi) and on
-        # the inverse (phase = delta_phase - psi).
-        self.requires = ["psi"]
+        # psi and theta_jn are needed on the forward pass
+        # (delta_phase = phase + sign(cos theta_jn) * psi) and on the inverse.
+        self.requires = ["psi", "theta_jn"]
         if hasattr(self, "inverse_input_parameters"):
             self.inverse_input_parameters = list(
                 dict.fromkeys(
-                    list(self.inverse_input_parameters or []) + ["psi"]
+                    list(self.inverse_input_parameters or [])
+                    + ["psi", "theta_jn"]
                 )
             )
 
@@ -179,8 +193,13 @@ class PolarisationPhaseReparameterisation(Angle):
                 "bound of 0 so the inverse wraps modulo 2*pi."
             )
 
+    @staticmethod
+    def _psi_sign(x):
+        """``sign(cos theta_jn)`` (0 exactly at edge-on -- a measure-zero set)."""
+        return np.sign(np.cos(x["theta_jn"]))
+
     def _rescale_angle(self, x, x_prime, log_j, **kwargs):
-        angle = (x["phase"] + x["psi"]) * self.scale
+        angle = (x["phase"] + self._psi_sign(x) * x["psi"]) * self.scale
         return angle, x, x_prime, log_j
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
@@ -189,5 +208,7 @@ class PolarisationPhaseReparameterisation(Angle):
         x, x_prime, log_j = super().inverse_reparameterise(
             x, x_prime, log_j, **kwargs
         )
-        x["phase"] = np.mod(x["phase"] - x["psi"], 2 * np.pi)
+        x["phase"] = np.mod(
+            x["phase"] - self._psi_sign(x) * x["psi"], 2 * np.pi
+        )
         return x, x_prime, log_j

@@ -298,6 +298,49 @@ def test_folding_concentrates_the_posterior(posterior, posterior_action):
     assert np.std(orbit_ra) > 0.9 * np.std(base["ra"])
 
 
+def _circ_std(x, period):
+    a = np.asarray(x) * (2 * np.pi / period)
+    c, s = np.mean(np.cos(a)), np.mean(np.sin(a))
+    return np.sqrt(-2 * np.log(np.hypot(c, s))) * (period / (2 * np.pi))
+
+
+def test_folding_concentrates_signed_delta_phase(posterior, posterior_action):
+    """After folding to the fundamental domain, the polarisation-phase
+    combination ``phase + sign(cos theta_jn) * psi`` is tight modulo pi -- much
+    tighter than raw ``phase`` -- which is what ``polarisation-phase`` exploits.
+    """
+    action = posterior_action
+    keys = ET_TRIANGLE_PARAMETERS
+    n = len(posterior["ra"])
+    base = _to_coords(
+        posterior["ra"], posterior["dec"], posterior["psi"],
+        posterior["theta_jn"], posterior["phase"],
+    )
+    tp = {k: torch.as_tensor(base[k]) for k in keys}
+    folded = {k: np.array(base[k]) for k in keys}
+    assigned = action.in_fundamental_domain(tp).numpy()
+    for g in range(1, ET_TRIANGLE_GROUP_SIZE):
+        image = _np(action(tp, torch.full((n,), g, dtype=torch.long)))
+        take = action.in_fundamental_domain(
+            {k: torch.as_tensor(v) for k, v in image.items()}
+        ).numpy() & ~assigned
+        for k in keys:
+            folded[k] = np.where(take, image[k], folded[k])
+        assigned |= take
+
+    psi = folded["psi"]
+    sign_ct = np.sign(folded["cos_theta_jn"])
+    dphase = folded["phase"] + sign_ct * psi
+
+    # tight modulo pi, and much tighter than raw phase
+    assert _circ_std(dphase, np.pi) < 0.5
+    assert _circ_std(dphase, np.pi) < 0.5 * _circ_std(folded["phase"], np.pi)
+    # the sign matters: the opposite sign is markedly less concentrated
+    assert _circ_std(folded["phase"] - sign_ct * psi, np.pi) > 1.5 * _circ_std(
+        dphase, np.pi
+    )
+
+
 @pytest.mark.requires("bilby")
 def test_long_wavelength_response_invariance():
     """Each group element leaves the long-wavelength single-triangle antenna
