@@ -114,6 +114,14 @@ def prime_action():
     return PrimeSpaceETGroupAction(base, PRIME_NAMES)
 
 
+@pytest.fixture(scope="module")
+def prime_action_16():
+    base = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, phase_reflection=True
+    )
+    return PrimeSpaceETGroupAction(base, PRIME_NAMES)
+
+
 def test_prime_space_action_missing_coordinate():
     base = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
     with pytest.raises(RuntimeError, match="prime space is missing"):
@@ -240,6 +248,58 @@ def test_prime_space_action_delta_phase_matches_physical(
         assert d.max() < 1e-5, g
 
 
+@pytest.mark.parametrize("g", range(16))
+def test_prime_space_action_16_inverse_round_trip(
+    prime_action_16, prime_points, g
+):
+    n = len(prime_points["ra_dec_x"])
+    modes = torch.full((n,), g, dtype=torch.long)
+    mapped = prime_action_16(prime_points, modes)
+    back = prime_action_16(mapped, modes, inverse=True)
+    for name in PRIME_NAMES:
+        assert torch.allclose(
+            back[name], prime_points[name], atol=1e-6, rtol=1e-6
+        ), (g, name)
+
+
+def test_prime_space_action_16_physical_phase(prime_action_16, prime_points):
+    """Physical phase is invariant mod 2pi for modes 0..7 and shifted by pi
+    for modes 8..15 (invariant mod pi across all 16)."""
+    n = len(prime_points["ra_dec_x"])
+    phase0 = _to_physical(prime_points)["phase"]
+    for g in range(16):
+        modes = torch.full((n,), g, dtype=torch.long)
+        mapped = prime_action_16(prime_points, modes)
+        got = _to_physical(mapped)["phase"]
+        shift = np.pi if g >= 8 else 0.0
+        d = torch.remainder(got - phase0 - shift, 2 * np.pi)
+        d = torch.minimum(d, 2 * np.pi - d)
+        assert d.max() < 1e-5, g
+        # always invariant modulo pi
+        dpi = torch.remainder(got - phase0, np.pi)
+        dpi = torch.minimum(dpi, np.pi - dpi)
+        assert dpi.max() < 1e-5, g
+
+
+def test_prime_space_action_16_delta_phase_matches_physical(
+    prime_action_16, prime_points
+):
+    n = len(prime_points["ra_dec_x"])
+    base = prime_action_16._action
+    phys0 = _to_physical(prime_points)
+    for g in range(16):
+        modes = torch.full((n,), g, dtype=torch.long)
+        phys = base(phys0, modes)
+        want = _delta_phase_from_physical(phys)
+        mapped = prime_action_16(prime_points, modes)
+        got, _ = _decode_pair(
+            mapped["delta_phase_x"], mapped["delta_phase_y"], 1.0
+        )
+        d = torch.remainder(got - want, 2 * np.pi)
+        d = torch.minimum(d, 2 * np.pi - d)
+        assert d.max() < 1e-5, g
+
+
 def test_prime_parameter_names():
     prime = _prime_parameter_names(BNS_PARAMETERS, REFERENCE_TIME)
     if not any(n.startswith("ra_dec") for n in prime):
@@ -254,14 +314,19 @@ def test_prime_parameter_names():
 
 @requires_group_mixture
 @pytest.mark.parametrize("prime_space", [True, False])
-def test_make_et_group_flow_proposal(prime_space):
+@pytest.mark.parametrize("phase_reflection", [False, True])
+def test_make_et_group_flow_proposal(prime_space, phase_reflection):
     cls = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, prime_space=prime_space
+        BNS_PARAMETERS,
+        REFERENCE_TIME,
+        prime_space=prime_space,
+        phase_reflection=phase_reflection,
     )
     from nessai.proposal import FlowProposal
     from nessai.flowmodel.group_mixture import GroupFlowProposalMixin
     from nessai_gw.proposals import GWReparamMixin
 
+    assert cls._FlowModelClass.group_size == (16 if phase_reflection else 8)
     assert cls.__qualname__ == "ETGroupFlowProposal"
     assert cls.__module__ == "nessai_gw.group_mixture"
     assert issubclass(cls, (GWReparamMixin, GroupFlowProposalMixin, FlowProposal))

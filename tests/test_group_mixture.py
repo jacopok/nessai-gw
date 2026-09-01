@@ -12,6 +12,7 @@ torch = pytest.importorskip("torch")
 
 from nessai_gw.group_mixture import (  # noqa: E402
     ET_TRIANGLE_GROUP_SIZE,
+    ET_TRIANGLE_GROUP_SIZE_PHASE,
     ET_TRIANGLE_PARAMETERS,
     ETTriangleGroupAction,
     detector_plane_normal,
@@ -28,6 +29,14 @@ DATA = (
 @pytest.fixture(scope="module")
 def action():
     return ETTriangleGroupAction(reference_time=REFERENCE_TIME)
+
+
+@pytest.fixture(scope="module")
+def phase_action():
+    """16-element action (extra ``phase -> phase + pi`` reflection)."""
+    return ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, phase_reflection=True
+    )
 
 
 @pytest.fixture(scope="module")
@@ -86,6 +95,7 @@ def _to_coords(ra, dec, psi, theta_jn, phase, geocent_time=REFERENCE_TIME):
 
 def test_metadata(action):
     assert action.group_size == ET_TRIANGLE_GROUP_SIZE == 8
+    assert action.phase_reflection is False
     assert action.parameters == ET_TRIANGLE_PARAMETERS
     assert ET_TRIANGLE_PARAMETERS == [
         "ra",
@@ -98,18 +108,38 @@ def test_metadata(action):
     assert np.isclose(np.linalg.norm(action.plane_normal), 1.0)
 
 
-def test_public_mode_helpers_match_private(action):
-    modes = torch.arange(ET_TRIANGLE_GROUP_SIZE)
-    k_pub, refl_pub = action.decode_modes(modes)
-    k_priv, refl_priv = ETTriangleGroupAction._decode(modes)
+def test_metadata_phase_reflection(phase_action):
+    assert phase_action.group_size == ET_TRIANGLE_GROUP_SIZE_PHASE == 16
+    assert phase_action.phase_reflection is True
+    # class default is unchanged
+    assert ETTriangleGroupAction.group_size == 8
+
+
+@pytest.mark.parametrize("phase_reflection", [False, True])
+def test_public_mode_helpers_match_private(phase_reflection):
+    action = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, phase_reflection=phase_reflection
+    )
+    modes = torch.arange(action.group_size)
+    k_pub, refl_pub, pf_pub = action.decode_modes(modes)
+    k_priv, refl_priv, pf_priv = ETTriangleGroupAction._decode(modes)
     assert torch.equal(k_pub, k_priv)
     assert torch.equal(refl_pub, refl_priv)
+    assert torch.equal(pf_pub, pf_priv)
+    if not phase_reflection:
+        assert not pf_pub.any()
+    else:
+        assert torch.equal(pf_pub, modes >= 8)
     assert torch.equal(
         action.invert_modes(modes), ETTriangleGroupAction._invert_modes(modes)
     )
     # every element composed with its inverse is the identity
     assert torch.equal(
         action.invert_modes(action.invert_modes(modes)), modes
+    )
+    # the inverse is a permutation of 0..group_size-1
+    assert torch.equal(
+        torch.sort(action.invert_modes(modes)).values, modes
     )
 
 
@@ -198,6 +228,89 @@ def test_group_closure(action, random_points):
                 ):
                     matches += 1
             assert matches == 1, (g, h, matches)
+
+
+# ---------------------------------------------------------------------------
+# 16-element variant (phase_reflection=True)
+# ---------------------------------------------------------------------------
+
+
+def test_phase_reflection_element(phase_action, action, random_points):
+    """Modes 8..15 = modes 0..7 with ``phase -> (phase + pi) mod 2pi``."""
+    n = len(random_points["ra"])
+    for base_g in range(ET_TRIANGLE_GROUP_SIZE):
+        m8 = torch.full((n,), base_g, dtype=torch.long)
+        m16 = torch.full((n,), base_g + 8, dtype=torch.long)
+        out8 = _np(phase_action(random_points, m8))
+        out16 = _np(phase_action(random_points, m16))
+        # the 8-element action agrees with the 16-element action on modes 0..7
+        ref8 = _np(action(random_points, m8))
+        for key in METRICS:
+            assert _dist(key, out8[key], ref8[key]).max() < 1e-9, (base_g, key)
+        for key in METRICS:
+            if key == "phase":
+                shifted = (out8["phase"] + np.pi) % (2 * np.pi)
+                assert _dist("phase", out16["phase"], shifted).max() < 1e-9
+            else:
+                assert _dist(key, out16[key], out8[key]).max() < 1e-9, key
+
+
+@pytest.mark.parametrize("g", range(ET_TRIANGLE_GROUP_SIZE_PHASE))
+def test_inverse_round_trip_16(phase_action, random_points, g):
+    modes = torch.full((len(random_points["ra"]),), g, dtype=torch.long)
+    transformed = phase_action(random_points, modes)
+    recovered = _np(phase_action(transformed, modes, inverse=True))
+    ref = _np(random_points)
+    for key in METRICS:
+        assert _dist(key, recovered[key], ref[key]).max() < 1e-8, (g, key)
+
+
+def test_outputs_in_prior_ranges_16(phase_action, random_points):
+    for g in range(ET_TRIANGLE_GROUP_SIZE_PHASE):
+        modes = torch.full((len(random_points["ra"]),), g, dtype=torch.long)
+        out = _np(phase_action(random_points, modes))
+        assert np.all((out["ra"] >= 0) & (out["ra"] <= 2 * np.pi))
+        assert np.all(np.abs(out["sin_dec"]) <= 1 + 1e-9)
+        assert np.all((out["psi"] >= 0) & (out["psi"] <= np.pi))
+        assert np.all(np.abs(out["cos_theta_jn"]) <= 1 + 1e-9)
+        assert np.all((out["phase"] >= 0) & (out["phase"] <= 2 * np.pi))
+
+
+def test_action_is_measure_preserving_16(phase_action, random_points):
+    """Unit Jacobian in ``(ra, sin_dec, cos_theta_jn, psi, phase)`` for all 16."""
+    keys = ["ra", "sin_dec", "cos_theta_jn", "psi", "phase"]
+    base = {k: random_points[k][:64].clone() for k in METRICS}
+    eps = 1e-6
+    for g in range(ET_TRIANGLE_GROUP_SIZE_PHASE):
+        n = len(base["ra"])
+        modes = torch.full((n,), g, dtype=torch.long)
+        f0 = _np(phase_action(base, modes))
+        jac = np.zeros((n, len(keys), len(keys)))
+        for j, kj in enumerate(keys):
+            pert = {k: v.clone() for k, v in base.items()}
+            pert[kj] = pert[kj] + eps
+            f1 = _np(phase_action(pert, modes))
+            for i, ki in enumerate(keys):
+                d = f1[ki] - f0[ki]
+                if METRICS[ki][0] == "circ":
+                    p = METRICS[ki][1]
+                    d = (d + p / 2) % p - p / 2
+                jac[:, i, j] = d / eps
+        det = np.abs(np.linalg.det(jac))
+        assert np.allclose(det, 1.0, atol=1e-3), (g, det.min(), det.max())
+
+
+def test_fundamental_domain_partitions_every_orbit_16(
+    phase_action, random_points
+):
+    """Exactly one of the sixteen images of each point is canonical."""
+    n = len(random_points["ra"])
+    in_domain = np.zeros((ET_TRIANGLE_GROUP_SIZE_PHASE, n), dtype=bool)
+    for g in range(ET_TRIANGLE_GROUP_SIZE_PHASE):
+        modes = torch.full((n,), g, dtype=torch.long)
+        image = phase_action(random_points, modes)
+        in_domain[g] = phase_action.in_fundamental_domain(image).numpy()
+    assert np.array_equal(in_domain.sum(axis=0), np.ones(n, dtype=int))
 
 
 # ---------------------------------------------------------------------------
@@ -459,3 +572,8 @@ def test_make_flow_factory():
     assert cls.param_names == ET_TRIANGLE_PARAMETERS
     assert callable(cls.group_action_fn)
     assert callable(cls.in_fundamental_domain)
+
+    cls16 = make_et_triangle_group_mixture_flow(
+        reference_time=REFERENCE_TIME, phase_reflection=True
+    )
+    assert cls16.group_size == ET_TRIANGLE_GROUP_SIZE_PHASE

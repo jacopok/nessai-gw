@@ -64,10 +64,14 @@ def _domain_mask(action, tp, domain):
     lam_f, beta_f, _ = action._to_frame(tp["ra"], dec, tp["psi"])
     in_quarter = torch.remainder(lam_f, _TWO_PI) < 0.5 * np.pi
     if domain == "beta":
-        return in_quarter & (beta_f >= 0.0)
+        mask = in_quarter & (beta_f >= 0.0)
     elif domain == "face":
-        return in_quarter & (tp["cos_theta_jn"] >= 0.0)
-    raise ValueError(domain)
+        mask = in_quarter & (tp["cos_theta_jn"] >= 0.0)
+    else:
+        raise ValueError(domain)
+    if action.phase_reflection:
+        mask = mask & (torch.remainder(tp["phase"], _TWO_PI) < np.pi)
+    return mask
 
 
 def fold(action, coords, domain):
@@ -75,7 +79,7 @@ def fold(action, coords, domain):
     tp = {k: torch.as_tensor(np.asarray(coords[k], float)) for k in _KEYS}
     folded = {k: np.asarray(tp[k]) for k in _KEYS}
     assigned = _domain_mask(action, tp, domain).numpy()
-    for g in range(1, ET_TRIANGLE_GROUP_SIZE):
+    for g in range(1, action.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         image = {k: v.numpy() for k, v in action(tp, modes).items()}
         it = {k: torch.as_tensor(v) for k, v in image.items()}
@@ -183,13 +187,20 @@ def main():
     p.add_argument("--domains", nargs="+", default=["beta", "face"])
     p.add_argument(
         "--combos", nargs="+",
-        default=["phase", "phase+psi", "phase-psi"],
+        default=["phase", "signed", "phase+psi", "phase-psi"],
+    )
+    p.add_argument(
+        "--group", type=int, choices=[8, 16], default=8,
+        help="8 = Z4xZ2; 16 also folds phase<->phase+pi (needs 'signed' combo "
+        "at period 2pi to see the benefit)",
     )
     args = p.parse_args()
 
     post = load_posterior()
     reference_time = float(np.mean(post["geocent_time"]))
-    action = ETTriangleGroupAction(reference_time=reference_time)
+    action = ETTriangleGroupAction(
+        reference_time=reference_time, phase_reflection=(args.group == 16)
+    )
     coords = to_coords(post)
     n = len(coords["ra"])
 
@@ -200,8 +211,32 @@ def main():
 
     folds = {d: fold(action, coords, d) for d in args.domains}
 
+    # empirical mixture weights update_mixture_weights would assign: for each
+    # posterior sample, which of the group elements lands it in the fundamental
+    # domain.  For an exact symmetry the phase-flip pair (g, g+8) get equal
+    # weight; the split shows how approximate phase <-> phase + pi is.
+    mixture_weights = {}
+    for domain in args.domains:
+        tp = {k: torch.as_tensor(np.asarray(coords[k], float)) for k in _KEYS}
+        assign = np.full(n, -1)
+        for g in range(action.group_size):
+            img = action(tp, torch.full((n,), g, dtype=torch.long))
+            m = _domain_mask(
+                action, {k: v for k, v in img.items()}, domain
+            ).numpy()
+            assign[(assign < 0) & m] = g
+        w = np.bincount(assign[assign >= 0], minlength=action.group_size)
+        w = (w / w.sum()).round(4).tolist()
+        mixture_weights[domain] = w
+        print(f"mixture weights [{domain}] group={action.group_size}: {w}")
+        if action.group_size == 16:
+            lo, hi = np.array(w[:8]), np.array(w[8:])
+            print(f"  phase / phase+pi total: {lo.sum():.3f} / {hi.sum():.3f}"
+                  f"   per-pair |Delta w|: {np.abs(lo - hi).round(4).tolist()}")
+
     results = {"reference_time": reference_time, "n": n, "n_val": n_val,
-               "config": vars(args), "runs": {}}
+               "config": vars(args), "mixture_weights": mixture_weights,
+               "runs": {}}
     curves = {}
     for domain in args.domains:
         folded = folds[domain]
@@ -257,8 +292,7 @@ def main():
         ax = axes[r][1]
         best = {c: results["runs"][f"{domain}/{c}"]["best_val_nll_mean"]
                 for c in args.combos}
-        bars = ax.bar(list(best), list(best.values()),
-                      color=["0.5", "tab:blue", "tab:orange"])
+        bars = ax.bar(list(best), list(best.values()))
         ax.set_ylabel("best val NLL (lower better)")
         ax.set_title(f"domain '{domain}': best val NLL by phase coordinate")
         for b, v in zip(bars, best.values()):

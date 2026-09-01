@@ -132,8 +132,13 @@ class PolarisationPhaseReparameterisation(Angle):
         gives period ``2*pi`` and keeps the map an exact bijection.  ``2.0``
         (period ``pi``) fits noticeably tighter still by folding out the
         ``phase -> phase + pi`` (2, 2)-mode degeneracy, at the cost of
-        discarding that (weak, for BNS) distinction -- only use it if the
-        likelihood really cannot resolve it.
+        discarding that (weak, for BNS) distinction and making the map 2->1.
+        The **preferred** way to exploit that degeneracy is instead a
+        16-element group action
+        (:class:`nessai_gw.group_mixture.ETTriangleGroupAction` with
+        ``phase_reflection=True``): the mixture folds ``phase <-> phase + pi``
+        and its fitted weight absorbs the inexactness, while this
+        reparameterisation stays a clean bijection at ``scale=1.0``.
     prior : {"uniform", "sine", None}, optional
         Passed through to :class:`~nessai.reparameterisations.angle.Angle` on
         versions of nessai that accept it.
