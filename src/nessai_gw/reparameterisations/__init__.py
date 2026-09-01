@@ -9,6 +9,7 @@ from nessai.reparameterisations import (
 
 from .distance import DistanceReparameterisation
 from .phase import DeltaPhaseReparameterisation
+from .spin import AlignedSpinReparameterisation
 
 known_reparameterisations = ReparameterisationDict()
 known_reparameterisations.add_reparameterisation(
@@ -49,6 +50,11 @@ known_reparameterisations.add_reparameterisation(
     "mass",
     RescaleToBounds,
     {"update_bounds": True},
+)
+known_reparameterisations.add_reparameterisation(
+    "aligned-spin",
+    AlignedSpinReparameterisation,
+    {},
 )
 known_reparameterisations.add_reparameterisation(
     "delta_phase",
