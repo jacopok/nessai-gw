@@ -41,8 +41,8 @@ class GWReparamMixin:
         "time_jitter": ("periodic", None),
         "a_1": ("default", None),
         "a_2": ("default", None),
-        "chi_1": ("default", None),
-        "chi_2": ("default", None),
+        "chi_1": ("aligned-spin", None),
+        "chi_2": ("aligned-spin", None),
         "luminosity_distance": ("distance", None),
     }
     """
