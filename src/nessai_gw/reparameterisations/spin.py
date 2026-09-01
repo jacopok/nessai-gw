@@ -58,18 +58,25 @@ class AlignedSpinReparameterisation(Reparameterisation):
     def __init__(
         self,
         parameters=None,
+        input_parameters=None,
         prior_bounds=None,
         n_interp=2000,
         rng=None,
+        **kwargs,
     ):
         super().__init__(
-            parameters=parameters, prior_bounds=prior_bounds, rng=rng
+            parameters=parameters,
+            input_parameters=input_parameters,
+            prior_bounds=prior_bounds,
+            rng=rng,
+            **kwargs,
         )
 
         if len(self.parameters) > 1:
             raise RuntimeError(
                 "AlignedSpinReparameterisation only supports one parameter"
             )
+        self.prime_parameters = [f"{self.parameters[0]}_prime"]
 
         lower, upper = self.prior_bounds[self.parameters[0]]
         self.a_max = float(max(abs(lower), abs(upper)))
