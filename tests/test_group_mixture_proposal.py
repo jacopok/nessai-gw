@@ -16,6 +16,7 @@ from nessai_gw.group_mixture import (  # noqa: E402
     PrimeSpaceTriangularGroupAction,
     TriangularDetectorGroupAction,
     _prime_parameter_names,
+    recommended_sky_azimuth_offset,
     triangular_group_reparameterisations,
     make_et_group_flow_proposal,
 )
@@ -447,6 +448,59 @@ def test_fundamental_domain_is_positive_sky_octant(prime_action, prime_points):
             assert torch.all(image[c][canon] > -1e-9), (g, c)
         seen |= canon
     assert torch.all(seen)
+
+
+def test_azimuth_offset_rotates_frame_and_moves_seam():
+    a0 = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
+    off = 0.6
+    a1 = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, azimuth_offset=off
+    )
+    # e3 (normal) unchanged; e1/e2 rotated by `off` about e3
+    np.testing.assert_allclose(a1._basis_np[2], a0._basis_np[2], atol=1e-12)
+    c, s = np.cos(off), np.sin(off)
+    np.testing.assert_allclose(
+        a1._basis_np[0], c * a0._basis_np[0] + s * a0._basis_np[1], atol=1e-12
+    )
+    # sky_frame_rotation follows, still orthogonal
+    np.testing.assert_allclose(
+        a1.sky_frame_rotation @ a1.sky_frame_rotation.T, np.eye(3), atol=1e-10
+    )
+
+
+def test_recommended_sky_azimuth_offset_centres_the_wedge():
+    """A localised sky blob: the recommended offset moves its folded azimuth
+    circular mean to pi/4, and re-measuring with that offset confirms it."""
+    rng = np.random.default_rng(0)
+    ra = rng.normal(0.9694, 0.05, 4000)
+    dec = rng.normal(-1.1491, 0.05, 4000)
+    a0 = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
+    d0 = recommended_sky_azimuth_offset(a0, ra, dec)
+    assert d0["concentration"] > 0.8  # tight blob -> well localised
+    a1 = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME,
+        azimuth_offset=d0["recommended_azimuth_offset"],
+    )
+    d1 = recommended_sky_azimuth_offset(a1, ra, dec)
+    assert d1["circ_mean_lambda"] == pytest.approx(np.pi / 4, abs=0.02)
+    assert d1["recommended_azimuth_offset"] == pytest.approx(0.0, abs=0.02)
+
+
+@requires_group_mixture
+@pytest.mark.parametrize("boundary_reflection", [False, True])
+def test_make_et_group_flow_proposal_reflection_and_offset(boundary_reflection):
+    cls = make_et_group_flow_proposal(
+        BNS_PARAMETERS,
+        REFERENCE_TIME,
+        azimuth_offset=0.3,
+        boundary_reflection=boundary_reflection,
+    )
+    expect = (
+        ["ra_dec_x", "ra_dec_y", "ra_dec_z"] if boundary_reflection else None
+    )
+    assert (
+        getattr(cls._FlowModelClass, "reflect_parameters", None) == expect
+    )
 
 
 @requires_group_mixture

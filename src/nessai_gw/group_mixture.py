@@ -281,18 +281,26 @@ def _greenwich_mean_sidereal_time(gps_time: float) -> float:
         return (gmst_seconds * np.pi / 43200.0) % _TWO_PI
 
 
-def _detector_frame_basis(plane_normal: np.ndarray) -> np.ndarray:
+def _detector_frame_basis(
+    plane_normal: np.ndarray, azimuth_offset: float = 0.0
+) -> np.ndarray:
     """Orthonormal Earth-fixed basis ``[e1, e2, e3]`` with ``e3`` the normal.
 
-    ``e1`` is the (Earth-fixed) z-axis projected into the plane.  The choice
-    of in-plane axes only shifts ``lambda`` and ``psi`` by a constant, which
-    the group action is equivariant under, so it does not matter.
+    ``e1`` is the (Earth-fixed) z-axis projected into the plane, then rotated
+    about ``e3`` by ``azimuth_offset``.  The physical group action is
+    equivariant under this in-plane rotation (it only shifts ``lambda`` and
+    ``psi`` by a constant), but the *fundamental domain* -- detector-frame
+    azimuth in ``[0, pi/2)`` -- is not: ``azimuth_offset`` moves the Z4 seams
+    off the sky-posterior peak (see :func:`recommended_sky_azimuth_offset`).
     """
     e3 = np.asarray(plane_normal, dtype=float)
     e3 = e3 / np.linalg.norm(e3)
     e1 = np.array([0.0, 0.0, 1.0]) - e3[2] * e3
     e1 = e1 / np.linalg.norm(e1)
     e2 = np.cross(e3, e1)
+    if azimuth_offset:
+        c, s = np.cos(azimuth_offset), np.sin(azimuth_offset)
+        e1, e2 = c * e1 + s * e2, -s * e1 + c * e2
     return np.stack([e1, e2, e3])
 
 
@@ -356,9 +364,13 @@ class TriangularDetectorGroupAction:
         plane_normal,
         vertex,
         phase_reflection=False,
+        azimuth_offset=0.0,
     ):
         self.reference_time = float(reference_time)
         self.phase_reflection = bool(phase_reflection)
+        #: In-plane rotation (rad) of the detector frame about the plane
+        #: normal; moves the Z4 fundamental-domain seams off the sky peak.
+        self.azimuth_offset = float(azimuth_offset)
         #: Instance attribute (shadows the class default): 16 when the extra
         #: ``phase -> phase + pi`` reflection is folded in, else 8.
         self.group_size = (
@@ -368,7 +380,9 @@ class TriangularDetectorGroupAction:
         )
         self.gmst = _greenwich_mean_sidereal_time(self.reference_time)
         self.plane_normal = np.asarray(plane_normal, dtype=float)
-        self._basis_np = _detector_frame_basis(self.plane_normal)
+        self._basis_np = _detector_frame_basis(
+            self.plane_normal, self.azimuth_offset
+        )
         self._basis = torch.as_tensor(self._basis_np, dtype=torch.float64)
         self.vertex = np.asarray(vertex, dtype=float)
         self._vertex = torch.as_tensor(self.vertex, dtype=torch.float64)
@@ -566,6 +580,7 @@ def make_triangular_group_mixture_flow(
     vertex,
     parameters=None,
     phase_reflection=False,
+    azimuth_offset=0.0,
 ):
     """Build a group-mixture ``FlowModel`` class for a triangular detector.
 
@@ -604,6 +619,7 @@ def make_triangular_group_mixture_flow(
         plane_normal=plane_normal,
         vertex=vertex,
         phase_reflection=phase_reflection,
+        azimuth_offset=azimuth_offset,
     )
     names = list(parameters) if parameters is not None else action.parameters
     return make_group_mixture_flow(
@@ -1074,6 +1090,58 @@ def _prime_parameter_names(sampling_parameters, reference_time):
     return out
 
 
+def recommended_sky_azimuth_offset(action, ra, dec):
+    """Fold ``(ra, dec)`` to the fundamental domain and report its azimuth.
+
+    Returns a dict with
+
+    * ``concentration`` -- 0 (folded azimuth uniform on ``[0, pi/2)``) to 1
+      (delta).  A recentre is only worth triggering once this is well above
+      ~0.5 (the canonical sky posterior is genuinely localised).
+    * ``circ_mean_lambda`` -- circular mean of the folded detector-frame
+      azimuth, in ``[0, pi/2)``.
+    * ``recommended_azimuth_offset`` -- the extra ``azimuth_offset`` (rad,
+      taken mod ``pi/2``) that would move ``circ_mean_lambda`` to ``pi/4``,
+      the centre of the fundamental wedge, so the Z4 seams sit furthest from
+      the peak.  Pass it to :func:`make_et_group_flow_proposal` (added to any
+      current offset) and retrain the flow from scratch.
+    * ``fraction_near_seam`` -- fraction of points within 0.15 rad of a Z4
+      seam under the current frame.
+
+    ``action`` is any :class:`TriangularDetectorGroupAction`; only its
+    ``sky_frame_rotation`` is used.
+    """
+    ra = np.asarray(ra, dtype=float)
+    dec = np.asarray(dec, dtype=float)
+    R = np.asarray(action.sky_frame_rotation, dtype=float)
+    w_eq = np.stack(
+        [np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)],
+        axis=-1,
+    )
+    wf = w_eq @ R.T
+    # fold to the canonical +++ octant: reflect z, bring azimuth to [0, pi/2)
+    x, y, z = wf[:, 0].copy(), wf[:, 1].copy(), np.abs(wf[:, 2])
+    lam = np.mod(np.arctan2(y, x), 2 * np.pi)
+    k = np.floor(lam / (0.5 * np.pi))
+    ang = -k * (0.5 * np.pi)
+    xr = np.cos(ang) * x - np.sin(ang) * y
+    yr = np.sin(ang) * x + np.cos(ang) * y
+    lam_f = np.mod(np.arctan2(yr, xr), 0.5 * np.pi)
+    z4 = np.mean(np.exp(4j * lam_f))
+    circ_mean = np.mod(np.angle(z4) / 4.0, 0.5 * np.pi)
+    return {
+        "concentration": float(np.abs(z4)),
+        "circ_mean_lambda": float(circ_mean),
+        "recommended_azimuth_offset": float(
+            np.mod(circ_mean - 0.25 * np.pi, 0.5 * np.pi)
+        ),
+        "fraction_near_seam": float(
+            np.mean((lam_f < 0.15) | (lam_f > 0.5 * np.pi - 0.15))
+        ),
+        "n": int(ra.size),
+    }
+
+
 def make_triangular_group_flow_proposal(
     sampling_parameters,
     reference_time,
@@ -1081,6 +1149,8 @@ def make_triangular_group_flow_proposal(
     vertex,
     prime_space=True,
     phase_reflection=False,
+    azimuth_offset=0.0,
+    boundary_reflection=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1112,6 +1182,17 @@ def make_triangular_group_flow_proposal(
     phase_reflection : bool, optional
         Fold in the extra ``phase -> phase + pi`` (2, 2)-mode degeneracy
         (16-element group).  See :class:`TriangularDetectorGroupAction`.
+    azimuth_offset : float, optional
+        In-plane rotation (rad) of the detector frame about the plane normal,
+        moving the Z4 fundamental-domain seams off the sky-posterior peak.
+        Use :func:`recommended_sky_azimuth_offset` on a localised run to pick
+        it, then retrain from scratch.  Default ``0.0``.
+    boundary_reflection : bool, optional
+        Only on the prime-space path.  Symmetrise the base flow across the
+        ``ra_dec_{x,y,z} = 0`` octant faces so it need not model the wall
+        cliffs (see ``reflect_parameters`` in
+        :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow`).
+        Default ``False``.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1144,11 +1225,28 @@ def make_triangular_group_flow_proposal(
         plane_normal=plane_normal,
         vertex=vertex,
         phase_reflection=phase_reflection,
+        azimuth_offset=azimuth_offset,
     )
 
     if prime_space:
         prime_names = _prime_parameter_names(names, reference_time)
         action = PrimeSpaceTriangularGroupAction(base_action, prime_names)
+        gm_kwargs = {}
+        if boundary_reflection:
+            import inspect as _inspect
+
+            if "reflect_parameters" not in _inspect.signature(
+                make_group_mixture_flow
+            ).parameters:
+                raise RuntimeError(
+                    "boundary_reflection requires a version of nessai whose "
+                    "make_group_mixture_flow accepts `reflect_parameters`."
+                )
+            gm_kwargs["reflect_parameters"] = [
+                p
+                for p in ("ra_dec_x", "ra_dec_y", "ra_dec_z")
+                if p in prime_names
+            ]
         flow_model_cls = make_group_mixture_flow(
             group_action_fn=action,  # ignored on the prime-space path
             group_size=base_action.group_size,
@@ -1156,6 +1254,7 @@ def make_triangular_group_flow_proposal(
             prime_space_action=action,
             prime_space_in_domain=action.in_fundamental_domain,
             min_canon_std=_MIN_CANON_STD,
+            **gm_kwargs,
         )
     else:
         action = None
@@ -1209,7 +1308,40 @@ def make_triangular_group_flow_proposal(
             prime = list(getattr(self, "prime_parameters", []) or [])
             if model is not None and prime:
                 action.bind(prime)
-                model.param_names = prime
+                if hasattr(model, "set_param_names"):
+                    model.set_param_names(prime)
+                else:
+                    model.param_names = prime
+
+        def train(self, x, **kwargs):
+            out = super().train(x, **kwargs)
+            try:
+                names = getattr(getattr(x, "dtype", None), "names", None) or ()
+                if "ra" in names and "dec" in names:
+                    d = recommended_sky_azimuth_offset(
+                        base_action, x["ra"], x["dec"]
+                    )
+                    logger.info(
+                        "[sky] folded-azimuth concentration %.3f, circ-mean "
+                        "%.3f rad; current azimuth_offset %.4f, recommended "
+                        "extra offset %.4f rad (%.1f deg); %.1f%% of points "
+                        "near a Z4 seam. %s",
+                        d["concentration"],
+                        d["circ_mean_lambda"],
+                        base_action.azimuth_offset,
+                        d["recommended_azimuth_offset"],
+                        np.degrees(d["recommended_azimuth_offset"]),
+                        100 * d["fraction_near_seam"],
+                        (
+                            "Well localised -- a recentre + full retrain is "
+                            "worthwhile."
+                            if d["concentration"] > 0.5
+                            else "Not localised enough to recentre yet."
+                        ),
+                    )
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                logger.debug("sky azimuth diagnostic failed: %s", exc)
+            return out
 
     # nessai checkpoints the sampler (hence the proposal *instance*) with
     # ``pickle``, which resolves an instance's class by ``module.__qualname__``.
@@ -1262,6 +1394,7 @@ class ETTriangleGroupAction(TriangularDetectorGroupAction):
         plane_normal=None,
         vertex=None,
         phase_reflection=False,
+        azimuth_offset=0.0,
     ):
         super().__init__(
             reference_time,
@@ -1270,6 +1403,7 @@ class ETTriangleGroupAction(TriangularDetectorGroupAction):
             ),
             vertex=ET_EMR_VERTEX if vertex is None else vertex,
             phase_reflection=phase_reflection,
+            azimuth_offset=azimuth_offset,
         )
 
 
@@ -1279,6 +1413,7 @@ def make_et_triangle_group_mixture_flow(
     vertex=None,
     parameters=None,
     phase_reflection=False,
+    azimuth_offset=0.0,
 ):
     """:func:`make_triangular_group_mixture_flow` with the ET-EMR geometry."""
     return make_triangular_group_mixture_flow(
@@ -1289,6 +1424,7 @@ def make_et_triangle_group_mixture_flow(
         vertex=ET_EMR_VERTEX if vertex is None else vertex,
         parameters=parameters,
         phase_reflection=phase_reflection,
+        azimuth_offset=azimuth_offset,
     )
 
 
@@ -1299,6 +1435,8 @@ def make_et_group_flow_proposal(
     vertex=None,
     prime_space=True,
     phase_reflection=False,
+    azimuth_offset=0.0,
+    boundary_reflection=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -1310,4 +1448,6 @@ def make_et_group_flow_proposal(
         vertex=ET_EMR_VERTEX if vertex is None else vertex,
         prime_space=prime_space,
         phase_reflection=phase_reflection,
+        azimuth_offset=azimuth_offset,
+        boundary_reflection=boundary_reflection,
     )
