@@ -11,10 +11,13 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from nessai_gw.group_mixture import (  # noqa: E402
-    ET_TRIANGLE_GROUP_SIZE,
-    ET_TRIANGLE_GROUP_SIZE_PHASE,
-    ET_TRIANGLE_PARAMETERS,
+    ET_EMR_PLANE_NORMAL,
+    ET_EMR_VERTEX,
+    TRIANGULAR_DETECTOR_GROUP_SIZE,
+    TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE,
+    TRIANGULAR_DETECTOR_PARAMETERS,
     ETTriangleGroupAction,
+    TriangularDetectorGroupAction,
     detector_plane_normal,
 )
 
@@ -94,10 +97,10 @@ def _to_coords(ra, dec, psi, theta_jn, phase, geocent_time=REFERENCE_TIME):
 
 
 def test_metadata(action):
-    assert action.group_size == ET_TRIANGLE_GROUP_SIZE == 8
+    assert action.group_size == TRIANGULAR_DETECTOR_GROUP_SIZE == 8
     assert action.phase_reflection is False
-    assert action.parameters == ET_TRIANGLE_PARAMETERS
-    assert ET_TRIANGLE_PARAMETERS == [
+    assert action.parameters == TRIANGULAR_DETECTOR_PARAMETERS
+    assert TRIANGULAR_DETECTOR_PARAMETERS == [
         "ra",
         "sin_dec",
         "cos_theta_jn",
@@ -108,8 +111,38 @@ def test_metadata(action):
     assert np.isclose(np.linalg.norm(action.plane_normal), 1.0)
 
 
+def test_et_is_thin_subclass():
+    """``ETTriangleGroupAction`` only fills in the ET-EMR geometry."""
+    et = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
+    assert isinstance(et, TriangularDetectorGroupAction)
+    assert np.allclose(et.plane_normal, ET_EMR_PLANE_NORMAL)
+    assert np.allclose(et.vertex, ET_EMR_VERTEX)
+
+    generic = TriangularDetectorGroupAction(
+        REFERENCE_TIME,
+        plane_normal=ET_EMR_PLANE_NORMAL,
+        vertex=ET_EMR_VERTEX,
+    )
+    rng = np.random.default_rng(7)
+    n = 256
+    pts = {
+        "ra": torch.as_tensor(rng.uniform(0, 2 * np.pi, n)),
+        "sin_dec": torch.as_tensor(rng.uniform(-1, 1, n)),
+        "cos_theta_jn": torch.as_tensor(rng.uniform(-1, 1, n)),
+        "psi": torch.as_tensor(rng.uniform(0, np.pi, n)),
+        "phase": torch.as_tensor(rng.uniform(0, 2 * np.pi, n)),
+        "geocent_time": torch.as_tensor(REFERENCE_TIME + rng.uniform(-0.1, 0.1, n)),
+    }
+    for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE):
+        modes = torch.full((n,), g, dtype=torch.long)
+        oe = et(pts, modes)
+        og = generic(pts, modes)
+        for key in METRICS:
+            assert torch.allclose(oe[key], og[key])
+
+
 def test_metadata_phase_reflection(phase_action):
-    assert phase_action.group_size == ET_TRIANGLE_GROUP_SIZE_PHASE == 16
+    assert phase_action.group_size == TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE == 16
     assert phase_action.phase_reflection is True
     # class default is unchanged
     assert ETTriangleGroupAction.group_size == 8
@@ -151,7 +184,7 @@ def test_identity_element(action, random_points):
         assert _dist(key, out[key], ref[key]).max() < 1e-9
 
 
-@pytest.mark.parametrize("g", range(ET_TRIANGLE_GROUP_SIZE))
+@pytest.mark.parametrize("g", range(TRIANGULAR_DETECTOR_GROUP_SIZE))
 def test_inverse_round_trip(action, random_points, g):
     modes = torch.full((len(random_points["ra"]),), g, dtype=torch.long)
     transformed = action(random_points, modes)
@@ -162,7 +195,7 @@ def test_inverse_round_trip(action, random_points, g):
 
 
 def test_outputs_in_prior_ranges(action, random_points):
-    for g in range(ET_TRIANGLE_GROUP_SIZE):
+    for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE):
         modes = torch.full((len(random_points["ra"]),), g, dtype=torch.long)
         out = _np(action(random_points, modes))
         assert np.all((out["ra"] >= 0) & (out["ra"] <= 2 * np.pi))
@@ -179,7 +212,7 @@ def test_action_is_measure_preserving(action, random_points):
     keys = ["ra", "sin_dec", "cos_theta_jn", "psi"]
     base = {k: random_points[k][:64].clone() for k in METRICS}
     eps = 1e-6
-    for g in range(ET_TRIANGLE_GROUP_SIZE):
+    for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE):
         n = len(base["ra"])
         modes = torch.full((n,), g, dtype=torch.long)
         f0 = _np(action(base, modes))
@@ -202,8 +235,8 @@ def test_action_is_measure_preserving(action, random_points):
 def test_fundamental_domain_partitions_every_orbit(action, random_points):
     """Exactly one of the eight images of each point is canonical."""
     n = len(random_points["ra"])
-    in_domain = np.zeros((ET_TRIANGLE_GROUP_SIZE, n), dtype=bool)
-    for g in range(ET_TRIANGLE_GROUP_SIZE):
+    in_domain = np.zeros((TRIANGULAR_DETECTOR_GROUP_SIZE, n), dtype=bool)
+    for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE):
         modes = torch.full((n,), g, dtype=torch.long)
         image = action(random_points, modes)
         in_domain[g] = action.in_fundamental_domain(image).numpy()
@@ -219,7 +252,7 @@ def test_group_closure(action, random_points):
             mh = torch.full((n,), h, dtype=torch.long)
             composed = _np(action(action(random_points, mh), mg))
             matches = 0
-            for k in range(ET_TRIANGLE_GROUP_SIZE):
+            for k in range(TRIANGULAR_DETECTOR_GROUP_SIZE):
                 mk = torch.full((n,), k, dtype=torch.long)
                 cand = _np(action(random_points, mk))
                 if all(
@@ -238,7 +271,7 @@ def test_group_closure(action, random_points):
 def test_phase_reflection_element(phase_action, action, random_points):
     """Modes 8..15 = modes 0..7 with ``phase -> (phase + pi) mod 2pi``."""
     n = len(random_points["ra"])
-    for base_g in range(ET_TRIANGLE_GROUP_SIZE):
+    for base_g in range(TRIANGULAR_DETECTOR_GROUP_SIZE):
         m8 = torch.full((n,), base_g, dtype=torch.long)
         m16 = torch.full((n,), base_g + 8, dtype=torch.long)
         out8 = _np(phase_action(random_points, m8))
@@ -255,7 +288,7 @@ def test_phase_reflection_element(phase_action, action, random_points):
                 assert _dist(key, out16[key], out8[key]).max() < 1e-9, key
 
 
-@pytest.mark.parametrize("g", range(ET_TRIANGLE_GROUP_SIZE_PHASE))
+@pytest.mark.parametrize("g", range(TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE))
 def test_inverse_round_trip_16(phase_action, random_points, g):
     modes = torch.full((len(random_points["ra"]),), g, dtype=torch.long)
     transformed = phase_action(random_points, modes)
@@ -266,7 +299,7 @@ def test_inverse_round_trip_16(phase_action, random_points, g):
 
 
 def test_outputs_in_prior_ranges_16(phase_action, random_points):
-    for g in range(ET_TRIANGLE_GROUP_SIZE_PHASE):
+    for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE):
         modes = torch.full((len(random_points["ra"]),), g, dtype=torch.long)
         out = _np(phase_action(random_points, modes))
         assert np.all((out["ra"] >= 0) & (out["ra"] <= 2 * np.pi))
@@ -281,7 +314,7 @@ def test_action_is_measure_preserving_16(phase_action, random_points):
     keys = ["ra", "sin_dec", "cos_theta_jn", "psi", "phase"]
     base = {k: random_points[k][:64].clone() for k in METRICS}
     eps = 1e-6
-    for g in range(ET_TRIANGLE_GROUP_SIZE_PHASE):
+    for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE):
         n = len(base["ra"])
         modes = torch.full((n,), g, dtype=torch.long)
         f0 = _np(phase_action(base, modes))
@@ -305,8 +338,8 @@ def test_fundamental_domain_partitions_every_orbit_16(
 ):
     """Exactly one of the sixteen images of each point is canonical."""
     n = len(random_points["ra"])
-    in_domain = np.zeros((ET_TRIANGLE_GROUP_SIZE_PHASE, n), dtype=bool)
-    for g in range(ET_TRIANGLE_GROUP_SIZE_PHASE):
+    in_domain = np.zeros((TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE, n), dtype=bool)
+    for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE):
         modes = torch.full((n,), g, dtype=torch.long)
         image = phase_action(random_points, modes)
         in_domain[g] = phase_action.in_fundamental_domain(image).numpy()
@@ -365,7 +398,7 @@ def test_folding_concentrates_the_posterior(posterior, posterior_action):
     """Mapping every sample to the fundamental domain shrinks the sky
     posterior; the 8-fold orbit of the folded set covers the original."""
     action = posterior_action
-    keys = ET_TRIANGLE_PARAMETERS
+    keys = TRIANGULAR_DETECTOR_PARAMETERS
     n = len(posterior["ra"])
     base = _to_coords(
         posterior["ra"],
@@ -378,7 +411,7 @@ def test_folding_concentrates_the_posterior(posterior, posterior_action):
 
     folded = {k: np.array(base[k]) for k in keys}
     assigned = action.in_fundamental_domain(tp).numpy()
-    for g in range(1, ET_TRIANGLE_GROUP_SIZE):
+    for g in range(1, TRIANGULAR_DETECTOR_GROUP_SIZE):
         modes = torch.full((n,), g, dtype=torch.long)
         image = _np(action(tp, modes))
         take = action.in_fundamental_domain(
@@ -405,7 +438,7 @@ def test_folding_concentrates_the_posterior(posterior, posterior_action):
                     torch.full((n,), g, dtype=torch.long),
                 )
             )["ra"]
-            for g in range(ET_TRIANGLE_GROUP_SIZE)
+            for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE)
         ]
     )
     assert np.std(orbit_ra) > 0.9 * np.std(base["ra"])
@@ -423,7 +456,7 @@ def test_folding_concentrates_signed_delta_phase(posterior, posterior_action):
     tighter than raw ``phase`` -- which is what ``polarisation-phase`` exploits.
     """
     action = posterior_action
-    keys = ET_TRIANGLE_PARAMETERS
+    keys = TRIANGULAR_DETECTOR_PARAMETERS
     n = len(posterior["ra"])
     base = _to_coords(
         posterior["ra"], posterior["dec"], posterior["psi"],
@@ -432,7 +465,7 @@ def test_folding_concentrates_signed_delta_phase(posterior, posterior_action):
     tp = {k: torch.as_tensor(base[k]) for k in keys}
     folded = {k: np.array(base[k]) for k in keys}
     assigned = action.in_fundamental_domain(tp).numpy()
-    for g in range(1, ET_TRIANGLE_GROUP_SIZE):
+    for g in range(1, TRIANGULAR_DETECTOR_GROUP_SIZE):
         image = _np(action(tp, torch.full((n,), g, dtype=torch.long)))
         take = action.in_fundamental_domain(
             {k: torch.as_tensor(v) for k, v in image.items()}
@@ -492,7 +525,7 @@ def test_long_wavelength_response_invariance():
         c0 = coeffs(p["ra"], p["dec"], p["psi"], p["theta_jn"], p["phase"])
         coords = _to_coords(**p)
         pt = {k: torch.tensor([float(v)]) for k, v in coords.items()}
-        for g in range(ET_TRIANGLE_GROUP_SIZE):
+        for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE):
             out = action(pt, torch.tensor([g]))
             ra = float(out["ra"])
             dec = float(np.arcsin(np.clip(float(out["sin_dec"]), -1, 1)))
@@ -550,7 +583,7 @@ def test_geocent_time_preserves_detector_arrival_time():
         }
         t0 = arrival(ra, dec, t)
         flipped = False
-        for g in range(ET_TRIANGLE_GROUP_SIZE):
+        for g in range(TRIANGULAR_DETECTOR_GROUP_SIZE):
             out = action(pt, torch.tensor([g]))
             ra_t = float(out["ra"])
             dec_t = float(np.arcsin(np.clip(float(out["sin_dec"]), -1, 1)))
@@ -568,12 +601,12 @@ def test_make_flow_factory():
     from nessai_gw.group_mixture import make_et_triangle_group_mixture_flow
 
     cls = make_et_triangle_group_mixture_flow(reference_time=REFERENCE_TIME)
-    assert cls.group_size == ET_TRIANGLE_GROUP_SIZE
-    assert cls.param_names == ET_TRIANGLE_PARAMETERS
+    assert cls.group_size == TRIANGULAR_DETECTOR_GROUP_SIZE
+    assert cls.param_names == TRIANGULAR_DETECTOR_PARAMETERS
     assert callable(cls.group_action_fn)
     assert callable(cls.in_fundamental_domain)
 
     cls16 = make_et_triangle_group_mixture_flow(
         reference_time=REFERENCE_TIME, phase_reflection=True
     )
-    assert cls16.group_size == ET_TRIANGLE_GROUP_SIZE_PHASE
+    assert cls16.group_size == TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE

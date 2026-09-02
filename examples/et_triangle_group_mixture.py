@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from nessai_gw.group_mixture import (
-    ET_TRIANGLE_PARAMETERS,
+    TRIANGULAR_DETECTOR_PARAMETERS,
     ETTriangleGroupAction,
 )
 
@@ -33,7 +33,7 @@ def main() -> None:
     action = ETTriangleGroupAction(
         reference_time=float(np.mean(post["geocent_time"]))
     )
-    keys = ET_TRIANGLE_PARAMETERS
+    keys = TRIANGULAR_DETECTOR_PARAMETERS
     coords = {
         "ra": np.asarray(post["ra"]),
         "sin_dec": np.sin(post["dec"]),

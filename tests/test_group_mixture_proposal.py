@@ -1,4 +1,4 @@
-"""Tests for the ET group-mixture proposal wiring in :mod:`nessai_gw.group_mixture`.
+"""Tests for the triangular-detector group-mixture proposal wiring in :mod:`nessai_gw.group_mixture`.
 
 These exercise the prime-space adapter, the reparameterisation profile, the
 prime-name probe and the proposal factory.  Only the proposal-factory tests
@@ -13,9 +13,10 @@ torch = pytest.importorskip("torch")
 
 from nessai_gw.group_mixture import (  # noqa: E402
     ETTriangleGroupAction,
-    PrimeSpaceETGroupAction,
+    PrimeSpaceTriangularGroupAction,
+    TriangularDetectorGroupAction,
     _prime_parameter_names,
-    et_group_reparameterisations,
+    triangular_group_reparameterisations,
     make_et_group_flow_proposal,
 )
 
@@ -64,8 +65,8 @@ requires_group_mixture = pytest.mark.skipif(
 )
 
 
-def test_et_group_reparameterisations():
-    reps = et_group_reparameterisations(BNS_PARAMETERS, REFERENCE_TIME)
+def test_triangular_group_reparameterisations():
+    reps = triangular_group_reparameterisations(BNS_PARAMETERS, REFERENCE_TIME)
     assert reps["chi_1"] == {"reparameterisation": "aligned-spin"}
     assert reps["chi_2"] == {"reparameterisation": "aligned-spin"}
     assert reps["lambda_1"]["reparameterisation"] == "logit"
@@ -108,10 +109,14 @@ def prime_points():
     }
 
 
+def test_et_action_is_triangular_subclass():
+    assert issubclass(ETTriangleGroupAction, TriangularDetectorGroupAction)
+
+
 @pytest.fixture(scope="module")
 def prime_action():
     base = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
-    return PrimeSpaceETGroupAction(base, PRIME_NAMES)
+    return PrimeSpaceTriangularGroupAction(base, PRIME_NAMES)
 
 
 @pytest.fixture(scope="module")
@@ -119,13 +124,13 @@ def prime_action_16():
     base = ETTriangleGroupAction(
         reference_time=REFERENCE_TIME, phase_reflection=True
     )
-    return PrimeSpaceETGroupAction(base, PRIME_NAMES)
+    return PrimeSpaceTriangularGroupAction(base, PRIME_NAMES)
 
 
 def test_prime_space_action_missing_coordinate():
     base = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
     with pytest.raises(RuntimeError, match="prime space is missing"):
-        PrimeSpaceETGroupAction(base, ["ra_dec_x", "ra_dec_y", "ra_dec_z"])
+        PrimeSpaceTriangularGroupAction(base, ["ra_dec_x", "ra_dec_y", "ra_dec_z"])
 
 
 @pytest.mark.parametrize("g", range(ETTriangleGroupAction.group_size))
@@ -158,7 +163,18 @@ def _decode_pair(px, py, scale):
 
 def _to_physical(points):
     """prime-space dict -> physical (ra, sin_dec, cos_theta_jn, psi, phase)."""
-    sx, sy, sz = (points[n] for n in ("ra_dec_x", "ra_dec_y", "ra_dec_z"))
+    # Flow sky coordinates are detector-frame; rotate back to equatorial to
+    # match PrimeSpaceTriangularGroupAction._decode.
+    _R = torch.as_tensor(
+        ETTriangleGroupAction(
+            reference_time=REFERENCE_TIME
+        ).sky_frame_rotation
+    )
+    _d = points
+    _dx, _dy, _dz = _d["ra_dec_x"], _d["ra_dec_y"], _d["ra_dec_z"]
+    sx = _R[0, 0] * _dx + _R[1, 0] * _dy + _R[2, 0] * _dz
+    sy = _R[0, 1] * _dx + _R[1, 1] * _dy + _R[2, 1] * _dz
+    sz = _R[0, 2] * _dx + _R[1, 2] * _dy + _R[2, 2] * _dz
     r_sky = torch.sqrt(sx * sx + sy * sy + sz * sz)
     ra = torch.remainder(torch.atan2(sy, sx), 2 * np.pi)
     sin_dec = torch.clamp(sz / r_sky, -1.0, 1.0)
@@ -367,7 +383,7 @@ def test_make_et_group_flow_proposal(prime_space, phase_reflection):
     from nessai_gw.proposals import GWReparamMixin
 
     assert cls._FlowModelClass.group_size == (16 if phase_reflection else 8)
-    assert cls.__qualname__ == "ETGroupFlowProposal"
+    assert cls.__qualname__ == "TriangularGroupFlowProposal"
     assert cls.__module__ == "nessai_gw.group_mixture"
     assert issubclass(cls, (GWReparamMixin, GroupFlowProposalMixin, FlowProposal))
     mro = cls.__mro__
@@ -377,7 +393,60 @@ def test_make_et_group_flow_proposal(prime_space, phase_reflection):
     # class is resolvable by module.qualname (nessai checkpoints via pickle)
     import nessai_gw.group_mixture as gm
 
-    assert getattr(gm, "ETGroupFlowProposal") is cls
+    assert getattr(gm, "TriangularGroupFlowProposal") is cls
+
+
+def test_rotated_anglepair_matches_anglepair_rotated():
+    """RotatedAnglePair's prime output is AnglePair's output rotated by R,
+    and the forward/inverse round trip recovers ra/dec."""
+    from nessai.reparameterisations import AnglePair
+    from nessai_gw.reparameterisations.sky import RotatedAnglePair
+
+    R = ETTriangleGroupAction(reference_time=REFERENCE_TIME).sky_frame_rotation
+    bounds = {"ra": np.array([0.0, 2 * np.pi]), "dec": np.array([-np.pi / 2, np.pi / 2])}
+    rng = np.random.default_rng(0)
+    plain = AnglePair(
+        parameters=["ra", "dec"], prior_bounds=dict(bounds),
+        convention="ra-dec", rng=np.random.default_rng(1),
+    )
+    rot = RotatedAnglePair(
+        parameters=["ra", "dec"], prior_bounds=dict(bounds),
+        convention="ra-dec", rotation=R, rng=np.random.default_rng(1),
+    )
+    n = 500
+    x = np.zeros(n, dtype=[(p, "f8") for p in plain.parameters])
+    x["ra"] = rng.uniform(0, 2 * np.pi, n)
+    x["dec"] = np.arcsin(rng.uniform(-1, 1, n))
+    x[plain.parameters[2]] = rng.uniform(0.5, 1.5, n)
+    dt = [(p, "f8") for p in plain.prime_parameters]
+    xp_a = np.zeros(n, dtype=dt)
+    xp_b = np.zeros(n, dtype=dt)
+    _, xp_a, _ = plain.reparameterise(x.copy(), xp_a, np.zeros(n))
+    _, xp_b, _ = rot.reparameterise(x.copy(), xp_b, np.zeros(n))
+    va = np.stack([xp_a[p] for p in plain.prime_parameters], axis=-1)
+    vb = np.stack([xp_b[p] for p in rot.prime_parameters], axis=-1)
+    np.testing.assert_allclose(vb, va @ R.T, atol=1e-9)
+
+    back = np.zeros(n, dtype=[(p, "f8") for p in rot.parameters])
+    back, _, _ = rot.inverse_reparameterise(back, xp_b, np.zeros(n))
+    np.testing.assert_allclose(np.cos(back["ra"]), np.cos(x["ra"]), atol=1e-6)
+    np.testing.assert_allclose(np.sin(back["ra"]), np.sin(x["ra"]), atol=1e-6)
+    np.testing.assert_allclose(back["dec"], x["dec"], atol=1e-6)
+
+
+def test_fundamental_domain_is_positive_sky_octant(prime_action, prime_points):
+    """With the detector-frame rotation, the canonical image of each orbit has
+    all three sky prime coordinates non-negative (the axis-aligned octant)."""
+    n = len(prime_points["ra_dec_x"])
+    seen = torch.zeros(n, dtype=torch.bool)
+    for g in range(8):
+        modes = torch.full((n,), g, dtype=torch.long)
+        image = prime_action(prime_points, modes)
+        canon = prime_action.in_fundamental_domain(image)
+        for c in ("ra_dec_x", "ra_dec_y", "ra_dec_z"):
+            assert torch.all(image[c][canon] > -1e-9), (g, c)
+        seen |= canon
+    assert torch.all(seen)
 
 
 @requires_group_mixture

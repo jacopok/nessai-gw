@@ -1,10 +1,14 @@
-"""Discrete symmetry transformations for the triangular Einstein Telescope.
+"""Discrete symmetry transformations for a triangular gravitational-wave detector.
 
 nessai's :mod:`nessai.flowmodel.group_mixture` can learn a discrete mixture
 over a finite symmetry group that acts on the (physical) parameters, letting
 the normalising flow model a single mode while the mixture accounts for the
-others.  This module provides the group for a single triangular detector such
-as one Einstein Telescope (ET) site.
+others.  This module provides the group for a single triangular / equilateral
+planar ground-based detector -- the motivating case is one Einstein Telescope
+(ET) site, but nothing here is ET-specific: :class:`TriangularDetectorGroupAction`
+takes the detector plane normal and vertex position as arguments, and
+:class:`ETTriangleGroupAction` is only a thin subclass that fills in the ET-EMR
+(Meuse-Rhine) geometry (:data:`ET_EMR_PLANE_NORMAL`, :data:`ET_EMR_VERTEX`).
 
 In the long-wavelength / "frozen" limit the extrinsic likelihood of a single
 triangular detector is invariant under an eight-element group.  This is the
@@ -54,7 +58,7 @@ Polarisation-phase coordinate
 -----------------------------
 For the dominant (2, 2) mode the extrinsic likelihood constrains only
 ``phase + sign(cos theta_jn) * psi`` (``phase + psi`` face-on, ``phase - psi``
-face-off); the orthogonal combination is nearly flat.  The ET group wiring
+face-off); the orthogonal combination is nearly flat.  The group wiring
 therefore carries ``phase`` as the periodic coordinate
 ``delta_phase = phase + sign(cos theta_jn) * psi``
 (:class:`~nessai_gw.reparameterisations.phase.PolarisationPhaseReparameterisation`,
@@ -69,7 +73,7 @@ on the ET BNS posterior, ``examples/validate_polarisation_phase.py``, made this
 concrete: ``phase + psi`` fit worse than the plain ``phase`` pair, while
 ``phase + sign(cos theta_jn) * psi`` cut the flow NLL by ~1.5 nat).
 
-``phase`` is group-invariant, so :class:`PrimeSpaceETGroupAction` fixes
+``phase`` is group-invariant, so :class:`PrimeSpaceTriangularGroupAction` fixes
 ``phase_inv = delta_phase_in - sign(cos theta_jn)_in * psi_in`` on decode and
 sets ``delta_phase_out = phase_inv + sign(cos theta_jn)_out * psi_out`` on
 encode, from the group-transformed ``psi`` and ``cos theta_jn`` sign (a
@@ -88,22 +92,23 @@ degeneracy.  ``_encode`` shifts ``delta_phase`` by ``pi`` under a
 ``phase``-flip, so ``delta_phase in [0, pi)`` is the matching domain.
 
 Unlike LISA, a ground-based triangle sits at an appreciable offset
-``r_ET`` from the geocenter, so the sky degeneracy is only a degeneracy of
-the *detector-frame* arrival time, not of the geocentric time ``geocent_time``
-that bilby samples.  With ``n`` the unit vector towards the source,
+``r_det`` (the detector ``vertex``) from the geocenter, so the sky degeneracy
+is only a degeneracy of the *detector-frame* arrival time, not of the
+geocentric time ``geocent_time`` that bilby samples.  With ``n`` the unit
+vector towards the source,
 
-    geocent_time = t_det + (n . r_ET) / c
+    geocent_time = t_det + (n . r_det) / c
 
 (Eq. 22 of Santoliquido et al. 2025, arXiv:2504.21087), so every element of
 the group -- and in particular the plane reflection, which sends
-``n . r_ET -> -n . r_ET`` for a near-radial site and thus produces the
+``n . r_det -> -n . r_det`` for a near-radial site and thus produces the
 bimodal ``geocent_time`` posterior of that paper -- must carry
 ``geocent_time`` along by the change in the geocenter-to-detector delay::
 
     geocent_time -> geocent_time + delay(n) - delay(n')
 
 where ``n'`` is the transformed source direction and
-``delay(n) = -(n . r_ET) / c`` is bilby's ``time_delay_from_geocenter``.  This is an additive shift
+``delay(n) = -(n . r_det) / c`` is bilby's ``time_delay_from_geocenter``.  This is an additive shift
 that depends only on the (already transformed) sky position, so it leaves the
 Jacobian of the whole action equal to one.
 
@@ -139,7 +144,7 @@ logger = nessai_logger.getChild(__name__)
 #: are the *measure-preserving* coordinates: ``sin_dec = sin(dec)`` and
 #: ``cos_theta_jn = cos(theta_jn)`` rather than the raw angles, so the action
 #: has unit Jacobian (see the module docstring).
-ET_TRIANGLE_PARAMETERS = [
+TRIANGULAR_DETECTOR_PARAMETERS = [
     "ra",
     "sin_dec",
     "cos_theta_jn",
@@ -149,33 +154,15 @@ ET_TRIANGLE_PARAMETERS = [
 ]
 
 #: Number of group elements of the long-wavelength-exact group (``Z4 x Z2``).
-ET_TRIANGLE_GROUP_SIZE = 8
+TRIANGULAR_DETECTOR_GROUP_SIZE = 8
 
 #: Number of group elements with the extra (approximate) ``phase -> phase + pi``
 #: (2, 2)-mode reflection folded in (``Z4 x Z2 x Z2``); see
-#: :class:`ETTriangleGroupAction` ``phase_reflection``.
-ET_TRIANGLE_GROUP_SIZE_PHASE = 16
+#: :class:`TriangularDetectorGroupAction` ``phase_reflection``.
+TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE = 16
 
 #: Speed of light in m / s (CODATA / bilby ``speed_of_light``).
 _SPEED_OF_LIGHT = 299792458.0
-
-#: Geocentric position (metres, Earth-fixed frame) of the ``ET-EMR`` site,
-#: WGS84 geodetic ``(lat, lon, height) = (50 deg 43' 23", 5 deg 55' 14", 0)``.
-#: Used to convert between the detector-frame arrival time and bilby's
-#: ``geocent_time``.  Recompute with :func:`detector_vertex` for a different
-#: geometry.
-ET_EMR_VERTEX = np.array(
-    [4024345.21150611, 417334.87759012, 4914098.18878217]
-)
-
-#: Unit normal to the ET-EMR detector plane in the Earth-fixed (geocentric)
-#: frame, ``mean_i normalise(x_arm_i x y_arm_i)`` for the three nested
-#: interferometers of the ``ET-EMR`` triangle shipped with ``bilby_xG``
-#: (Meuse-Rhine site, lat 50 deg 43' 23", lon 5 deg 55' 14").  Recompute with
-#: :func:`detector_plane_normal` for a different geometry.
-ET_EMR_PLANE_NORMAL = np.array(
-    [0.6290179004039584, 0.06512521686797399, 0.7746581091603363]
-)
 
 _TWO_PI = 2.0 * np.pi
 
@@ -184,7 +171,7 @@ _EPS = 1e-30
 
 #: nessai ``Angle`` reparameterisation convention: the Cartesian angle stored by
 #: the flow is ``physical_angle * scale``.  ``angle-pi`` (used for ``psi``) has
-#: ``scale = 2``; ``angle-2pi`` (used for ``phase``) has ``scale = 1``.  The ET
+#: ``scale = 2``; ``angle-2pi`` (used for ``phase``) has ``scale = 1``.  The
 #: group wiring replaces ``phase`` with
 #: ``delta_phase = phase + sign(cos theta_jn) * psi`` (``polarisation-phase``,
 #: an ``angle-2pi``-style periodic coordinate); the ``"phase"`` key is kept so
@@ -194,11 +181,13 @@ _ANGLE_SCALE = {"psi": 2.0, "phase": 1.0, "delta_phase": 1.0}
 #: ``geocent_time`` prime coordinate is ``(geocent_time - reference_time) /
 #: _GEOCENT_SCALE``.  A fixed scale (rather than data-driven bounds) keeps the
 #: group's additive light-travel-delay shift exact under a constant offset.
+#: Tuned for an ET-scale site; a very different geometry may want it revisited.
 _GEOCENT_SCALE = 5e-3
 
 #: Floor for the group-mixture wrapper's per-element canonical std.  Lowered
 #: from nessai's ``1e-2`` default so a genuinely narrow prime dimension
 #: (``geocent_time``) is standardised by its real width, not the floor.
+#: Tuned for an ET-scale site; a very different geometry may want it revisited.
 _MIN_CANON_STD = 1e-3
 
 
@@ -323,8 +312,12 @@ def _polarisation_angle(m: torch.Tensor, u: torch.Tensor, v: torch.Tensor):
     return torch.atan2(-(m * u).sum(-1), -(m * v).sum(-1))
 
 
-class ETTriangleGroupAction:
+class TriangularDetectorGroupAction:
     """Callable eight-element group action for a triangular detector.
+
+    Detector-agnostic: the only inputs that depend on the instrument are the
+    Earth-fixed plane normal and vertex position.  :class:`ETTriangleGroupAction`
+    is a thin subclass that fills those in with the ET-EMR geometry.
 
     Instances are the ``group_action_fn`` /  ``in_fundamental_domain`` pair
     consumed by :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow`.
@@ -336,15 +329,14 @@ class ETTriangleGroupAction:
         time it implies is used (to rotate between the equatorial and
         Earth-fixed frames); the ~tens-of-ms spread of a posterior is
         negligible here.
-    plane_normal : array_like, optional
-        Unit normal to the detector plane in the Earth-fixed frame.  Defaults
-        to :data:`ET_EMR_PLANE_NORMAL`.  Use :func:`detector_plane_normal` to
-        build one from a bilby interferometer list.
-    vertex : array_like, optional
+    plane_normal : array_like
+        Unit normal to the detector plane in the Earth-fixed frame.  Use
+        :func:`detector_plane_normal` to build one from a bilby interferometer
+        list.
+    vertex : array_like
         Geocentric position of the detector (metres, Earth-fixed frame), used
-        to carry ``geocent_time`` along with the sky transformation.  Defaults
-        to :data:`ET_EMR_VERTEX`.  Use :func:`detector_vertex` to build one
-        from a bilby interferometer list.
+        to carry ``geocent_time`` along with the sky transformation.  Use
+        :func:`detector_vertex` to build one from a bilby interferometer list.
     phase_reflection : bool, optional
         If ``True``, fold in the extra ``phase -> phase + pi`` (2, 2)-mode
         degeneracy as a third ``Z2`` factor, giving a **16-element** group
@@ -355,14 +347,14 @@ class ETTriangleGroupAction:
         (the long-wavelength-exact 8-element group).
     """
 
-    parameters = ET_TRIANGLE_PARAMETERS
-    group_size = ET_TRIANGLE_GROUP_SIZE
+    parameters = TRIANGULAR_DETECTOR_PARAMETERS
+    group_size = TRIANGULAR_DETECTOR_GROUP_SIZE
 
     def __init__(
         self,
         reference_time,
-        plane_normal=None,
-        vertex=None,
+        plane_normal,
+        vertex,
         phase_reflection=False,
     ):
         self.reference_time = float(reference_time)
@@ -370,20 +362,35 @@ class ETTriangleGroupAction:
         #: Instance attribute (shadows the class default): 16 when the extra
         #: ``phase -> phase + pi`` reflection is folded in, else 8.
         self.group_size = (
-            ET_TRIANGLE_GROUP_SIZE_PHASE
+            TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE
             if self.phase_reflection
-            else ET_TRIANGLE_GROUP_SIZE
+            else TRIANGULAR_DETECTOR_GROUP_SIZE
         )
         self.gmst = _greenwich_mean_sidereal_time(self.reference_time)
-        if plane_normal is None:
-            plane_normal = ET_EMR_PLANE_NORMAL
         self.plane_normal = np.asarray(plane_normal, dtype=float)
         self._basis_np = _detector_frame_basis(self.plane_normal)
         self._basis = torch.as_tensor(self._basis_np, dtype=torch.float64)
-        if vertex is None:
-            vertex = ET_EMR_VERTEX
         self.vertex = np.asarray(vertex, dtype=float)
         self._vertex = torch.as_tensor(self.vertex, dtype=torch.float64)
+
+        # Equatorial (ra-based) Cartesian sky vector -> detector-frame vector,
+        # with GMST folded in: ``w_f = R @ w_eq`` where
+        # ``w_eq = (cos dec cos ra, cos dec sin ra, sin dec)`` and ``w_f`` is
+        # ``(cos beta_f cos lam_f, cos beta_f sin lam_f, sin beta_f)`` -- the
+        # same detector-frame direction :meth:`_to_frame` computes.  ``Rz``
+        # maps ``ra -> ra - gmst``; ``_basis_np`` (rows e1, e2, e3=normal) then
+        # rotates Earth-fixed -> detector frame.  Used by
+        # :class:`RotatedAnglePair` (flow coordinates) and
+        # :class:`PrimeSpaceTriangularGroupAction` (prime-space decode/encode).
+        _g = self.gmst
+        _Rz = np.array(
+            [
+                [np.cos(_g), np.sin(_g), 0.0],
+                [-np.sin(_g), np.cos(_g), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        self.sky_frame_rotation = self._basis_np @ _Rz
 
     # -- coordinate maps ------------------------------------------------
 
@@ -423,7 +430,7 @@ class ETTriangleGroupAction:
     def _geocenter_delay(self, ra, dec):
         """Geocenter-to-detector light-travel delay ``t_det - geocent_time``.
 
-        Equal to ``-(n . r_ET) / c`` with ``n`` the unit vector towards the
+        Equal to ``-(n . r_det) / c`` with ``n`` the unit vector towards the
         source, matching bilby's ``time_delay_from_geocenter`` convention.
         """
         vertex = self._vertex.to(ra.dtype)
@@ -463,17 +470,19 @@ class ETTriangleGroupAction:
         return pf * 8 + refl * 4 + torch.remainder(-k, 4)
 
     # Public aliases of the mode helpers, for callers (e.g.
-    # :class:`PrimeSpaceETGroupAction`) that need to inspect group elements
-    # without reaching into private names.
+    # :class:`PrimeSpaceTriangularGroupAction`) that need to inspect group
+    # elements without reaching into private names.
     @staticmethod
     def decode_modes(modes):
         """Split a mode index into ``(k, reflected, phase_flipped)``."""
-        return ETTriangleGroupAction._decode(torch.as_tensor(modes))
+        return TriangularDetectorGroupAction._decode(torch.as_tensor(modes))
 
     @staticmethod
     def invert_modes(modes):
         """Index of the inverse element (the group is abelian)."""
-        return ETTriangleGroupAction._invert_modes(torch.as_tensor(modes))
+        return TriangularDetectorGroupAction._invert_modes(
+            torch.as_tensor(modes)
+        )
 
     def __call__(self, point_dict: dict, modes, inverse: bool = False) -> dict:
         """Apply the group element ``modes`` (or its inverse) to each point."""
@@ -551,10 +560,10 @@ class ETTriangleGroupAction:
         return mask
 
 
-def make_et_triangle_group_mixture_flow(
+def make_triangular_group_mixture_flow(
     reference_time,
-    plane_normal=None,
-    vertex=None,
+    plane_normal,
+    vertex,
     parameters=None,
     phase_reflection=False,
 ):
@@ -562,25 +571,24 @@ def make_et_triangle_group_mixture_flow(
 
     Thin wrapper around
     :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow` bound to
-    :class:`ETTriangleGroupAction`.
+    :class:`TriangularDetectorGroupAction`.
 
     Parameters
     ----------
     reference_time : float
-        Geocentric GPS time of the event (see :class:`ETTriangleGroupAction`).
-    plane_normal : array_like, optional
-        Earth-fixed unit normal to the detector plane; defaults to
-        :data:`ET_EMR_PLANE_NORMAL`.
-    vertex : array_like, optional
-        Geocentric detector position (metres); defaults to
-        :data:`ET_EMR_VERTEX`.
+        Geocentric GPS time of the event (see
+        :class:`TriangularDetectorGroupAction`).
+    plane_normal : array_like
+        Earth-fixed unit normal to the detector plane.
+    vertex : array_like
+        Geocentric detector position (metres).
     parameters : list of str, optional
         Override the acted-on parameter names/order (default
-        :data:`ET_TRIANGLE_PARAMETERS`).  The flow must be given exactly
+        :data:`TRIANGULAR_DETECTOR_PARAMETERS`).  The flow must be given exactly
         these inputs, in this order.
     phase_reflection : bool, optional
         Fold in the extra ``phase -> phase + pi`` (2, 2)-mode degeneracy
-        (16-element group).  See :class:`ETTriangleGroupAction`.
+        (16-element group).  See :class:`TriangularDetectorGroupAction`.
 
     Returns
     -------
@@ -591,7 +599,7 @@ def make_et_triangle_group_mixture_flow(
     """
     from nessai.flowmodel.group_mixture import make_group_mixture_flow
 
-    action = ETTriangleGroupAction(
+    action = TriangularDetectorGroupAction(
         reference_time=reference_time,
         plane_normal=plane_normal,
         vertex=vertex,
@@ -610,11 +618,11 @@ def make_et_triangle_group_mixture_flow(
 # Prime-space adapter + proposal wiring
 #
 # nessai's :class:`~nessai.flowmodel.group_mixture.GroupFlowProposalMixin` can
-# run :class:`ETTriangleGroupAction` directly in the *physical* parameter space
-# and bridge to the flow's *prime* space with a
+# run :class:`TriangularDetectorGroupAction` directly in the *physical* parameter
+# space and bridge to the flow's *prime* space with a
 # :class:`~nessai.flowmodel.group_mixture.ReparamBridge` (non-affine
 # reparameterisations handled exactly).  That is the ``prime_space=False`` path
-# of :func:`make_et_group_flow_proposal` and needs no code here.
+# of :func:`make_triangular_group_flow_proposal` and needs no code here.
 #
 # The ``prime_space=True`` path instead maps the acted physical coordinates out
 # of the nessai-gw prime vector, runs the unchanged group action, and re-encodes
@@ -642,8 +650,8 @@ def _decode_pair(point_dict, pair, scale):
     return _angle_from_pair(x, y, scale)
 
 
-class PrimeSpaceETGroupAction:
-    """Apply :class:`ETTriangleGroupAction` in the nessai-gw *prime* space.
+class PrimeSpaceTriangularGroupAction:
+    """Apply :class:`TriangularDetectorGroupAction` in the nessai-gw *prime* space.
 
     Discovers the sky / ``psi`` / ``phase`` / ``theta_jn`` / ``geocent_time``
     prime coordinates from the flow's actual ``prime_parameters`` and threads
@@ -657,7 +665,7 @@ class PrimeSpaceETGroupAction:
 
     Parameters
     ----------
-    action : ETTriangleGroupAction
+    action : TriangularDetectorGroupAction
         The physical-space group action.
     prime_names : list of str
         The flow's prime-parameter names, in order.  Re-bind after the proposal
@@ -666,6 +674,12 @@ class PrimeSpaceETGroupAction:
 
     def __init__(self, action, prime_names):
         self._action = action
+        # Flow sky coordinates are detector-frame (see RotatedAnglePair); the
+        # decode/encode below work in equatorial coordinates, so rotate in and
+        # out with the action's fixed sky-frame rotation.
+        self._sky_R = torch.as_tensor(
+            action.sky_frame_rotation, dtype=torch.float64
+        )
         self.bind(prime_names)
 
     # -- binding -----------------------------------------------------------
@@ -718,9 +732,9 @@ class PrimeSpaceETGroupAction:
             missing.append("geocent_time")
         if missing:
             raise RuntimeError(
-                f"prime space is missing {missing}, which the ET group action "
-                "needs; the prime-space path only applies to a single-site "
-                "ET-triangle run with the standard extrinsic parameters and "
+                f"prime space is missing {missing}, which the triangular-detector "
+                "group action needs; the prime-space path only applies to a "
+                "single-site triangular-detector run with the standard extrinsic parameters and "
                 "the nessai-gw reparameterisations (sky-ra-dec, angle-pi, "
                 "polarisation-phase, angle-sine)."
             )
@@ -728,12 +742,17 @@ class PrimeSpaceETGroupAction:
     # -- decode / encode -------------------------------------------------
 
     def _decode(self, point_dict):
-        """nessai-gw prime dict -> ``ETTriangleGroupAction`` coordinate dict.
+        """nessai-gw prime dict -> ``TriangularDetectorGroupAction`` coordinate dict.
 
         Returns ``(acted, aux)`` where ``aux`` carries the radii needed to
         re-encode.
         """
-        sx, sy, sz = (point_dict[n] for n in self._sky)
+        dx, dy, dz = (point_dict[n] for n in self._sky)
+        # detector-frame (flow) -> equatorial: v_eq = R^T v_det
+        Rt = self._sky_R.to(dx.dtype)
+        sx = Rt[0, 0] * dx + Rt[1, 0] * dy + Rt[2, 0] * dz
+        sy = Rt[0, 1] * dx + Rt[1, 1] * dy + Rt[2, 1] * dz
+        sz = Rt[0, 2] * dx + Rt[1, 2] * dy + Rt[2, 2] * dz
         r_sky = torch.sqrt(sx * sx + sy * sy + sz * sz + _EPS)
         ra = torch.remainder(torch.atan2(sy, sx), _TWO_PI)
         sin_dec = torch.clamp(sz / r_sky, -1.0, 1.0)
@@ -790,9 +809,14 @@ class PrimeSpaceETGroupAction:
         cos_dec_t = torch.sqrt(torch.clamp(1.0 - sin_dec_t ** 2, min=0.0))
         r = aux["r_sky"]
         sx, sy, sz = self._sky
-        out[sx] = r * cos_dec_t * torch.cos(ra_t)
-        out[sy] = r * cos_dec_t * torch.sin(ra_t)
-        out[sz] = r * sin_dec_t
+        ex = r * cos_dec_t * torch.cos(ra_t)
+        ey = r * cos_dec_t * torch.sin(ra_t)
+        ez = r * sin_dec_t
+        # equatorial -> detector-frame (flow): v_det = R v_eq
+        Rf = self._sky_R.to(ex.dtype)
+        out[sx] = Rf[0, 0] * ex + Rf[0, 1] * ey + Rf[0, 2] * ez
+        out[sy] = Rf[1, 0] * ex + Rf[1, 1] * ey + Rf[1, 2] * ez
+        out[sz] = Rf[2, 0] * ex + Rf[2, 1] * ey + Rf[2, 2] * ez
 
         px, py = self._pair["psi"]
         out[px], out[py] = _pair_from_angle(
@@ -856,10 +880,10 @@ class PrimeSpaceETGroupAction:
         return self._action.in_fundamental_domain(acted)
 
 
-def et_group_reparameterisations(sampling_parameters, reference_time):
+def triangular_group_reparameterisations(sampling_parameters, reference_time):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
-    The ET group action has unit Jacobian in
+    The triangular-detector group action has unit Jacobian in
     ``(ra, sin_dec, cos_theta_jn, psi, phase, geocent_time)``.  Each of those
     maps to the nessai-gw prime coordinates by an isometry *provided* the right
     reparameterisation is used:
@@ -981,7 +1005,7 @@ def _prime_parameter_names(sampling_parameters, reference_time):
     reparameterisation dict / fallback the real proposal uses and reading back
     ``prime_parameters``.  The order matters: the group-mixture wrapper builds
     its base-flow ``point_dict`` from ``param_names`` before
-    :meth:`ETGroupFlowProposal.initialise` re-binds to the live
+    :meth:`TriangularGroupFlowProposal.initialise` re-binds to the live
     ``prime_parameters``.
 
     Falls back to a name-order heuristic (right count, order not guaranteed) if
@@ -1015,7 +1039,7 @@ def _prime_parameter_names(sampling_parameters, reference_time):
         probe = GWFlowProposal(
             _StubModel(),
             poolsize=100,
-            reparameterisations=et_group_reparameterisations(
+            reparameterisations=triangular_group_reparameterisations(
                 names, reference_time
             ),
             fallback_reparameterisation="zscore",
@@ -1041,7 +1065,7 @@ def _prime_parameter_names(sampling_parameters, reference_time):
     for name in names:
         if name in ("ra", "dec"):
             continue
-        # the ET wiring reparameterises ``phase`` as ``delta_phase = phase + psi``
+        # the group wiring reparameterises ``phase`` as ``delta_phase = phase + psi``
         coord = "delta_phase" if name == "phase" else name
         if coord in _ANGLE_SCALE:
             out += [f"{coord}_x", f"{coord}_y"]
@@ -1050,23 +1074,23 @@ def _prime_parameter_names(sampling_parameters, reference_time):
     return out
 
 
-def make_et_group_flow_proposal(
+def make_triangular_group_flow_proposal(
     sampling_parameters,
     reference_time,
-    plane_normal=None,
-    vertex=None,
+    plane_normal,
+    vertex,
     prime_space=True,
     phase_reflection=False,
 ):
-    """Build a ``FlowProposal`` subclass wired for the ET-triangle group mixture.
+    """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
     The returned class combines :class:`nessai_gw.proposals.GWReparamMixin`
     (GW reparameterisations by parameter name),
     :class:`nessai.flowmodel.group_mixture.GroupFlowProposalMixin` (group-mixture
     wiring) and :class:`nessai.proposal.FlowProposal`, with
-    :class:`ETTriangleGroupAction` as the group action.  Pass it as
+    :class:`TriangularDetectorGroupAction` as the group action.  Pass it as
     ``flow_proposal_class`` to ``bilby.run_sampler(sampler="nessai", ...)``
-    together with :func:`et_group_reparameterisations`.
+    together with :func:`triangular_group_reparameterisations`.
 
     Parameters
     ----------
@@ -1075,20 +1099,19 @@ def make_et_group_flow_proposal(
         ``theta_jn``, ``psi``, ``phase`` and ``geocent_time``.
     reference_time : float
         Geocentric GPS time of the event.
-    plane_normal : array_like, optional
-        Earth-fixed unit normal to the detector plane; defaults to
-        :data:`ET_EMR_PLANE_NORMAL`.
-    vertex : array_like, optional
-        Geocentric detector position (metres); defaults to :data:`ET_EMR_VERTEX`.
+    plane_normal : array_like
+        Earth-fixed unit normal to the detector plane.
+    vertex : array_like
+        Geocentric detector position (metres).
     prime_space : bool, optional
         If ``True`` (default) run the action in the flow's prime space via
-        :class:`PrimeSpaceETGroupAction` (exact unit Jacobian, no per-call numpy
-        round-trip).  If ``False`` run it in physical coordinates and let
-        nessai's ``GroupFlowProposalMixin`` bridge to prime space with a
+        :class:`PrimeSpaceTriangularGroupAction` (exact unit Jacobian, no
+        per-call numpy round-trip).  If ``False`` run it in physical coordinates
+        and let nessai's ``GroupFlowProposalMixin`` bridge to prime space with a
         ``ReparamBridge``.
     phase_reflection : bool, optional
         Fold in the extra ``phase -> phase + pi`` (2, 2)-mode degeneracy
-        (16-element group).  See :class:`ETTriangleGroupAction`.
+        (16-element group).  See :class:`TriangularDetectorGroupAction`.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1098,8 +1121,8 @@ def make_et_group_flow_proposal(
         )
     except ImportError as exc:  # pragma: no cover - depends on nessai version
         raise RuntimeError(
-            "make_et_group_flow_proposal requires a version of nessai that "
-            "ships nessai.flowmodel.group_mixture (GroupFlowProposalMixin, "
+            "make_triangular_group_flow_proposal requires a version of nessai "
+            "that ships nessai.flowmodel.group_mixture (GroupFlowProposalMixin, "
             "make_group_mixture_flow)."
         ) from exc
 
@@ -1111,12 +1134,12 @@ def make_et_group_flow_proposal(
     )
     if missing:
         raise RuntimeError(
-            f"The sampling space is missing {missing}, which the ET group "
-            "action needs; this proposal only applies to a single-site "
-            "ET-triangle run with the standard extrinsic parameters."
+            f"The sampling space is missing {missing}, which the triangular-detector "
+            "group action needs; this proposal only applies to a single-site "
+            "triangular-detector run with the standard extrinsic parameters."
         )
 
-    base_action = ETTriangleGroupAction(
+    base_action = TriangularDetectorGroupAction(
         reference_time=reference_time,
         plane_normal=plane_normal,
         vertex=vertex,
@@ -1125,7 +1148,7 @@ def make_et_group_flow_proposal(
 
     if prime_space:
         prime_names = _prime_parameter_names(names, reference_time)
-        action = PrimeSpaceETGroupAction(base_action, prime_names)
+        action = PrimeSpaceTriangularGroupAction(base_action, prime_names)
         flow_model_cls = make_group_mixture_flow(
             group_action_fn=action,  # ignored on the prime-space path
             group_size=base_action.group_size,
@@ -1144,13 +1167,37 @@ def make_et_group_flow_proposal(
             min_canon_std=_MIN_CANON_STD,
         )
 
-    class ETGroupFlowProposal(
+    class TriangularGroupFlowProposal(
         GWReparamMixin, GroupFlowProposalMixin, FlowProposal
     ):
-        """``FlowProposal`` wired for the ET-triangle group-mixture flow with
-        the nessai-gw GW reparameterisations."""
+        """``FlowProposal`` wired for the triangular-detector group-mixture flow
+        with the nessai-gw GW reparameterisations."""
 
         _FlowModelClass = flow_model_cls
+
+        def add_default_reparameterisations(self):
+            # Sky: use the detector-frame-rotated AnglePair so the group's
+            # fundamental domain is the axis-aligned octant x, y, z >= 0
+            # rather than an oblique equatorial wedge (see RotatedAnglePair).
+            rep = self._reparameterisation
+            model_names = set(self.model.names)
+            if {"ra", "dec"} <= model_names and not (
+                {"ra", "dec"} & set(rep.parameters)
+            ):
+                from .reparameterisations.sky import RotatedAnglePair
+
+                rep.add_reparameterisation(
+                    RotatedAnglePair(
+                        parameters=["ra", "dec"],
+                        prior_bounds={
+                            k: self.model.bounds[k] for k in ("ra", "dec")
+                        },
+                        convention="ra-dec",
+                        rotation=base_action.sky_frame_rotation,
+                        rng=self.rng,
+                    )
+                )
+            super().add_default_reparameterisations()
 
         def initialise(self, *args, **kwargs):
             super().initialise(*args, **kwargs)
@@ -1167,7 +1214,100 @@ def make_et_group_flow_proposal(
     # nessai checkpoints the sampler (hence the proposal *instance*) with
     # ``pickle``, which resolves an instance's class by ``module.__qualname__``.
     # Publish this otherwise-local class at module scope under a stable name.
-    ETGroupFlowProposal.__module__ = __name__
-    ETGroupFlowProposal.__qualname__ = "ETGroupFlowProposal"
-    globals()["ETGroupFlowProposal"] = ETGroupFlowProposal
-    return ETGroupFlowProposal
+    TriangularGroupFlowProposal.__module__ = __name__
+    TriangularGroupFlowProposal.__qualname__ = "TriangularGroupFlowProposal"
+    globals()["TriangularGroupFlowProposal"] = TriangularGroupFlowProposal
+    return TriangularGroupFlowProposal
+
+
+# ---------------------------------------------------------------------------
+# Einstein Telescope (ET-EMR / Meuse-Rhine site) specifics
+#
+# Everything above is detector-agnostic.  The ET layer is just the two Earth-fixed
+# numbers -- the detector-plane normal and the vertex position -- plus thin
+# subclass / factory wrappers that fill them in.
+# ---------------------------------------------------------------------------
+
+#: Geocentric position (metres, Earth-fixed frame) of the ``ET-EMR`` site,
+#: WGS84 geodetic ``(lat, lon, height) = (50 deg 43' 23", 5 deg 55' 14", 0)``.
+#: Recompute with :func:`detector_vertex` (or
+#: :func:`detector_vertex_from_geodetic`) for a different geometry.
+ET_EMR_VERTEX = np.array(
+    [4024345.21150611, 417334.87759012, 4914098.18878217]
+)
+
+#: Unit normal to the ET-EMR detector plane in the Earth-fixed (geocentric)
+#: frame, ``mean_i normalise(x_arm_i x y_arm_i)`` for the three nested
+#: interferometers of the ``ET-EMR`` triangle shipped with ``bilby_xG``
+#: (Meuse-Rhine site, lat 50 deg 43' 23", lon 5 deg 55' 14").  Recompute with
+#: :func:`detector_plane_normal` for a different geometry.
+ET_EMR_PLANE_NORMAL = np.array(
+    [0.6290179004039584, 0.06512521686797399, 0.7746581091603363]
+)
+
+
+class ETTriangleGroupAction(TriangularDetectorGroupAction):
+    """:class:`TriangularDetectorGroupAction` with the ET-EMR geometry.
+
+    A thin subclass: ``plane_normal`` / ``vertex`` default to
+    :data:`ET_EMR_PLANE_NORMAL` / :data:`ET_EMR_VERTEX` (pass explicit values,
+    e.g. from :func:`detector_plane_normal` / :func:`detector_vertex` on a bilby
+    ``InterferometerList(["ET"])``, to override).  All the behaviour lives in the
+    base class.
+    """
+
+    def __init__(
+        self,
+        reference_time,
+        plane_normal=None,
+        vertex=None,
+        phase_reflection=False,
+    ):
+        super().__init__(
+            reference_time,
+            plane_normal=(
+                ET_EMR_PLANE_NORMAL if plane_normal is None else plane_normal
+            ),
+            vertex=ET_EMR_VERTEX if vertex is None else vertex,
+            phase_reflection=phase_reflection,
+        )
+
+
+def make_et_triangle_group_mixture_flow(
+    reference_time,
+    plane_normal=None,
+    vertex=None,
+    parameters=None,
+    phase_reflection=False,
+):
+    """:func:`make_triangular_group_mixture_flow` with the ET-EMR geometry."""
+    return make_triangular_group_mixture_flow(
+        reference_time,
+        plane_normal=(
+            ET_EMR_PLANE_NORMAL if plane_normal is None else plane_normal
+        ),
+        vertex=ET_EMR_VERTEX if vertex is None else vertex,
+        parameters=parameters,
+        phase_reflection=phase_reflection,
+    )
+
+
+def make_et_group_flow_proposal(
+    sampling_parameters,
+    reference_time,
+    plane_normal=None,
+    vertex=None,
+    prime_space=True,
+    phase_reflection=False,
+):
+    """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
+    return make_triangular_group_flow_proposal(
+        sampling_parameters,
+        reference_time,
+        plane_normal=(
+            ET_EMR_PLANE_NORMAL if plane_normal is None else plane_normal
+        ),
+        vertex=ET_EMR_VERTEX if vertex is None else vertex,
+        prime_space=prime_space,
+        phase_reflection=phase_reflection,
+    )

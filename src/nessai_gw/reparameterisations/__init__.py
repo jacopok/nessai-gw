@@ -12,6 +12,7 @@ from .phase import (
     DeltaPhaseReparameterisation,
     PolarisationPhaseReparameterisation,
 )
+from .sky import RotatedAnglePair
 from .spin import AlignedSpinReparameterisation
 
 known_reparameterisations = ReparameterisationDict()

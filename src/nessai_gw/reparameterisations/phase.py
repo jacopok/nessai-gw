@@ -110,7 +110,7 @@ class PolarisationPhaseReparameterisation(Angle):
       and is exactly invariant modulo ``pi`` under the group reflection
       (``cos theta_jn -> -cos theta_jn``, ``psi -> pi - psi``).
 
-    :class:`nessai_gw.group_mixture.PrimeSpaceETGroupAction` recomputes
+    :class:`nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction` recomputes
     ``delta_phase`` from the group-transformed ``psi`` and ``cos theta_jn`` on
     the encode side.
 
