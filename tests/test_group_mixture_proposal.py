@@ -412,7 +412,8 @@ def test_rotated_anglepair_matches_anglepair_rotated():
     )
     rot = RotatedAnglePair(
         parameters=["ra", "dec"], prior_bounds=dict(bounds),
-        convention="ra-dec", rotation=R, rng=np.random.default_rng(1),
+        convention="ra-dec", rotation=R, radial_sigma=None,
+        rng=np.random.default_rng(1),
     )
     n = 500
     x = np.zeros(n, dtype=[(p, "f8") for p in plain.parameters])
@@ -433,6 +434,44 @@ def test_rotated_anglepair_matches_anglepair_rotated():
     np.testing.assert_allclose(np.cos(back["ra"]), np.cos(x["ra"]), atol=1e-6)
     np.testing.assert_allclose(np.sin(back["ra"]), np.sin(x["ra"]), atol=1e-6)
     np.testing.assert_allclose(back["dec"], x["dec"], atol=1e-6)
+
+
+def test_rotated_anglepair_radial_shell():
+    """The default concentrated radius keeps the prime points in a unit shell
+    (no mass tapering toward the origin); ``radial_sigma=None`` restores chi(3).
+    """
+    from nessai_gw.reparameterisations.sky import RotatedAnglePair
+
+    R = ETTriangleGroupAction(reference_time=REFERENCE_TIME).sky_frame_rotation
+    bounds = {
+        "ra": np.array([0.0, 2 * np.pi]),
+        "dec": np.array([-np.pi / 2, np.pi / 2]),
+    }
+    rng = np.random.default_rng(0)
+    n = 20000
+    x = np.zeros(n, dtype=[("ra", "f8"), ("dec", "f8"), ("ra_dec_radial", "f8")])
+    x["ra"] = rng.uniform(0, 2 * np.pi, n)
+    x["dec"] = np.arcsin(rng.uniform(-1, 1, n))
+
+    def radii(radial_sigma):
+        rep = RotatedAnglePair(
+            parameters=["ra", "dec"], prior_bounds=dict(bounds),
+            convention="ra-dec", rotation=R, radial_sigma=radial_sigma,
+            rng=np.random.default_rng(1),
+        )
+        xp = np.zeros(n, dtype=[(p, "f8") for p in rep.prime_parameters])
+        _, xp, _ = rep.reparameterise(x.copy(), xp, np.zeros(n))
+        v = np.stack([xp[p] for p in rep.prime_parameters], axis=-1)
+        return np.linalg.norm(v, axis=1)
+
+    shell = radii(0.15)
+    assert shell.mean() == pytest.approx(1.0, abs=0.02)
+    assert shell.std() == pytest.approx(0.15, abs=0.02)
+    assert shell.min() > 0.4  # nothing near the origin
+
+    chi3 = radii(None)
+    assert chi3.std() > 0.4  # the wide chi(3) spread
+    assert (chi3 < 0.7).mean() > 0.05  # real mass tapering toward r=0
 
 
 def test_fundamental_domain_is_positive_sky_octant(prime_action, prime_points):

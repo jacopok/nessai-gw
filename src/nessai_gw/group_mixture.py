@@ -1151,6 +1151,7 @@ def make_triangular_group_flow_proposal(
     phase_reflection=False,
     azimuth_offset=0.0,
     boundary_reflection=False,
+    sky_radial_sigma=0.15,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1193,6 +1194,12 @@ def make_triangular_group_flow_proposal(
         cliffs (see ``reflect_parameters`` in
         :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow`).
         Default ``False``.
+    sky_radial_sigma : float or None, optional
+        Width of the auxiliary sky radial coordinate (see
+        :class:`~nessai_gw.reparameterisations.sky.RotatedAnglePair`).  The
+        default (``0.15``) confines the sky prime points to a thin unit shell
+        so the base flow never has to taper a cone into the ``r = 0``
+        coordinate singularity; ``None`` restores ``AnglePair``'s ``chi(3)``.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1293,6 +1300,7 @@ def make_triangular_group_flow_proposal(
                         },
                         convention="ra-dec",
                         rotation=base_action.sky_frame_rotation,
+                        radial_sigma=sky_radial_sigma,
                         rng=self.rng,
                     )
                 )
@@ -1437,6 +1445,7 @@ def make_et_group_flow_proposal(
     phase_reflection=False,
     azimuth_offset=0.0,
     boundary_reflection=False,
+    sky_radial_sigma=0.15,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -1450,4 +1459,5 @@ def make_et_group_flow_proposal(
         phase_reflection=phase_reflection,
         azimuth_offset=azimuth_offset,
         boundary_reflection=boundary_reflection,
+        sky_radial_sigma=sky_radial_sigma,
     )

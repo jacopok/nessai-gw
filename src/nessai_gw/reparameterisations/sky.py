@@ -2,6 +2,7 @@
 
 import numpy as np
 from nessai.reparameterisations import AnglePair
+from scipy import stats
 
 from .. import nessai_logger
 
@@ -31,11 +32,22 @@ class RotatedAnglePair(AnglePair):
     ----------
     rotation : array_like
         ``(3, 3)`` orthogonal matrix.  ``v_out = rotation @ v_cartesian``.
+    radial_sigma : float or None, optional
+        Standard deviation of the auxiliary radial coordinate.  ``AnglePair``
+        draws it from ``chi(3)`` (mode ~1.4, but ~20% of the mass at ``r < 1``
+        and non-negligible density down to ``r ~ 0``), which forces the base
+        flow to model a cone tapering into the coordinate singularity at the
+        origin.  The sky *direction* is all that carries information, so by
+        default this replaces ``chi(3)`` with a ``Gamma`` concentrated at
+        ``r = 1`` with this width (default ``0.15``): the prime points then lie
+        in a thin unit shell and the base flow fits a 2-D patch of the sphere
+        with a near-trivial radial dof -- nothing has to stretch across the
+        origin.  Pass ``None`` to keep the ``chi(3)`` behaviour.
     **kwargs
         Forwarded to :class:`~nessai.reparameterisations.AnglePair`.
     """
 
-    def __init__(self, rotation=None, **kwargs):
+    def __init__(self, rotation=None, radial_sigma=0.15, **kwargs):
         super().__init__(**kwargs)
         if rotation is None:
             raise ValueError("RotatedAnglePair requires a `rotation` matrix.")
@@ -45,6 +57,13 @@ class RotatedAnglePair(AnglePair):
         if not np.allclose(R @ R.T, np.eye(3), atol=1e-6):
             raise ValueError("`rotation` must be orthogonal.")
         self._rotation = R
+
+        self.radial_sigma = radial_sigma
+        if radial_sigma is not None and getattr(self, "chi", False):
+            # Gamma(a, scale=1/a): mean 1, variance 1/a = radial_sigma**2,
+            # strictly positive so the `r < 0` guard never trips.
+            a = 1.0 / float(radial_sigma) ** 2
+            self.chi = stats.gamma(a=a, scale=1.0 / a)
 
     @property
     def _cartesian_names(self):
