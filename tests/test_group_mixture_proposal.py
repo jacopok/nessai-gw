@@ -300,6 +300,46 @@ def test_prime_space_action_16_delta_phase_matches_physical(
         assert d.max() < 1e-5, g
 
 
+def _in_domain_count(action, prime_points, group_size):
+    """For each point, how many of its ``group_size`` orbit images the adapter
+    reports as canonical."""
+    n = len(prime_points["ra_dec_x"])
+    count = torch.zeros(n)
+    for g in range(group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        image = action(prime_points, modes)
+        count += action.in_fundamental_domain(image).float()
+    return count
+
+
+def test_prime_space_fundamental_domain_partitions_orbit(
+    prime_action, prime_points
+):
+    """Exactly one of the 8 orbit images is canonical (generic points)."""
+    count = _in_domain_count(prime_action, prime_points, 8)
+    assert torch.all(count == 1), count.unique(return_counts=True)
+
+
+def test_prime_space_16_fundamental_domain_partitions_orbit(
+    prime_action_16, prime_points
+):
+    """With ``phase_reflection`` exactly one of the 16 orbit images is
+    canonical, and it is the one with ``delta_phase in [0, pi)`` -- i.e. the
+    Z2 is folded on the flow coordinate, not the (unconstrained) raw phase."""
+    count = _in_domain_count(prime_action_16, prime_points, 16)
+    assert torch.all(count == 1), count.unique(return_counts=True)
+
+    n = len(prime_points["ra_dec_x"])
+    for g in range(16):
+        modes = torch.full((n,), g, dtype=torch.long)
+        image = prime_action_16(prime_points, modes)
+        canon = prime_action_16.in_fundamental_domain(image)
+        dphase, _ = _decode_pair(
+            image["delta_phase_x"], image["delta_phase_y"], 1.0
+        )
+        assert torch.all(dphase[canon] < np.pi + 1e-6), g
+
+
 def test_prime_parameter_names():
     prime = _prime_parameter_names(BNS_PARAMETERS, REFERENCE_TIME)
     if not any(n.startswith("ra_dec") for n in prime):

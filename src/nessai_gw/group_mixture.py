@@ -78,6 +78,15 @@ reflection flips the sign and sends ``psi -> pi - psi``; a rotation shifts
 so the Jacobian stays 1.  With the default period ``2*pi`` the map is an exact
 bijection; ``delta_phase`` is additionally invariant modulo ``pi``.
 
+With ``phase_reflection`` the fundamental-domain test for the extra
+:math:`\\mathbb{Z}_2` is taken on ``delta_phase`` (the *flow* coordinate),
+``delta_phase in [0, pi)`` -- **not** on the raw invariant ``phase``.  The two
+differ by ``sign(cos theta_jn) * psi`` and ``psi`` is unconstrained, so a
+raw-``phase`` cut is uncorrelated with the ``delta_phase`` the base flow
+actually sees and never folds the ``delta_phase -> delta_phase + pi``
+degeneracy.  ``_encode`` shifts ``delta_phase`` by ``pi`` under a
+``phase``-flip, so ``delta_phase in [0, pi)`` is the matching domain.
+
 Unlike LISA, a ground-based triangle sits at an appreciable offset
 ``r_ET`` from the geocenter, so the sky degeneracy is only a degeneracy of
 the *detector-frame* arrival time, not of the geocentric time ``geocent_time``
@@ -830,7 +839,20 @@ class PrimeSpaceETGroupAction:
         return self._encode(point_dict, mapped, aux)
 
     def in_fundamental_domain(self, point_dict):
-        acted, _ = self._decode(point_dict)
+        acted, aux = self._decode(point_dict)
+        if self._action.phase_reflection:
+            # The base action folds the phase-reflection Z2 by testing
+            # ``phase in [0, pi)`` on the raw invariant phase.  In prime space
+            # the flow coordinate is ``delta_phase = phase + sign_ct * psi``,
+            # not the raw phase, and psi is unconstrained -- so the raw-phase
+            # cut is ~a coin flip w.r.t. delta_phase and never actually folds
+            # the ``delta_phase -> delta_phase + pi`` (2, 2)-mode degeneracy the
+            # base flow sees.  ``_encode`` under ``phase_flipped`` shifts
+            # delta_phase by pi, so ``delta_phase in [0, pi)`` is the matching
+            # fundamental domain -- test that instead (base uses ``phase`` only
+            # for this clause).
+            acted = dict(acted)
+            acted["phase"] = acted["phase"] + aux["sign_ct"] * acted["psi"]
         return self._action.in_fundamental_domain(acted)
 
 
