@@ -45,8 +45,7 @@ PRIME_NAMES = [
     "ra_dec_z",
     "psi_x",
     "psi_y",
-    "delta_phase_x",
-    "delta_phase_y",
+    "delta_phase",
     "theta_jn_prime",
     "geocent_time_prime",
 ]
@@ -95,16 +94,15 @@ def prime_points():
     cos_dec = np.cos(dec)
     psi = rng.uniform(0, np.pi, n)
     r_psi = rng.uniform(0.5, 1.5, n)
-    delta_phase = rng.uniform(0, 2 * np.pi, n)
-    r_dphase = rng.uniform(0.5, 1.5, n)
+    # single [-1, 1) polarisation-phase coordinate
+    delta_phase = rng.uniform(-1.0, 1.0, n)
     return {
         "ra_dec_x": torch.as_tensor(r_sky * cos_dec * np.cos(ra)),
         "ra_dec_y": torch.as_tensor(r_sky * cos_dec * np.sin(ra)),
         "ra_dec_z": torch.as_tensor(r_sky * np.sin(dec)),
         "psi_x": torch.as_tensor(r_psi * np.cos(2.0 * psi)),
         "psi_y": torch.as_tensor(r_psi * np.sin(2.0 * psi)),
-        "delta_phase_x": torch.as_tensor(r_dphase * np.cos(delta_phase)),
-        "delta_phase_y": torch.as_tensor(r_dphase * np.sin(delta_phase)),
+        "delta_phase": torch.as_tensor(delta_phase),
         "theta_jn_prime": torch.as_tensor(rng.uniform(-1, 1, n)),
         "geocent_time_prime": torch.as_tensor(rng.uniform(-20, 20, n)),
     }
@@ -162,6 +160,11 @@ def _decode_pair(px, py, scale):
     return ang, r
 
 
+def _decode_delta_phase(prime, scale=1.0):
+    """Single ``delta_phase`` coordinate in ``[-1, 1)`` -> physical angle."""
+    return torch.remainder((prime + 1.0) * np.pi / scale, 2 * np.pi)
+
+
 def _to_physical(points):
     """prime-space dict -> physical (ra, sin_dec, cos_theta_jn, psi, phase)."""
     # Flow sky coordinates are detector-frame; rotate back to equatorial to
@@ -180,9 +183,7 @@ def _to_physical(points):
     ra = torch.remainder(torch.atan2(sy, sx), 2 * np.pi)
     sin_dec = torch.clamp(sz / r_sky, -1.0, 1.0)
     psi, _ = _decode_pair(points["psi_x"], points["psi_y"], 2.0)
-    dphase, _ = _decode_pair(
-        points["delta_phase_x"], points["delta_phase_y"], 1.0
-    )
+    dphase = _decode_delta_phase(points["delta_phase"])
     u = points["theta_jn_prime"]
     # angle-sine: u = 2 theta_jn / pi - 1  ->  cos(theta_jn) sign = -sign(u)
     cos_theta_jn = torch.cos(0.5 * np.pi * (u + 1.0))
@@ -225,9 +226,6 @@ def test_prime_space_action_preserves_radii(prime_action, prime_points):
         prime_points["ra_dec_z"],
     )
     r_psi = torch.hypot(prime_points["psi_x"], prime_points["psi_y"])
-    r_dphase = torch.hypot(
-        prime_points["delta_phase_x"], prime_points["delta_phase_y"]
-    )
     for g in range(ETTriangleGroupAction.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         mapped = prime_action(prime_points, modes)
@@ -236,12 +234,11 @@ def test_prime_space_action_preserves_radii(prime_action, prime_points):
             mapped["ra_dec_z"],
         )
         r_psi_t = torch.hypot(mapped["psi_x"], mapped["psi_y"])
-        r_dphase_t = torch.hypot(
-            mapped["delta_phase_x"], mapped["delta_phase_y"]
-        )
         assert torch.allclose(r_sky_t, r_sky, atol=1e-6)
         assert torch.allclose(r_psi_t, r_psi, atol=1e-6)
-        assert torch.allclose(r_dphase_t, r_dphase, atol=1e-6)
+        # single delta_phase coordinate stays in [-1, 1)
+        assert torch.all(mapped["delta_phase"] >= -1.0 - 1e-9)
+        assert torch.all(mapped["delta_phase"] < 1.0 + 1e-9)
 
 
 def test_prime_space_action_delta_phase_matches_physical(
@@ -257,9 +254,7 @@ def test_prime_space_action_delta_phase_matches_physical(
         phys = base(phys0, modes)
         want = _delta_phase_from_physical(phys)
         mapped = prime_action(prime_points, modes)
-        got, _ = _decode_pair(
-            mapped["delta_phase_x"], mapped["delta_phase_y"], 1.0
-        )
+        got = _decode_delta_phase(mapped["delta_phase"])
         d = torch.remainder(got - want, 2 * np.pi)
         d = torch.minimum(d, 2 * np.pi - d)
         assert d.max() < 1e-5, g
@@ -309,9 +304,7 @@ def test_prime_space_action_16_delta_phase_matches_physical(
         phys = base(phys0, modes)
         want = _delta_phase_from_physical(phys)
         mapped = prime_action_16(prime_points, modes)
-        got, _ = _decode_pair(
-            mapped["delta_phase_x"], mapped["delta_phase_y"], 1.0
-        )
+        got = _decode_delta_phase(mapped["delta_phase"])
         d = torch.remainder(got - want, 2 * np.pi)
         d = torch.minimum(d, 2 * np.pi - d)
         assert d.max() < 1e-5, g
@@ -351,9 +344,7 @@ def test_prime_space_16_fundamental_domain_partitions_orbit(
         modes = torch.full((n,), g, dtype=torch.long)
         image = prime_action_16(prime_points, modes)
         canon = prime_action_16.in_fundamental_domain(image)
-        dphase, _ = _decode_pair(
-            image["delta_phase_x"], image["delta_phase_y"], 1.0
-        )
+        dphase = _decode_delta_phase(image["delta_phase"])
         assert torch.all(dphase[canon] < np.pi + 1e-6), g
 
 
@@ -363,7 +354,8 @@ def test_prime_parameter_names():
         pytest.skip("probe fell back to the name-order heuristic")
     assert {"ra_dec_x", "ra_dec_y", "ra_dec_z"} <= set(prime)
     assert "psi_x" in prime and "psi_y" in prime
-    assert "delta_phase_x" in prime and "delta_phase_y" in prime
+    assert "delta_phase" in prime
+    assert "delta_phase_x" not in prime and "delta_phase_y" not in prime
     assert "phase_x" not in prime and "phase_y" not in prime
     # every physical parameter contributes at least one prime coordinate
     assert len(prime) >= len(BNS_PARAMETERS)

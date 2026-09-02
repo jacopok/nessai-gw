@@ -4,11 +4,12 @@ import numpy as np
 from nessai.reparameterisations import (
     Reparameterisation,
 )
-from nessai.reparameterisations.angle import Angle
 
 from .. import nessai_logger
 
 logger = nessai_logger.getChild(__name__)
+
+_TWO_PI = 2.0 * np.pi
 
 
 class DeltaPhaseReparameterisation(Reparameterisation):
@@ -85,90 +86,104 @@ class DeltaPhaseReparameterisation(Reparameterisation):
         return x, x_prime, log_j
 
 
-class PolarisationPhaseReparameterisation(Angle):
-    """Periodic ``delta_phase = phase + sign(cos theta_jn) * psi`` coordinate.
+class PolarisationPhaseReparameterisation(Reparameterisation):
+    """Single ``delta_phase = phase + sign(cos theta_jn) * psi`` flow coordinate.
 
     For the dominant (2, 2) GW mode the extrinsic likelihood constrains only the
-    combination ``phase + sign(cos theta_jn) * psi`` (``phase + psi`` face-on,
-    ``phase - psi`` face-off); the orthogonal combination is nearly flat.  This
-    reparameterisation replaces the ``phase`` Cartesian pair of
-    :class:`~nessai.reparameterisations.angle.Angle` (``angle-2pi``) with a
-    single periodic coordinate ``delta_phase``, so the constrained ridge is an
-    explicit flow axis and ``psi`` is left as the broad orthogonal coordinate.
+    combination ``delta_phase = phase + sign(cos theta_jn) * psi`` (``phase +
+    psi`` face-on, ``phase - psi`` face-off); the orthogonal combination
+    (``psi`` itself, carried separately as ``angle-pi``) is nearly flat.
 
-    The sign is taken from ``cos theta_jn`` (this is the same combination as
-    :class:`DeltaPhaseReparameterisation`).  A flow-fit study on the octomodal
-    ET BNS posterior (``examples/validate_polarisation_phase.py``) showed that
+    This reparameterisation replaces the ``phase`` ``angle-2pi`` **Cartesian
+    pair** with a **single** coordinate ::
 
-    * the *sign-free* ``phase + psi`` is worse than the plain ``phase`` pair
-      when the group fold canonicalises the detector-plane hemisphere
-      (``beta_f >= 0``, what :meth:`ETTriangleGroupAction.in_fundamental_domain`
-      does) rather than face-on/off -- that fold leaves the folded posterior
-      face-off dominated, so ``phase + psi`` is the *flat* direction;
-    * ``phase + sign(cos theta_jn) * psi`` picks the constrained combination
-      regardless of which reflection the fold chose (~1.5 nat lower flow NLL),
-      and is exactly invariant modulo ``pi`` under the group reflection
-      (``cos theta_jn -> -cos theta_jn``, ``psi -> pi - psi``).
+        delta_phase_prime =
+            (((phase + sign(cos theta_jn) * psi) * scale) mod 2*pi) / pi - 1
 
-    :class:`nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction` recomputes
+    in ``[-1, 1)``.
+
+    Dropping the pair removes the ``chi(2)`` auxiliary radius: with a
+    well-measured ``delta_phase`` the pair's free radius turns the flow-facing
+    marginal into a leptokurtic scale mixture (a radial "cusp" at the origin)
+    that the single group-mixture base flow fits poorly -- offline ``v9``
+    inspection measured ``delta_phase_x`` excess kurtosis ~+0.9 with ~12 % of
+    the mass at radius < 0.5.  The single coordinate is instead a clean unimodal
+    (or, for the 8-element group, ``pi``-periodic bimodal) bump.
+
+    The coordinate is *not* wrapped for the flow -- it is a bounded ``[-1, 1)``
+    linear coordinate -- but with the ``beta_f >= 0`` fold the canonical
+    ``delta_phase`` sits well inside ``(0, 2*pi)`` (folded circular
+    concentration ~0.9, mode ~1.9 rad) so the ``0`` / ``2*pi`` seam is a
+    non-issue.  :class:`nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction`
+    still wraps modulo the period in prime space.
+
+    The map ``phase -> delta_phase_prime`` has constant Jacobian
+    ``|d delta_phase_prime / d phase| = scale / pi`` (``psi`` / ``theta_jn`` are
+    held fixed -- the group action is what transforms them).
+    :class:`~nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction` recomputes
     ``delta_phase`` from the group-transformed ``psi`` and ``cos theta_jn`` on
-    the encode side.
+    the encode side (``sign`` flips and ``psi -> pi - psi`` under a reflection).
 
-    The transformation is a rotation of the Cartesian pair at fixed radius, so
-    its Jacobian determinant is 1 (the ``chi(2)`` auxiliary radius is inherited
-    from :class:`~nessai.reparameterisations.angle.Angle` unchanged).
-
-    Requires ``psi`` and ``theta_jn`` (to build ``delta_phase`` on the forward
-    pass and to recover ``phase`` on the inverse).
+    Requires ``psi`` and ``theta_jn`` on both the forward pass (to build
+    ``delta_phase``) and the inverse (to recover ``phase``).
 
     Parameters
     ----------
     parameters : Union[str, List[str]]
-        Name(s) of the parameter(s); the angle must be ``phase``.
-    prior_bounds : Union[list, dict]
-        Prior bounds for the parameters; ``phase`` must have a lower bound of 0.
+        Name of the parameter; must be ``phase``.
+    prior_bounds : Union[list, dict], optional
+        Prior bounds for ``phase``.  Unused -- the coordinate is always rescaled
+        from ``[0, 2*pi)``.
     scale : float, optional
-        Angle rescaling before the Cartesian conversion.  ``1.0`` (default)
-        gives period ``2*pi`` and keeps the map an exact bijection.  ``2.0``
-        (period ``pi``) fits noticeably tighter still by folding out the
-        ``phase -> phase + pi`` (2, 2)-mode degeneracy, at the cost of
-        discarding that (weak, for BNS) distinction and making the map 2->1.
-        The **preferred** way to exploit that degeneracy is instead a
-        16-element group action
+        ``1.0`` (default) -> period ``2*pi``, an exact bijection.  ``2.0``
+        (period ``pi``) folds out the ``phase -> phase + pi`` (2, 2)-mode
+        degeneracy for a tighter target, at the cost of a ``2 -> 1`` map; prefer
+        instead a 16-element group action
         (:class:`nessai_gw.group_mixture.ETTriangleGroupAction` with
-        ``phase_reflection=True``): the mixture folds ``phase <-> phase + pi``
-        and its fitted weight absorbs the inexactness, while this
-        reparameterisation stays a clean bijection at ``scale=1.0``.
-    prior : {"uniform", "sine", None}, optional
-        Passed through to :class:`~nessai.reparameterisations.angle.Angle` on
-        versions of nessai that accept it.
+        ``phase_reflection=True``), which folds ``phase <-> phase + pi`` while
+        this coordinate stays a clean bijection.
+    prior : optional
+        Accepted for registry compatibility and ignored (the flow models the
+        prime coordinate directly).
     """
+
+    one_to_one = False
 
     def __init__(
         self,
         parameters=None,
         prior_bounds=None,
         scale=1.0,
-        prior="uniform",
+        prior=None,
         rng=None,
         **kwargs,
     ):
-        parent_params = inspect.signature(Angle.__init__).parameters
-        call = dict(
-            parameters=parameters, prior_bounds=prior_bounds, scale=scale,
-            rng=rng,
-        )
-        if "prior" in parent_params:
-            call["prior"] = prior
-        # forward any framework-injected kwargs the installed nessai accepts
-        # (e.g. ``input_parameters`` on newer versions)
+        # Only forward kwargs the installed nessai ``Reparameterisation`` accepts
+        # (0.15.x: ``parameters``, ``prior_bounds``, ``rng``; newer versions also
+        # ``input_parameters`` / ``output_parameters``).
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        call = dict(parameters=parameters, prior_bounds=prior_bounds)
+        if "rng" in parent_params:
+            call["rng"] = rng
         for key, value in kwargs.items():
             if key in parent_params:
                 call[key] = value
         super().__init__(**call)
 
-        # psi and theta_jn are needed on the forward pass
-        # (delta_phase = phase + sign(cos theta_jn) * psi) and on the inverse.
+        if self.parameters != ["phase"]:
+            raise RuntimeError(
+                "PolarisationPhaseReparameterisation must act on 'phase'; got "
+                f"{self.parameters}"
+            )
+        self.scale = float(scale)
+        # single flow-facing coordinate
+        self.prime_parameters = ["delta_phase"]
+        if hasattr(self, "output_parameters"):
+            self.output_parameters = ["delta_phase"]
+        # psi and theta_jn are needed both to build delta_phase (forward) and to
+        # recover phase (inverse).
         self.requires = ["psi", "theta_jn"]
         if hasattr(self, "inverse_input_parameters"):
             self.inverse_input_parameters = list(
@@ -177,43 +192,25 @@ class PolarisationPhaseReparameterisation(Angle):
                     + ["psi", "theta_jn"]
                 )
             )
-
-        # Rename the flow-facing coordinate ``phase`` -> ``delta_phase``.
-        self.prime_parameters = ["delta_phase_x", "delta_phase_y"]
-        if hasattr(self, "output_parameters"):
-            self.output_parameters = ["delta_phase_x", "delta_phase_y"]
-
-        radial = "delta_phase_radial"
-        if getattr(self, "chi", False):
-            # nessai <= 0.15: the auxiliary radial lives in ``self.parameters``.
-            if len(self.parameters) > 1:
-                self.parameters[1] = radial
-            # newer nessai: it lives in ``self.auxiliary_parameters``.
-            if getattr(self, "auxiliary_parameters", None):
-                self.auxiliary_parameters = [radial]
-
-        if not self._zero_bound:
-            raise RuntimeError(
-                "PolarisationPhaseReparameterisation requires a phase lower "
-                "bound of 0 so the inverse wraps modulo 2*pi."
-            )
+        self._log_j = float(np.log(self.scale / np.pi))
 
     @staticmethod
     def _psi_sign(x):
         """``sign(cos theta_jn)`` (0 exactly at edge-on -- a measure-zero set)."""
         return np.sign(np.cos(x["theta_jn"]))
 
-    def _rescale_angle(self, x, x_prime, log_j, **kwargs):
-        angle = (x["phase"] + self._psi_sign(x) * x["psi"]) * self.scale
-        return angle, x, x_prime, log_j
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        angle = np.mod(
+            (x["phase"] + self._psi_sign(x) * x["psi"]) * self.scale, _TWO_PI
+        )
+        x_prime[self.prime_parameters[0]] = angle / np.pi - 1.0
+        return x, x_prime, log_j + self._log_j
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
-        # ``Angle`` writes the recovered ``delta_phase`` angle into ``x["phase"]``
-        # and the radius into the auxiliary parameter, and subtracts ``log r``.
-        x, x_prime, log_j = super().inverse_reparameterise(
-            x, x_prime, log_j, **kwargs
+        angle = np.mod(
+            (x_prime[self.prime_parameters[0]] + 1.0) * np.pi, _TWO_PI
         )
         x["phase"] = np.mod(
-            x["phase"] - self._psi_sign(x) * x["psi"], 2 * np.pi
+            angle / self.scale - self._psi_sign(x) * x["psi"], _TWO_PI
         )
-        return x, x_prime, log_j
+        return x, x_prime, log_j - self._log_j

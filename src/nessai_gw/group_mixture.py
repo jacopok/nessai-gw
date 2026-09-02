@@ -59,11 +59,14 @@ Polarisation-phase coordinate
 For the dominant (2, 2) mode the extrinsic likelihood constrains only
 ``phase + sign(cos theta_jn) * psi`` (``phase + psi`` face-on, ``phase - psi``
 face-off); the orthogonal combination is nearly flat.  The group wiring
-therefore carries ``phase`` as the periodic coordinate
+therefore carries ``phase`` as the **single** bounded coordinate
 ``delta_phase = phase + sign(cos theta_jn) * psi``
 (:class:`~nessai_gw.reparameterisations.phase.PolarisationPhaseReparameterisation`,
 ``polarisation-phase``) so that ridge is an explicit flow axis and ``psi`` is
-left as the broad orthogonal coordinate.
+left as the broad orthogonal coordinate.  ``delta_phase`` is a single
+``[-1, 1)`` coordinate, *not* an ``Angle`` Cartesian pair: with the ridge
+well-measured the pair's free ``chi(2)`` radius made the flow-facing marginal a
+leptokurtic scale mixture (origin cusp), which the single base flow fit badly.
 
 The sign must be taken from ``cos theta_jn``: the fundamental domain used above
 canonicalises the detector-plane hemisphere (``beta_f >= 0``), *not*
@@ -78,9 +81,10 @@ concrete: ``phase + psi`` fit worse than the plain ``phase`` pair, while
 sets ``delta_phase_out = phase_inv + sign(cos theta_jn)_out * psi_out`` on
 encode, from the group-transformed ``psi`` and ``cos theta_jn`` sign (a
 reflection flips the sign and sends ``psi -> pi - psi``; a rotation shifts
-``psi`` by ``k*pi/2``).  It is a rotation of the Cartesian pair at fixed radius,
-so the Jacobian stays 1.  With the default period ``2*pi`` the map is an exact
-bijection; ``delta_phase`` is additionally invariant modulo ``pi``.
+``psi`` by ``k*pi/2``).  It is a constant shift / sign flip of the single
+``delta_phase`` coordinate wrapped modulo the period, so the Jacobian stays 1.
+With the default period ``2*pi`` the map is an exact bijection; ``delta_phase``
+is additionally invariant modulo ``pi``.
 
 With ``phase_reflection`` the fundamental-domain test for the extra
 :math:`\\mathbb{Z}_2` is taken on ``delta_phase`` (the *flow* coordinate),
@@ -171,12 +175,15 @@ _EPS = 1e-30
 
 #: nessai ``Angle`` reparameterisation convention: the Cartesian angle stored by
 #: the flow is ``physical_angle * scale``.  ``angle-pi`` (used for ``psi``) has
-#: ``scale = 2``; ``angle-2pi`` (used for ``phase``) has ``scale = 1``.  The
-#: group wiring replaces ``phase`` with
-#: ``delta_phase = phase + sign(cos theta_jn) * psi`` (``polarisation-phase``,
-#: an ``angle-2pi``-style periodic coordinate); the ``"phase"`` key is kept so
-#: :func:`_decode_pair` stays generic.
-_ANGLE_SCALE = {"psi": 2.0, "phase": 1.0, "delta_phase": 1.0}
+#: ``scale = 2``.  ``psi`` is the only extrinsic coordinate still carried as an
+#: ``Angle`` Cartesian pair.
+_ANGLE_SCALE = {"psi": 2.0}
+
+#: ``polarisation-phase`` scale (must match the value the ``polarisation-phase``
+#: reparameterisation is registered with).  The flow coordinate is
+#: ``delta_phase_prime = (((phase + sign(cos theta_jn) * psi) * scale) mod 2*pi)
+#: / pi - 1`` in ``[-1, 1)``; ``scale = 1`` -> period ``2*pi`` (bijective).
+_DELTA_PHASE_SCALE = 1.0
 
 #: ``geocent_time`` prime coordinate is ``(geocent_time - reference_time) /
 #: _GEOCENT_SCALE``.  A fixed scale (rather than data-driven bounds) keeps the
@@ -713,13 +720,19 @@ class PrimeSpaceTriangularGroupAction:
                 self._sky = tuple(trip)
                 break
 
-        # psi / delta_phase: name_{x,y} from the angle-pi / polarisation-phase
-        # Angle reparams
+        # psi: name_{x,y} from the angle-pi Angle reparam
         self._pair = {}
         for base in _ANGLE_SCALE:
             x, y = f"{base}_x", f"{base}_y"
             if x in names and y in names:
                 self._pair[base] = (x, y)
+
+        # delta_phase: single linear polarisation-phase coordinate
+        self._delta_phase = None
+        for cand in ("delta_phase", "delta_phase_prime"):
+            if cand in names:
+                self._delta_phase = cand
+                break
 
         # theta_jn: single linear angle-sine coordinate
         self._theta_jn = None
@@ -740,8 +753,8 @@ class PrimeSpaceTriangularGroupAction:
             missing.append("sky-ra-dec (ra_dec_x/_y/_z)")
         if "psi" not in self._pair:
             missing.append("psi (psi_x/_y)")
-        if "delta_phase" not in self._pair:
-            missing.append("delta_phase (delta_phase_x/_y)")
+        if self._delta_phase is None:
+            missing.append("delta_phase")
         if self._theta_jn is None:
             missing.append("theta_jn")
         if self._geocent_time is None:
@@ -787,12 +800,15 @@ class PrimeSpaceTriangularGroupAction:
         sign_ct = -torch.sign(u_theta)
         cos_theta_jn = torch.zeros_like(ra)
 
-        # The flow carries delta_phase = phase + sign(cos theta_jn) * psi
-        # (polarisation-phase).  ``phase`` itself is group-invariant, so recover
-        # the invariant piece and let :meth:`_encode` rebuild delta_phase from
-        # the group-transformed psi and cos(theta_jn) sign.
-        delta_phase, r_dphase = _decode_pair(
-            point_dict, self._pair["delta_phase"], _ANGLE_SCALE["delta_phase"]
+        # The flow carries the single coordinate
+        # ``delta_phase_prime = (delta_phase * scale mod 2*pi) / pi - 1`` with
+        # ``delta_phase = phase + sign(cos theta_jn) * psi`` (polarisation-phase).
+        # ``phase`` itself is group-invariant, so recover the invariant piece and
+        # let :meth:`_encode` rebuild delta_phase from the group-transformed psi
+        # and cos(theta_jn) sign.
+        delta_phase = torch.remainder(
+            (point_dict[self._delta_phase] + 1.0) * np.pi / _DELTA_PHASE_SCALE,
+            _TWO_PI,
         )
         phase = delta_phase - sign_ct * psi
 
@@ -811,7 +827,6 @@ class PrimeSpaceTriangularGroupAction:
         aux = {
             "r_sky": r_sky,
             "r_psi": r_psi,
-            "r_dphase": r_dphase,
             "phase_inv": phase,
             "sign_ct": sign_ct,
         }
@@ -852,11 +867,11 @@ class PrimeSpaceTriangularGroupAction:
         phase_inv_out = torch.where(
             aux["phase_flipped"], aux["phase_inv"] + np.pi, aux["phase_inv"]
         )
-        dpx, dpy = self._pair["delta_phase"]
         delta_phase_new = phase_inv_out + sign_ct_out * mapped["psi"]
-        out[dpx], out[dpy] = _pair_from_angle(
-            delta_phase_new, aux["r_dphase"], _ANGLE_SCALE["delta_phase"]
+        angle = torch.remainder(
+            delta_phase_new * _DELTA_PHASE_SCALE, _TWO_PI
         )
+        out[self._delta_phase] = angle / np.pi - 1.0
 
         out[self._geocent_time] = mapped["geocent_time"] / _GEOCENT_SCALE
         return {n: out[n] for n in self._prime_names}
@@ -915,12 +930,14 @@ def triangular_group_reparameterisations(sampling_parameters, reference_time):
     * ``geocent_time`` -> constant ``reference_time`` shift with a fixed
       :data:`_GEOCENT_SCALE` (keeps the GPS epoch off the flow; the group's own
       additive light-travel-delay shift is unaffected by a constant offset).
-    * ``phase`` -> ``polarisation-phase`` (periodic
-      ``delta_phase = phase + sign(cos theta_jn) * psi`` pair): makes the
+    * ``phase`` -> ``polarisation-phase``: a **single** ``[-1, 1)`` coordinate
+      ``delta_phase = phase + sign(cos theta_jn) * psi``, making the
       likelihood-constrained polarisation/phase combination an explicit flow
-      axis instead of a thin diagonal ridge across four prime coordinates.
-      ``psi`` (``angle-pi``) and ``theta_jn`` (``angle-sine``) are prerequisites
-      of this coordinate.
+      axis instead of a thin diagonal ridge across four prime coordinates -- and
+      *without* the ``Angle`` pair's free ``chi(2)`` radius, whose scale mixing
+      with a well-measured ridge left a leptokurtic origin cusp the base flow
+      fit poorly.  ``psi`` (``angle-pi``) and ``theta_jn`` (``angle-sine``) are
+      prerequisites of this coordinate.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
@@ -1081,12 +1098,14 @@ def _prime_parameter_names(sampling_parameters, reference_time):
     for name in names:
         if name in ("ra", "dec"):
             continue
-        # the group wiring reparameterises ``phase`` as ``delta_phase = phase + psi``
-        coord = "delta_phase" if name == "phase" else name
-        if coord in _ANGLE_SCALE:
-            out += [f"{coord}_x", f"{coord}_y"]
+        if name == "phase":
+            # the group wiring carries ``phase`` as the single ``delta_phase``
+            # polarisation-phase coordinate (no ``_x``/``_y`` pair, no suffix)
+            out.append("delta_phase")
+        elif name in _ANGLE_SCALE:
+            out += [f"{name}_x", f"{name}_y"]
         else:
-            out.append(f"{coord}_prime")
+            out.append(f"{name}_prime")
     return out
 
 

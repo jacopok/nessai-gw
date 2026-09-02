@@ -365,3 +365,43 @@ hold for this fold.
 
 R2/R3/R6 stand as written (R6: the probe now needs both `psi` and `theta_jn`
 inverted first, still falls back to the name heuristic; `initialise` rebinds).
+
+---
+
+## UPDATE 2 (2026-09-02) — pair -> single coordinate
+
+Offline `v9` inspection (`group_flow_inspection/inspect_flow_v9.py`, after fixing
+three unrelated harness bugs) showed the *combination* choice is now fine but
+the **`Angle` Cartesian-pair representation** of `delta_phase` is the residual
+problem: with the folded ridge well-measured (circular concentration ~0.9, mode
+~1.9 rad) the pair's free `chi(2)` radius makes `delta_phase_x` a leptokurtic
+scale mixture (excess kurtosis ~+0.9, ~12 % of the mass at radius < 0.5) — a
+radial "cusp" the single base flow fits poorly.
+
+`polarisation-phase` is now a **single** `[-1, 1)` coordinate:
+
+    delta_phase_prime =
+        (((phase + sign(cos theta_jn) * psi) * scale) mod 2*pi) / pi - 1
+
+- `PolarisationPhaseReparameterisation` no longer subclasses `Angle`; it is a
+  plain `Reparameterisation` (0.15.x API, `inspect`-guarded kwarg forwarding for
+  newer nessai). `prime_parameters == ["delta_phase"]`, unit-`scale` Jacobian
+  `log|J| = log(scale/pi)` (constant), no auxiliary radius.
+- Not wrapped for the flow — a bounded linear coordinate. With the `beta_f >= 0`
+  fold the canonical `delta_phase` sits well inside `(0, 2*pi)`, so the seam is a
+  non-issue; the prime-space action still `torch.remainder`-wraps.
+- `_ANGLE_SCALE` drops `phase`/`delta_phase` (only `psi` stays a pair); new
+  module constant `_DELTA_PHASE_SCALE` must match the registered `scale`.
+- `PrimeSpaceTriangularGroupAction`: `bind` discovers a single `delta_phase`
+  coord (not `_pair`); `_decode` reads it directly (`aux` drops `r_dphase`);
+  `_encode` writes `((phase_inv_out + sign_ct_out * psi_out) * scale mod 2*pi)
+  / pi - 1`. `in_fundamental_domain` unchanged.
+- `_prime_parameter_names` heuristic emits `"delta_phase"` for `phase`.
+- Period-`pi` (`scale=2.0`) still opt-in via the registry.
+
+Verified: full nessai-gw suite 164 passed / 10 skipped; with the dev nessai
+(`nessai.flowmodel.group_mixture`) the probe returns `delta_phase`, all four
+proposal variants build, the 16-element prime-space action round-trips to 1e-13
+and partitions every orbit exactly, and a `GWFlowProposal.rescale` ->
+`inverse_rescale` round-trip is machine-precision with `log_j` cancelling.
+Still needs a fresh run + `inspect_flow` to confirm the flow-fit improvement.

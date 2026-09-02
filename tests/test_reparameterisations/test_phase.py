@@ -129,54 +129,55 @@ class TestPolarisationPhase:
 
     def test_init(self):
         reparam = self._reparam()
-        assert reparam.prime_parameters == ["delta_phase_x", "delta_phase_y"]
+        assert reparam.prime_parameters == ["delta_phase"]
         assert reparam.requires == ["psi", "theta_jn"]
         assert reparam.scale == 1.0
-        assert reparam._zero_bound is True
-        assert reparam.radial == "delta_phase_radial"
 
+    @pytest.mark.parametrize("scale", [1.0, 2.0])
     @pytest.mark.parametrize("theta_jn, sign", [(0.6, 1.0), (2.5, -1.0)])
-    def test_reparameterise_values(self, theta_jn, sign):
-        reparam = self._reparam()
+    def test_reparameterise_values(self, theta_jn, sign, scale):
+        reparam = PolarisationPhaseReparameterisation(
+            parameters="phase", prior_bounds=self.prior_bounds, scale=scale
+        )
         n = 20
         phase = np.random.uniform(0, 2 * np.pi, n)
         psi = np.random.uniform(0, np.pi, n)
         tjn = np.full(n, theta_jn)
         x = dict_to_live_points({"phase": phase, "psi": psi, "theta_jn": tjn})
         x_prime = empty_structured_array(
-            n, names=["delta_phase_x", "delta_phase_y", "psi", "theta_jn"]
+            n, names=["delta_phase", "psi", "theta_jn"]
         )
         x_prime["psi"] = psi
         x_prime["theta_jn"] = tjn
         log_j = np.zeros(n)
-        _, x_prime, _ = reparam.reparameterise(x, x_prime, log_j)
+        _, x_prime, log_j = reparam.reparameterise(x, x_prime, log_j)
 
-        radius = np.hypot(x_prime["delta_phase_x"], x_prime["delta_phase_y"])
-        angle = np.arctan2(
-            x_prime["delta_phase_y"], x_prime["delta_phase_x"]
-        ) % (2 * np.pi)
+        # prime coordinate is a single [-1, 1) value
+        assert np.all(x_prime["delta_phase"] >= -1.0)
+        assert np.all(x_prime["delta_phase"] < 1.0)
+        angle = (x_prime["delta_phase"] + 1.0) * np.pi
         np.testing.assert_allclose(
-            angle, (phase + sign * psi) % (2 * np.pi), atol=1e-9
+            angle,
+            ((phase + sign * psi) * scale) % (2 * np.pi),
+            atol=1e-9,
         )
-        assert np.all(radius > 0)
+        np.testing.assert_allclose(log_j, np.log(scale / np.pi), atol=1e-12)
 
     @pytest.mark.integration_test
+    @pytest.mark.parametrize("scale", [1.0, 2.0])
     @pytest.mark.parametrize("theta_jn", [0.6, 2.5])
-    def test_invertible(self, theta_jn):
-        reparam = self._reparam()
+    def test_invertible(self, theta_jn, scale):
+        reparam = PolarisationPhaseReparameterisation(
+            parameters="phase", prior_bounds=self.prior_bounds, scale=scale
+        )
         n = 50
         phase = np.random.uniform(0, 2 * np.pi, n)
         psi = np.random.uniform(0, np.pi, n)
         tjn = np.full(n, theta_jn)
         x = dict_to_live_points(
-            {
-                "phase": phase,
-                "psi": psi,
-                "theta_jn": tjn,
-                "delta_phase_radial": np.zeros(n),
-            }
+            {"phase": phase, "psi": psi, "theta_jn": tjn}
         )
-        names = ["delta_phase_x", "delta_phase_y", "psi", "theta_jn"]
+        names = ["delta_phase", "psi", "theta_jn"]
         x_prime = empty_structured_array(n, names=names)
         x_prime["psi"] = psi
         x_prime["theta_jn"] = tjn
@@ -185,10 +186,13 @@ class TestPolarisationPhase:
         x_f, x_prime_f, log_j_f = reparam.reparameterise(
             x.copy(), x_prime.copy(), log_j.copy()
         )
+        # forward leaves the physical point untouched
+        np.testing.assert_array_equal(x_f["phase"], phase)
         x_in = x_f.copy()
         x_in["phase"] = np.nan
         x_i, _, log_j_i = reparam.inverse_reparameterise(
             x_in, x_prime_f.copy(), log_j_f.copy()
         )
-        np.testing.assert_allclose(x_i["phase"], phase, rtol=1e-10)
-        np.testing.assert_allclose(log_j_i, log_j, atol=1e-10)
+        if scale == 1.0:
+            np.testing.assert_allclose(x_i["phase"], phase, rtol=1e-9)
+        np.testing.assert_allclose(log_j_i, 0.0, atol=1e-10)

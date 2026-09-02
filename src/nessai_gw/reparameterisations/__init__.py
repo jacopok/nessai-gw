@@ -73,7 +73,7 @@ known_reparameterisations.add_reparameterisation(
 known_reparameterisations.add_reparameterisation(
     "polarisation-phase",
     PolarisationPhaseReparameterisation,
-    {"scale": 1.0, "prior": "uniform"},
+    {"scale": 1.0},
 )
 
 known_reparameterisations.update(base_reparameterisations)
