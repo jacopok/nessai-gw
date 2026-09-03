@@ -911,6 +911,125 @@ class PrimeSpaceTriangularGroupAction:
         return self._action.in_fundamental_domain(acted)
 
 
+_LOG_2PI = float(np.log(2.0 * np.pi))
+_HALF_LOG_2PI = 0.5 * _LOG_2PI
+
+
+def _log_std_normal_pdf(x):
+    return -0.5 * x * x - _HALF_LOG_2PI
+
+
+class SkyOctantGaussianiser:
+    """Cylindrical equal-area + probit map of the canonical sky octant.
+
+    A ``canonical_transform`` for
+    :class:`nessai.flowmodel.group_mixture.DiscreteGroupMixtureFlowWrapper`.
+    Once the triangular-detector group has folded the sky to the axis-aligned
+    detector-frame octant ``x, y, z >= 0`` (see
+    :class:`~nessai_gw.reparameterisations.sky.RotatedAnglePair`), the base
+    flow still sees the *uniform-on-sphere* prior restricted to that octant --
+    a distribution with a hard edge along every octant boundary, which a
+    Gaussian-latent flow fits badly.
+
+    This transform replaces the three canonical Cartesian sky coordinates
+    ``(x, y, z) = r * (sin th cos ph, sin th sin ph, cos th)`` with
+
+    * ``a = Phi^-1( (2/pi) * ph )``      (azimuth ``ph in [0, pi/2)``  -> ``U`` -> ``N(0, 1)``)
+    * ``b = Phi^-1( 1 - z / r )``        (``z/r = cos th in [0, 1]``   -> ``U`` -> ``N(0, 1)``)
+    * ``c = r``                          (the auxiliary radius, passed through)
+
+    ``(ph, z/r)`` are the equal-area (Lambert cylindrical) coordinates of the
+    octant, so under the uniform-on-sphere prior ``a`` and ``b`` are *exactly*
+    independent standard normals and the base flow sees no edge. The group
+    action, the fundamental-domain predicate and every conjugation Jacobian
+    stay in the untouched Cartesian frame -- this map only sits between the
+    canonical representative and the base flow.
+
+    The sky is detector-frame-rotated by ``RotatedAnglePair``, so the octant is
+    already axis-aligned in the flow's ``ra_dec_{x,y,z}`` prime coordinates and
+    no rotation is needed here.  ``reflect_parameters`` for the sky is
+    incompatible with (and made redundant by) this transform: the octant walls
+    are pushed to ``a, b -> -inf``.
+
+    Jacobian (sky block only; all other coordinates are identity)::
+
+        dx dy dz = r**2 dr dph d(z/r)             (spherical volume element)
+        dph      = (pi/2) phi(a) da
+        d(z/r)   = phi(b) db
+        =>  log|d(a, b, c)/d(x, y, z)|
+              = log(2/pi) - 2 log r - log phi(a) - log phi(b)
+    """
+
+    def __init__(self, param_names=None, eps: float = 1e-7):
+        self._eps = float(eps)
+        self._idx = None
+        if param_names is not None:
+            self.bind(param_names)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        trip = None
+        for prefix in ("ra_dec", "dec_ra"):
+            cand = [f"{prefix}_{c}" for c in ("x", "y", "z")]
+            if all(c in names for c in cand):
+                trip = cand
+                break
+        if trip is None:
+            raise RuntimeError(
+                "SkyOctantGaussianiser needs ra_dec_{x,y,z} (or dec_ra_*) in "
+                f"the prime parameters; got {names}."
+            )
+        self._idx = [names.index(c) for c in trip]
+
+    # -- transform ------------------------------------------------------
+
+    def forward(self, canon):
+        """``canon -> (t, log|det dt/dcanon|)`` (sky block gaussianised)."""
+        ix, iy, iz = self._idx
+        x, y, z = canon[:, ix], canon[:, iy], canon[:, iz]
+        r = torch.sqrt(x * x + y * y + z * z + _EPS)
+        lam = torch.atan2(y, x)
+        u = torch.clamp((2.0 / np.pi) * lam, self._eps, 1.0 - self._eps)
+        v = torch.clamp(1.0 - z / r, self._eps, 1.0 - self._eps)
+        a = torch.special.ndtri(u)
+        b = torch.special.ndtri(v)
+
+        t = canon.clone()
+        t[:, ix] = a
+        t[:, iy] = b
+        t[:, iz] = r
+        log_j = (
+            -np.log(np.pi / 2.0)
+            - 2.0 * torch.log(r)
+            - _log_std_normal_pdf(a)
+            - _log_std_normal_pdf(b)
+        )
+        return t, log_j
+
+    def inverse(self, t):
+        """``t -> (canon, log|det dcanon/dt|)``."""
+        ix, iy, iz = self._idx
+        a, b, r = t[:, ix], t[:, iy], t[:, iz]
+        u = torch.special.ndtr(a)
+        v = torch.special.ndtr(b)
+        lam = (np.pi / 2.0) * u
+        cos_th = torch.clamp(1.0 - v, -1.0, 1.0)
+        sin_th = torch.sqrt(torch.clamp(1.0 - cos_th * cos_th, min=0.0))
+        rho = r * sin_th
+
+        canon = t.clone()
+        canon[:, ix] = rho * torch.cos(lam)
+        canon[:, iy] = rho * torch.sin(lam)
+        canon[:, iz] = r * cos_th
+        log_j = (
+            np.log(np.pi / 2.0)
+            + 2.0 * torch.log(r)
+            + _log_std_normal_pdf(a)
+            + _log_std_normal_pdf(b)
+        )
+        return canon, log_j
+
+
 def triangular_group_reparameterisations(sampling_parameters, reference_time):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -1171,6 +1290,7 @@ def make_triangular_group_flow_proposal(
     azimuth_offset=0.0,
     boundary_reflection=False,
     sky_radial_sigma=0.15,
+    gaussianise_sky="auto",
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1219,6 +1339,16 @@ def make_triangular_group_flow_proposal(
         default (``0.15``) confines the sky prime points to a thin unit shell
         so the base flow never has to taper a cone into the ``r = 0``
         coordinate singularity; ``None`` restores ``AnglePair``'s ``chi(3)``.
+    gaussianise_sky : bool or "auto", optional
+        Only on the prime-space path.  Install :class:`SkyOctantGaussianiser`
+        as the group-mixture ``canonical_transform``: the base flow then sees
+        the canonical sky octant mapped (cylindrical equal-area + probit) to
+        two independent standard normals plus the pass-through radius, instead
+        of the uniform-on-sphere octant with its hard prior edge.  Supersedes
+        ``boundary_reflection`` for the sky (the octant walls move to
+        ``+/-inf``).  Default ``"auto"`` -- on whenever ``prime_space`` is
+        ``True``.  Pass ``False`` to opt out, or an explicit ``True`` with
+        ``prime_space=False`` to get an error rather than a silent no-op.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1234,6 +1364,14 @@ def make_triangular_group_flow_proposal(
         ) from exc
 
     from .proposals import GWReparamMixin
+
+    if gaussianise_sky == "auto":
+        gaussianise_sky = bool(prime_space)
+    elif gaussianise_sky and not prime_space:
+        raise RuntimeError(
+            "gaussianise_sky is only supported on the prime-space path "
+            "(prime_space=True)."
+        )
 
     names = list(sampling_parameters)
     missing = sorted(
@@ -1258,12 +1396,26 @@ def make_triangular_group_flow_proposal(
         prime_names = _prime_parameter_names(names, reference_time)
         action = PrimeSpaceTriangularGroupAction(base_action, prime_names)
         gm_kwargs = {}
-        if boundary_reflection:
-            import inspect as _inspect
+        import inspect as _inspect
 
-            if "reflect_parameters" not in _inspect.signature(
-                make_group_mixture_flow
-            ).parameters:
+        _gm_params = _inspect.signature(make_group_mixture_flow).parameters
+        if gaussianise_sky:
+            if "canonical_transform" not in _gm_params:
+                raise RuntimeError(
+                    "gaussianise_sky requires a version of nessai whose "
+                    "make_group_mixture_flow accepts `canonical_transform`."
+                )
+            gm_kwargs["canonical_transform"] = SkyOctantGaussianiser(
+                prime_names
+            )
+            if boundary_reflection:
+                logger.warning(
+                    "gaussianise_sky pushes the octant walls to +/-inf; "
+                    "ignoring boundary_reflection for the sky coordinates."
+                )
+                boundary_reflection = False
+        if boundary_reflection:
+            if "reflect_parameters" not in _gm_params:
                 raise RuntimeError(
                     "boundary_reflection requires a version of nessai whose "
                     "make_group_mixture_flow accepts `reflect_parameters`."
@@ -1465,6 +1617,7 @@ def make_et_group_flow_proposal(
     azimuth_offset=0.0,
     boundary_reflection=False,
     sky_radial_sigma=0.15,
+    gaussianise_sky="auto",
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -1478,5 +1631,6 @@ def make_et_group_flow_proposal(
         phase_reflection=phase_reflection,
         azimuth_offset=azimuth_offset,
         boundary_reflection=boundary_reflection,
+        gaussianise_sky=gaussianise_sky,
         sky_radial_sigma=sky_radial_sigma,
     )

@@ -525,6 +525,7 @@ def test_make_et_group_flow_proposal_reflection_and_offset(boundary_reflection):
         REFERENCE_TIME,
         azimuth_offset=0.3,
         boundary_reflection=boundary_reflection,
+        gaussianise_sky=False,  # tested in isolation; it supersedes reflection
     )
     expect = (
         ["ra_dec_x", "ra_dec_y", "ra_dec_z"] if boundary_reflection else None
@@ -538,3 +539,116 @@ def test_make_et_group_flow_proposal_reflection_and_offset(boundary_reflection):
 def test_make_et_group_flow_proposal_missing_parameter():
     with pytest.raises(RuntimeError, match="missing"):
         make_et_group_flow_proposal(["ra", "dec", "psi"], REFERENCE_TIME)
+
+
+# --------------------------------------------------------------------------
+# SkyOctantGaussianiser (canonical_transform)
+
+from nessai_gw.group_mixture import SkyOctantGaussianiser  # noqa: E402
+
+
+def _octant_canon(n, seed=7):
+    """``[n, len(PRIME_NAMES)]`` canon tensor, sky on the +++ octant shell."""
+    rng = np.random.default_rng(seed)
+    v = np.abs(rng.normal(size=(n, 3)))
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    r = rng.uniform(0.7, 1.3, n)
+    v *= r[:, None]
+    cols = {k: torch.zeros(n, dtype=torch.float64) for k in PRIME_NAMES}
+    cols["ra_dec_x"] = torch.as_tensor(v[:, 0])
+    cols["ra_dec_y"] = torch.as_tensor(v[:, 1])
+    cols["ra_dec_z"] = torch.as_tensor(v[:, 2])
+    for k in ("psi_x", "psi_y", "delta_phase", "theta_jn_prime"):
+        cols[k] = torch.as_tensor(rng.normal(size=n))
+    return torch.stack([cols[k] for k in PRIME_NAMES], dim=-1)
+
+
+def test_sky_octant_gaussianiser_roundtrip():
+    t = SkyOctantGaussianiser(PRIME_NAMES)
+    canon = _octant_canon(512)
+    base, ljf = t.forward(canon)
+    back, lji = t.inverse(base)
+    assert torch.allclose(back, canon, atol=1e-6)
+    assert torch.allclose(ljf, -lji, atol=1e-6)
+    # non-sky columns are untouched
+    for i, name in enumerate(PRIME_NAMES):
+        if not name.startswith("ra_dec"):
+            assert torch.allclose(base[:, i], canon[:, i])
+
+
+def test_sky_octant_gaussianiser_jacobian_numeric():
+    t = SkyOctantGaussianiser(PRIME_NAMES)
+    canon = _octant_canon(64, seed=1)
+    _, ljf = t.forward(canon)
+    idx = [PRIME_NAMES.index(f"ra_dec_{c}") for c in ("x", "y", "z")]
+    eps = 1e-6
+    jac = torch.zeros(canon.shape[0], 3, 3, dtype=torch.float64)
+    for j, col in enumerate(idx):
+        for s in (+1, -1):
+            pert = canon.clone()
+            pert[:, col] += s * eps
+            fp, _ = t.forward(pert)
+            jac[:, :, j] += s * fp[:, idx] / (2 * eps)
+    logdet = torch.log(torch.linalg.det(jac).abs())
+    assert torch.allclose(ljf, logdet, atol=1e-4)
+
+
+def test_sky_octant_gaussianiser_gaussianises_uniform_prior():
+    rng = np.random.default_rng(0)
+    v = np.abs(rng.normal(size=(200_000, 3)))
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    canon = torch.zeros(v.shape[0], len(PRIME_NAMES), dtype=torch.float64)
+    canon[:, 0] = torch.as_tensor(v[:, 0])
+    canon[:, 1] = torch.as_tensor(v[:, 1])
+    canon[:, 2] = torch.as_tensor(v[:, 2])
+    base, _ = SkyOctantGaussianiser(PRIME_NAMES).forward(canon)
+    a, b = base[:, 0].numpy(), base[:, 1].numpy()
+    assert abs(a.mean()) < 0.02 and abs(b.mean()) < 0.02
+    assert abs(a.std() - 1.0) < 0.02 and abs(b.std() - 1.0) < 0.02
+    # independent
+    assert abs(np.corrcoef(a, b)[0, 1]) < 0.02
+
+
+@requires_group_mixture
+def test_gaussianise_sky_on_by_default_for_prime_space():
+    on = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
+    assert isinstance(
+        getattr(on._FlowModelClass, "canonical_transform", None),
+        SkyOctantGaussianiser,
+    )
+    off = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, prime_space=False
+    )
+    assert getattr(off._FlowModelClass, "canonical_transform", None) is None
+    opt_out = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, gaussianise_sky=False
+    )
+    assert getattr(opt_out._FlowModelClass, "canonical_transform", None) is None
+
+
+@requires_group_mixture
+def test_make_et_group_flow_proposal_gaussianise_sky():
+    cls = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, gaussianise_sky=True
+    )
+    ct = getattr(cls._FlowModelClass, "canonical_transform", None)
+    assert isinstance(ct, SkyOctantGaussianiser)
+    # supersedes boundary_reflection for the sky
+    cls2 = make_et_group_flow_proposal(
+        BNS_PARAMETERS,
+        REFERENCE_TIME,
+        gaussianise_sky=True,
+        boundary_reflection=True,
+    )
+    assert getattr(cls2._FlowModelClass, "reflect_parameters", None) is None
+
+
+@requires_group_mixture
+def test_gaussianise_sky_requires_prime_space():
+    with pytest.raises(RuntimeError, match="prime-space"):
+        make_et_group_flow_proposal(
+            BNS_PARAMETERS,
+            REFERENCE_TIME,
+            prime_space=False,
+            gaussianise_sky=True,
+        )
