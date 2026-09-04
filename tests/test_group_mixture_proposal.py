@@ -47,7 +47,7 @@ PRIME_NAMES = [
     "psi_y",
     "delta_phase",
     "theta_jn_prime",
-    "geocent_time_prime",
+    "t_det",
 ]
 
 def _has_group_mixture():
@@ -75,8 +75,13 @@ def test_triangular_group_reparameterisations():
         "reparameterisation": "angle-sine",
         "update_bounds": False,
     }
-    assert reps["geocent_time"]["reparameterisation"] == "scaleandshift"
-    assert reps["geocent_time"]["shift"] == pytest.approx(REFERENCE_TIME)
+    assert (
+        reps["geocent_time"]["reparameterisation"] == "detector-center-time"
+    )
+    assert reps["geocent_time"]["reference_time"] == pytest.approx(
+        REFERENCE_TIME
+    )
+    assert len(reps["geocent_time"]["vertex"]) == 3
     assert reps["phase"] == {"reparameterisation": "polarisation-phase"}
     # parameters that get the default GW reparameterisation are not listed
     assert "ra" not in reps
@@ -104,7 +109,8 @@ def prime_points():
         "psi_y": torch.as_tensor(r_psi * np.sin(2.0 * psi)),
         "delta_phase": torch.as_tensor(delta_phase),
         "theta_jn_prime": torch.as_tensor(rng.uniform(-1, 1, n)),
-        "geocent_time_prime": torch.as_tensor(rng.uniform(-20, 20, n)),
+        # detector-centre arrival time (invariant under the group)
+        "t_det": torch.as_tensor(rng.uniform(-20, 20, n)),
     }
 
 
@@ -154,6 +160,16 @@ def test_prime_space_action_identity(prime_action, prime_points):
         ), name
 
 
+def test_prime_space_action_t_det_invariant(prime_action, prime_points):
+    """The detector-centre arrival time is carried through untouched by every
+    group element (Tissino et al. 2026, arXiv:2606.04918)."""
+    n = len(prime_points["ra_dec_x"])
+    for g in range(ETTriangleGroupAction.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        mapped = prime_action(prime_points, modes)
+        assert torch.equal(mapped["t_det"], prime_points["t_det"]), g
+
+
 def _decode_pair(px, py, scale):
     r = torch.hypot(px, py)
     ang = torch.remainder(torch.atan2(py, px), 2 * np.pi) / scale
@@ -195,8 +211,6 @@ def _to_physical(points):
         "cos_theta_jn": cos_theta_jn,
         "psi": psi,
         "phase": phase,
-        "geocent_time": points["geocent_time_prime"] * 0.0
-        + ETTriangleGroupAction(reference_time=REFERENCE_TIME).reference_time,
     }
 
 

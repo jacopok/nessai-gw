@@ -14,6 +14,7 @@ from .phase import (
 )
 from .sky import RotatedAnglePair
 from .spin import AlignedSpinReparameterisation
+from .time import DetectorCenterTimeReparameterisation
 
 known_reparameterisations = ReparameterisationDict()
 known_reparameterisations.add_reparameterisation(
@@ -74,6 +75,17 @@ known_reparameterisations.add_reparameterisation(
     "polarisation-phase",
     PolarisationPhaseReparameterisation,
     {"scale": 1.0},
+)
+
+known_reparameterisations.add_reparameterisation(
+    "detector-center-time",
+    DetectorCenterTimeReparameterisation,
+    {},
+)
+known_reparameterisations.add_reparameterisation(
+    "detector-centre-time",
+    DetectorCenterTimeReparameterisation,
+    {},
 )
 
 known_reparameterisations.update(base_reparameterisations)

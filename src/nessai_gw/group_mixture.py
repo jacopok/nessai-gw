@@ -95,24 +95,37 @@ actually sees and never folds the ``delta_phase -> delta_phase + pi``
 degeneracy.  ``_encode`` shifts ``delta_phase`` by ``pi`` under a
 ``phase``-flip, so ``delta_phase in [0, pi)`` is the matching domain.
 
-Unlike LISA, a ground-based triangle sits at an appreciable offset
-``r_det`` (the detector ``vertex``) from the geocenter, so the sky degeneracy
-is only a degeneracy of the *detector-frame* arrival time, not of the
-geocentric time ``geocent_time`` that bilby samples.  With ``n`` the unit
-vector towards the source,
+Timing coordinate
+-----------------
+Unlike LISA, a ground-based triangle sits at an appreciable offset ``r_det``
+(the detector ``vertex``) from the geocenter, so the sky degeneracy is only a
+degeneracy of the *detector-frame* arrival time ``t_det`` -- the arrival time at
+the detector centre -- not of the geocentric time ``geocent_time`` that bilby
+samples.  With ``n`` the unit vector towards the source,
 
-    geocent_time = t_det + (n . r_det) / c
+    t_det = geocent_time + delay(n),   delay(n) = -(n . r_det) / c
 
-(Eq. 22 of Santoliquido et al. 2025, arXiv:2504.21087), so every element of
-the group -- and in particular the plane reflection, which sends
-``n . r_det -> -n . r_det`` for a near-radial site and thus produces the
-bimodal ``geocent_time`` posterior of that paper -- must carry
-``geocent_time`` along by the change in the geocenter-to-detector delay::
+(``delay`` is bilby's ``time_delay_from_geocenter``, ``t_det - geocent_time``;
+cf. Eq. 22 of Santoliquido
+et al. 2025, arXiv:2504.21087, whose bimodal ``geocent_time`` posterior is
+exactly this offset seen in the wrong coordinate).
+
+The default (prime-space) wiring therefore reparameterises ``geocent_time`` to
+``t_det`` (:class:`~nessai_gw.reparameterisations.time.DetectorCenterTimeReparameterisation`,
+``detector-center-time``; see Tissino et al. 2026, arXiv:2606.04918,
+https://arxiv.org/abs/2606.04918).  Because ``t_det`` is invariant under every
+element of the frozen-limit group,
+:class:`PrimeSpaceTriangularGroupAction` carries the ``t_det`` prime coordinate
+through **unchanged** -- time need not be acted on at all.
+
+The physical-space :class:`TriangularDetectorGroupAction` (the
+``prime_space=False`` path and standalone
+:func:`make_triangular_group_mixture_flow`) still works in ``geocent_time`` and
+so must carry it along by the change in the geocenter-to-detector delay::
 
     geocent_time -> geocent_time + delay(n) - delay(n')
 
-where ``n'`` is the transformed source direction and
-``delay(n) = -(n . r_det) / c`` is bilby's ``time_delay_from_geocenter``.  This is an additive shift
+where ``n'`` is the transformed source direction.  This is an additive shift
 that depends only on the (already transformed) sky position, so it leaves the
 Jacobian of the whole action equal to one.
 
@@ -141,6 +154,8 @@ import numpy as np
 import torch
 
 from . import nessai_logger
+from ._geometry import SPEED_OF_LIGHT as _SPEED_OF_LIGHT
+from ._geometry import greenwich_mean_sidereal_time as _greenwich_mean_sidereal_time
 
 logger = nessai_logger.getChild(__name__)
 
@@ -164,9 +179,6 @@ TRIANGULAR_DETECTOR_GROUP_SIZE = 8
 #: (2, 2)-mode reflection folded in (``Z4 x Z2 x Z2``); see
 #: :class:`TriangularDetectorGroupAction` ``phase_reflection``.
 TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE = 16
-
-#: Speed of light in m / s (CODATA / bilby ``speed_of_light``).
-_SPEED_OF_LIGHT = 299792458.0
 
 _TWO_PI = 2.0 * np.pi
 
@@ -267,25 +279,6 @@ def detector_vertex_from_geodetic(
             (n * (1.0 - e2) + height) * sin_lat,
         ]
     )
-
-
-def _greenwich_mean_sidereal_time(gps_time: float) -> float:
-    """GMST in radians at ``gps_time`` (via bilby if it is available)."""
-    try:
-        from bilby_cython.time import greenwich_mean_sidereal_time
-
-        return float(greenwich_mean_sidereal_time(gps_time)) % _TWO_PI
-    except Exception:  # pragma: no cover - fallback only
-        # IAU 1982 GMST, adequate (<~1 arcmin) for a discrete-mode proposal.
-        jd = gps_time / 86400.0 + 2444244.5
-        t = (jd - 2451545.0) / 36525.0
-        gmst_seconds = (
-            67310.54841
-            + (876600.0 * 3600.0 + 8640184.812866) * t
-            + 0.093104 * t**2
-            - 6.2e-6 * t**3
-        )
-        return (gmst_seconds * np.pi / 43200.0) % _TWO_PI
 
 
 def _detector_frame_basis(
@@ -512,7 +505,6 @@ class TriangularDetectorGroupAction:
         psi = point_dict["psi"]
         cos_theta_jn = point_dict["cos_theta_jn"]
         phase = point_dict["phase"]
-        geocent_time = point_dict["geocent_time"]
 
         dec = torch.asin(torch.clamp(sin_dec, -1.0, 1.0))
 
@@ -536,28 +528,33 @@ class TriangularDetectorGroupAction:
 
         ra_t, dec_t, psi_t = self._from_frame(lam_f, beta_f, psi_f)
 
-        # The sky degeneracy fixes the detector-frame arrival time, not the
-        # geocentric one: shift geocent_time by the change in the
-        # geocenter-to-detector delay (Santoliquido et al. 2025, Eq. 22).
-        geocent_time_t = (
-            geocent_time
-            + self._geocenter_delay(ra, dec)
-            - self._geocenter_delay(ra_t, dec_t)
-        )
-
         # Extra (2, 2)-mode reflection: phase -> phase + pi (16-element group).
         phase_t = torch.where(
             phase_flipped, torch.remainder(phase + np.pi, _TWO_PI), phase
         )
 
-        return {
+        out = {
             "ra": ra_t,
             "sin_dec": torch.sin(dec_t),
             "cos_theta_jn": cos_theta_jn,
             "psi": psi_t,
             "phase": phase_t,
-            "geocent_time": geocent_time_t,
         }
+
+        # Physical-space path only: the sky degeneracy fixes the detector-frame
+        # arrival time, not the geocentric one, so carry geocent_time along by
+        # the change in the geocenter-to-detector delay (Santoliquido et al.
+        # 2025, Eq. 22).  The prime-space adapter instead reparameterises to the
+        # invariant detector-centre time and omits this key entirely (Tissino et
+        # al. 2026, arXiv:2606.04918).
+        if "geocent_time" in point_dict:
+            out["geocent_time"] = (
+                point_dict["geocent_time"]
+                + self._geocenter_delay(ra, dec)
+                - self._geocenter_delay(ra_t, dec_t)
+            )
+
+        return out
 
     def in_fundamental_domain(self, point_dict: dict) -> torch.Tensor:
         """Boolean mask: is each point the canonical point of its orbit?
@@ -676,11 +673,13 @@ def _decode_pair(point_dict, pair, scale):
 class PrimeSpaceTriangularGroupAction:
     """Apply :class:`TriangularDetectorGroupAction` in the nessai-gw *prime* space.
 
-    Discovers the sky / ``psi`` / ``phase`` / ``theta_jn`` / ``geocent_time``
-    prime coordinates from the flow's actual ``prime_parameters`` and threads
-    the acted subset through the unchanged group action, re-encoding onto
+    Discovers the sky / ``psi`` / ``phase`` / ``theta_jn`` / ``t_det`` prime
+    coordinates from the flow's actual ``prime_parameters`` and threads the
+    acted subset through the unchanged group action, re-encoding onto
     same-radius vectors so the prime-space map is exactly a rotation /
-    reflection / constant shift with unit Jacobian.
+    reflection / constant shift with unit Jacobian.  The detector-centre
+    arrival time ``t_det`` is invariant under the group and is carried through
+    untouched (Tissino et al. 2026, arXiv:2606.04918).
 
     Instances are passed to
     :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow` as the
@@ -741,11 +740,12 @@ class PrimeSpaceTriangularGroupAction:
                 self._theta_jn = cand
                 break
 
-        # geocent_time: single constant-shifted coordinate
-        self._geocent_time = None
-        for cand in ("geocent_time_prime", "geocent_time"):
+        # detector-centre arrival time: invariant, carried through unchanged
+        # (detector-center-time reparameterisation).
+        self._t_det = None
+        for cand in ("t_det", "t_det_prime", "detector_time", "geocent_time"):
             if cand in names:
-                self._geocent_time = cand
+                self._t_det = cand
                 break
 
         missing = []
@@ -757,15 +757,15 @@ class PrimeSpaceTriangularGroupAction:
             missing.append("delta_phase")
         if self._theta_jn is None:
             missing.append("theta_jn")
-        if self._geocent_time is None:
-            missing.append("geocent_time")
+        if self._t_det is None:
+            missing.append("t_det")
         if missing:
             raise RuntimeError(
                 f"prime space is missing {missing}, which the triangular-detector "
                 "group action needs; the prime-space path only applies to a "
                 "single-site triangular-detector run with the standard extrinsic parameters and "
                 "the nessai-gw reparameterisations (sky-ra-dec, angle-pi, "
-                "polarisation-phase, angle-sine)."
+                "polarisation-phase, angle-sine, detector-center-time)."
             )
 
     # -- decode / encode -------------------------------------------------
@@ -812,9 +812,9 @@ class PrimeSpaceTriangularGroupAction:
         )
         phase = delta_phase - sign_ct * psi
 
-        # prime -> seconds; the action uses geocent_time only additively, so the
-        # constant reference_time offset need not be restored -- only the scale.
-        geocent_time = point_dict[self._geocent_time] * _GEOCENT_SCALE
+        # The flow coordinate is the detector-centre arrival time (invariant
+        # under the group), so it is not decoded here -- :meth:`_encode` copies
+        # it through unchanged.
 
         acted = {
             "ra": ra,
@@ -822,7 +822,6 @@ class PrimeSpaceTriangularGroupAction:
             "cos_theta_jn": cos_theta_jn,
             "psi": psi,
             "phase": phase,
-            "geocent_time": geocent_time,
         }
         aux = {
             "r_sky": r_sky,
@@ -873,7 +872,8 @@ class PrimeSpaceTriangularGroupAction:
         )
         out[self._delta_phase] = angle / np.pi - 1.0
 
-        out[self._geocent_time] = mapped["geocent_time"] / _GEOCENT_SCALE
+        # Detector-centre arrival time is group-invariant: carried through
+        # unchanged from ``point_dict`` (via ``out = dict(point_dict)``).
         return {n: out[n] for n in self._prime_names}
 
     # -- interface ------------------------------------------------------
@@ -1030,7 +1030,9 @@ class SkyOctantGaussianiser:
         return canon, log_j
 
 
-def triangular_group_reparameterisations(sampling_parameters, reference_time):
+def triangular_group_reparameterisations(
+    sampling_parameters, reference_time, vertex=None
+):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
     The triangular-detector group action has unit Jacobian in
@@ -1046,9 +1048,13 @@ def triangular_group_reparameterisations(sampling_parameters, reference_time):
       symmetric bounds keep the group's ``theta_jn -> pi - theta_jn`` reflection
       an exact sign flip of the prime coordinate; ``update_bounds=True`` would
       let the empirical bounds drift off ``pi/2`` and break that.
-    * ``geocent_time`` -> constant ``reference_time`` shift with a fixed
-      :data:`_GEOCENT_SCALE` (keeps the GPS epoch off the flow; the group's own
-      additive light-travel-delay shift is unaffected by a constant offset).
+    * ``geocent_time`` -> ``detector-center-time``: the flow coordinate is the
+      (affine-rescaled) arrival time at the detector centre,
+      ``t_det = geocent_time + delay(ra, dec)``, which is **invariant** under the
+      group -- so :class:`PrimeSpaceTriangularGroupAction` carries it through
+      untouched and time is not acted on at all (Tissino et al. 2026,
+      arXiv:2606.04918).  Constant ``reference_time`` shift and fixed
+      :data:`_GEOCENT_SCALE` keep the GPS epoch off the flow.
     * ``phase`` -> ``polarisation-phase``: a **single** ``[-1, 1)`` coordinate
       ``delta_phase = phase + sign(cos theta_jn) * psi``, making the
       likelihood-constrained polarisation/phase combination an explicit flow
@@ -1072,23 +1078,34 @@ def triangular_group_reparameterisations(sampling_parameters, reference_time):
     sampling_parameters : iterable of str
         Every parameter nessai samples.
     reference_time : float
-        Geocentric GPS time subtracted from ``geocent_time`` in prime space.
+        Geocentric GPS time; subtracted from ``t_det`` in prime space and its
+        GMST rotates the ``detector-center-time`` delay into the Earth frame.
+    vertex : array_like, optional
+        Earth-fixed detector position (metres) for the ``detector-center-time``
+        reparameterisation.  Defaults to :data:`ET_EMR_VERTEX`; pass the value
+        from :func:`detector_vertex` for a different geometry.
 
     Returns
     -------
     dict
         A ``reparameterisations`` mapping for ``bilby.run_sampler`` / nessai.
     """
+    if vertex is None:
+        vertex = ET_EMR_VERTEX
+
     # ``polarisation-phase`` reads x-space ``psi`` and ``theta_jn`` on its
-    # inverse, so ``CombinedReparameterisation.check_order`` -- which walks the
-    # reparameterisations in reverse -- needs the ``phase`` entry to sort *ahead
-    # of* the ``theta_jn`` (``angle-sine``) entry.  The sorter only orders by
-    # forward-input arity and keeps insertion order on ties (all three are
-    # arity 1), and it ignores inverse inputs entirely, so we must emit ``phase``
-    # first here.  ``psi`` (``angle-pi``) is added later by
-    # ``add_default_reparameterisations`` and so is always behind ``phase``.
+    # inverse, and ``detector-center-time`` reads x-space ``ra`` / ``dec``, so
+    # ``CombinedReparameterisation.check_order`` -- which walks the
+    # reparameterisations in reverse -- needs the ``phase`` and ``geocent_time``
+    # entries to sort *ahead of* the coordinates they consume on the inverse.
+    # The sorter only orders by forward-input arity and keeps insertion order on
+    # ties (all are arity 1) and ignores inverse inputs entirely, so we emit
+    # ``phase`` / ``geocent_time`` first here.  ``psi`` (``angle-pi``) and the
+    # sky ``AnglePair`` are added later by ``add_default_reparameterisations``
+    # and so are always behind these.
     ordered_names = sorted(
-        sampling_parameters, key=lambda n: 0 if n == "phase" else 1
+        sampling_parameters,
+        key=lambda n: 0 if n in ("phase", "geocent_time") else 1,
     )
     reps = {}
     for name in ordered_names:
@@ -1105,10 +1122,14 @@ def triangular_group_reparameterisations(sampling_parameters, reference_time):
                 "update_bounds": False,
             }
         elif name == "geocent_time":
+            # t_det = geocent_time + delay(ra, dec): the invariant
+            # detector-centre arrival time.  ``ra`` / ``dec`` (sky-ra-dec) are
+            # prerequisites.
             reps[name] = {
-                "reparameterisation": "scaleandshift",
+                "reparameterisation": "detector-center-time",
+                "vertex": [float(v) for v in np.asarray(vertex)],
+                "reference_time": float(reference_time),
                 "scale": _GEOCENT_SCALE,
-                "shift": float(reference_time),
             }
         elif name == "phase":
             # delta_phase = phase + sign(cos theta_jn) * psi (polarisation-phase):
@@ -1149,7 +1170,7 @@ _DUMMY_PRIOR_BOUNDS = {
 }
 
 
-def _prime_parameter_names(sampling_parameters, reference_time):
+def _prime_parameter_names(sampling_parameters, reference_time, vertex=None):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
     Computed by configuring a throwaway
@@ -1192,7 +1213,7 @@ def _prime_parameter_names(sampling_parameters, reference_time):
             _StubModel(),
             poolsize=100,
             reparameterisations=triangular_group_reparameterisations(
-                names, reference_time
+                names, reference_time, vertex=vertex
             ),
             fallback_reparameterisation="zscore",
         )
@@ -1221,6 +1242,9 @@ def _prime_parameter_names(sampling_parameters, reference_time):
             # the group wiring carries ``phase`` as the single ``delta_phase``
             # polarisation-phase coordinate (no ``_x``/``_y`` pair, no suffix)
             out.append("delta_phase")
+        elif name == "geocent_time":
+            # detector-center-time: single ``t_det`` coordinate (no suffix)
+            out.append("t_det")
         elif name in _ANGLE_SCALE:
             out += [f"{name}_x", f"{name}_y"]
         else:
@@ -1393,7 +1417,9 @@ def make_triangular_group_flow_proposal(
     )
 
     if prime_space:
-        prime_names = _prime_parameter_names(names, reference_time)
+        prime_names = _prime_parameter_names(
+            names, reference_time, vertex=vertex
+        )
         action = PrimeSpaceTriangularGroupAction(base_action, prime_names)
         gm_kwargs = {}
         import inspect as _inspect
