@@ -1526,7 +1526,7 @@ def make_triangular_group_flow_proposal(
                     d = recommended_sky_azimuth_offset(
                         base_action, x["ra"], x["dec"]
                     )
-                    logger.info(
+                    logger.debug(
                         "[sky] folded-azimuth concentration %.3f, circ-mean "
                         "%.3f rad; current azimuth_offset %.4f, recommended "
                         "extra offset %.4f rad (%.1f deg); %.1f%% of points "
