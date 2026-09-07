@@ -44,6 +44,7 @@ class DistanceReparameterisation(RescaleToBounds):
     def __init__(
         self,
         parameters=None,
+        input_parameters=None,
         allowed_bounds=["upper"],
         allow_both=False,
         converter_kwargs=None,
@@ -52,6 +53,17 @@ class DistanceReparameterisation(RescaleToBounds):
         rng=None,
         **kwargs,
     ):
+        # FlowProposal's generic reparameterisation-spec path (an explicit
+        # ``reparameterisations={"luminosity_distance": {...}}`` dict, as
+        # opposed to GWReparamMixin's own default-reparameterisation path,
+        # which calls ``ReparamClass(parameters=p, ...)`` directly) only ever
+        # fills in ``input_parameters``, never ``parameters`` -- any
+        # ``"parameters"`` key in the config is consumed as a synonym for
+        # ``input_parameters`` before this class ever sees it. Without this
+        # fallback, ``parameters`` stays ``None`` and the ``len()`` below
+        # raises a ``TypeError`` for every explicit "distance" spec.
+        if parameters is None:
+            parameters = input_parameters
         if isinstance(parameters, str):
             parameters = [parameters]
 
