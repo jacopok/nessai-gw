@@ -838,3 +838,90 @@ def test_sky_2d_requires_gaussianise_and_prime_space():
         make_et_group_flow_proposal(
             BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True, gaussianise_sky=False
         )
+
+
+# ---------------------------------------------------------------------------
+# single psi coordinate (SingleAngleReparameterisation + psi_single wiring)
+# ---------------------------------------------------------------------------
+from nessai_gw.reparameterisations.phase import (  # noqa: E402
+    SingleAngleReparameterisation,
+)
+
+PRIME_NAMES_PSI1 = [
+    "ra_dec_x",
+    "ra_dec_y",
+    "ra_dec_z",
+    "psi_prime",
+    "delta_phase",
+    "theta_jn_prime",
+    "t_det",
+]
+
+
+def test_single_angle_reparameterisation_round_trip():
+    from nessai.livepoint import empty_structured_array
+
+    rep = SingleAngleReparameterisation(
+        parameters=["psi"], prior_bounds={"psi": [0.0, np.pi]}, scale=2.0
+    )
+    assert rep.prime_parameters == ["psi_prime"]
+    rng = np.random.default_rng(0)
+    n = 10000
+    x = empty_structured_array(n, names=["psi"])
+    x["psi"] = rng.uniform(0, np.pi, n)
+    xp = empty_structured_array(n, names=["psi_prime"])
+    x, xp, lj = rep.reparameterise(x, xp, np.zeros(n))
+    assert xp["psi_prime"].min() >= -1 and xp["psi_prime"].max() < 1
+    assert abs(xp["psi_prime"].mean()) < 0.03  # ~uniform
+    assert np.allclose(lj, np.log(2.0 / np.pi))
+    x2 = empty_structured_array(n, names=["psi"])
+    x2, xp, lj2 = rep.inverse_reparameterise(x2, xp.copy(), np.zeros(n))
+    dpsi = np.abs(x2["psi"] - x["psi"])
+    dpsi = np.minimum(dpsi, np.pi - dpsi)
+    assert dpsi.max() < 1e-9
+    assert np.allclose(lj, -lj2)
+
+
+def test_prime_space_action_single_psi_matches_pair(prime_points):
+    base = _et_action(phase_reflection=True)
+    a_pair = PrimeSpaceTriangularGroupAction(base, PRIME_NAMES)
+    a_single = PrimeSpaceTriangularGroupAction(base, PRIME_NAMES_PSI1)
+    assert a_single._psi_single and not a_pair._psi_single
+
+    # recover physical psi from the pair, build the single-coord input
+    acted, _ = a_pair._decode(prime_points)
+    psi = acted["psi"]
+    pts1 = {k: prime_points[k] for k in PRIME_NAMES_PSI1 if k in prime_points}
+    pts1["psi_prime"] = (
+        torch.remainder(psi * 2.0, 2 * np.pi) / np.pi - 1.0
+    )
+    for g in range(16):
+        modes = torch.full((psi.shape[0],), g)
+        m_pair = a_pair(prime_points, modes)
+        m_single = a_single(pts1, modes)
+        dp, _ = a_pair._decode(m_pair)
+        ds, _ = a_single._decode(m_single)
+        dpsi = torch.remainder(dp["psi"] - ds["psi"], np.pi)
+        dpsi = torch.minimum(dpsi, np.pi - dpsi)
+        assert dpsi.abs().max() < 1e-6, g
+        assert torch.allclose(m_pair["delta_phase"], m_single["delta_phase"],
+                              atol=1e-6), g
+
+
+@requires_group_mixture
+def test_make_et_group_flow_proposal_psi_single():
+    cls = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True
+    )
+    names = list(cls._FlowModelClass.param_names)
+    assert "psi_prime" in names
+    assert "psi_x" not in names and "psi_y" not in names
+    base = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
+    assert len(names) == len(base._FlowModelClass.param_names) - 1
+    # combines with sky_2d
+    both = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True, sky_2d=True
+    )
+    bn = list(both._FlowModelClass.param_names)
+    assert "psi_prime" in bn and "sky_u" in bn
+    assert len(bn) == len(base._FlowModelClass.param_names) - 2

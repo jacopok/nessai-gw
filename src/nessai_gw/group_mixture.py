@@ -724,12 +724,16 @@ class PrimeSpaceTriangularGroupAction:
                     self._sky = tuple(trip)
                     break
 
-        # psi: name_{x,y} from the angle-pi Angle reparam
+        # psi: name_{x,y} from the angle-pi Angle reparam, or a single
+        # ``psi_prime`` coordinate from SingleAngleReparameterisation.
         self._pair = {}
         for base in _ANGLE_SCALE:
             x, y = f"{base}_x", f"{base}_y"
             if x in names and y in names:
                 self._pair[base] = (x, y)
+        self._psi_single = (
+            "psi_prime" in names and "psi" not in self._pair
+        )
 
         # delta_phase: single linear polarisation-phase coordinate
         self._delta_phase = None
@@ -756,8 +760,8 @@ class PrimeSpaceTriangularGroupAction:
         missing = []
         if self._sky is None and self._sky2d is None:
             missing.append("sky-ra-dec (ra_dec_x/_y/_z) or sky_u/sky_v")
-        if "psi" not in self._pair:
-            missing.append("psi (psi_x/_y)")
+        if "psi" not in self._pair and not self._psi_single:
+            missing.append("psi (psi_x/_y or psi_prime)")
         if self._delta_phase is None:
             missing.append("delta_phase")
         if self._theta_jn is None:
@@ -805,9 +809,16 @@ class PrimeSpaceTriangularGroupAction:
         ra = torch.remainder(torch.atan2(sy, sx), _TWO_PI)
         sin_dec = torch.clamp(sz / norm, -1.0, 1.0)
 
-        psi, r_psi = _decode_pair(
-            point_dict, self._pair["psi"], _ANGLE_SCALE["psi"]
-        )
+        if self._psi_single:
+            ang = point_dict["psi_prime"]
+            psi = torch.remainder(
+                (ang + 1.0) * np.pi / _ANGLE_SCALE["psi"], np.pi
+            )
+            r_psi = torch.ones_like(psi)
+        else:
+            psi, r_psi = _decode_pair(
+                point_dict, self._pair["psi"], _ANGLE_SCALE["psi"]
+            )
 
         # theta_jn is decoupled from the frame rotation: the group only ever
         # sends cos(theta_jn) -> -cos(theta_jn) under a reflection, i.e. the
@@ -876,10 +887,16 @@ class PrimeSpaceTriangularGroupAction:
             out[sy] = r * dyf
             out[sz] = r * dzf
 
-        px, py = self._pair["psi"]
-        out[px], out[py] = _pair_from_angle(
-            mapped["psi"], aux["r_psi"], _ANGLE_SCALE["psi"]
-        )
+        if self._psi_single:
+            a = torch.remainder(
+                mapped["psi"] * _ANGLE_SCALE["psi"], _TWO_PI
+            )
+            out["psi_prime"] = a / np.pi - 1.0
+        else:
+            px, py = self._pair["psi"]
+            out[px], out[py] = _pair_from_angle(
+                mapped["psi"], aux["r_psi"], _ANGLE_SCALE["psi"]
+            )
 
         u = point_dict[self._theta_jn]
         out[self._theta_jn] = torch.where(aux["reflected"], -u, u)
@@ -1273,7 +1290,8 @@ _DUMMY_PRIOR_BOUNDS = {
 
 
 def _prime_parameter_names(
-    sampling_parameters, reference_time, vertex=None, sky_2d=False
+    sampling_parameters, reference_time, vertex=None, sky_2d=False,
+    psi_single=False,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -1330,6 +1348,11 @@ def _prime_parameter_names(
                 # override); swap the triple for the 2-coordinate names in
                 # place so the pre-bind placeholder has the right count/order.
                 prime = _swap_sky_triple_for_pair(prime)
+            if psi_single and "psi_x" in prime and "psi_y" in prime:
+                i = prime.index("psi_x")
+                prime = prime[:i] + ["psi_prime"] + [
+                    n for n in prime[i:] if n not in ("psi_x", "psi_y")
+                ]
             return prime
     except Exception as exc:  # pragma: no cover - defensive
         import warnings
@@ -1358,7 +1381,11 @@ def _prime_parameter_names(
             # detector-center-time: single ``t_det`` coordinate (no suffix)
             out.append("t_det")
         elif name in _ANGLE_SCALE:
-            out += [f"{name}_x", f"{name}_y"]
+            out += (
+                [f"{name}_prime"]
+                if (psi_single and name == "psi")
+                else [f"{name}_x", f"{name}_y"]
+            )
         else:
             out.append(f"{name}_prime")
     return out
@@ -1440,6 +1467,7 @@ def make_triangular_group_flow_proposal(
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
     sky_2d=False,
+    psi_single=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1550,7 +1578,8 @@ def make_triangular_group_flow_proposal(
 
     if prime_space:
         prime_names = _prime_parameter_names(
-            names, reference_time, vertex=vertex, sky_2d=sky_2d
+            names, reference_time, vertex=vertex, sky_2d=sky_2d,
+            psi_single=psi_single,
         )
         action = PrimeSpaceTriangularGroupAction(base_action, prime_names)
         gm_kwargs = {}
@@ -1618,6 +1647,23 @@ def make_triangular_group_flow_proposal(
             # rather than an oblique equatorial wedge (see RotatedAnglePair).
             rep = self._reparameterisation
             model_names = set(self.model.names)
+            if psi_single and "psi" in model_names and "psi" not in set(
+                rep.parameters
+            ):
+                # Single ``psi_prime`` coordinate instead of the angle-pi
+                # Cartesian pair + chi(2) radius (the bare psi is only weakly
+                # constrained; the pair's free radius gives an origin cusp).
+                from .reparameterisations.phase import (
+                    SingleAngleReparameterisation,
+                )
+
+                rep.add_reparameterisation(
+                    SingleAngleReparameterisation(
+                        parameters=["psi"],
+                        prior_bounds={"psi": self.model.bounds["psi"]},
+                        scale=2.0,
+                    )
+                )
             if {"ra", "dec"} <= model_names and not (
                 {"ra", "dec"} & set(rep.parameters)
             ):
@@ -1792,6 +1838,7 @@ def make_et_group_flow_proposal(
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
     sky_2d=False,
+    psi_single=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -1808,4 +1855,5 @@ def make_et_group_flow_proposal(
         gaussianise_sky=gaussianise_sky,
         sky_radial_sigma=sky_radial_sigma,
         sky_2d=sky_2d,
+        psi_single=psi_single,
     )

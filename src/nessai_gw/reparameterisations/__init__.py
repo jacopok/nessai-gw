@@ -11,6 +11,7 @@ from .distance import DistanceReparameterisation
 from .phase import (
     DeltaPhaseReparameterisation,
     PolarisationPhaseReparameterisation,
+    SingleAngleReparameterisation,
 )
 from .sky import EqualAreaSky, RotatedAnglePair
 from .spin import AlignedSpinReparameterisation

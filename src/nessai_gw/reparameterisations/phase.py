@@ -214,3 +214,78 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             angle / self.scale - self._psi_sign(x) * x["psi"], _TWO_PI
         )
         return x, x_prime, log_j - self._log_j
+
+
+class SingleAngleReparameterisation(Reparameterisation):
+    r"""Map one periodic angle to a single bounded coordinate -- no radius.
+
+    ``angle_prime = ((a * scale) mod 2*pi) / pi - 1``  in ``[-1, 1)``, with
+    constant Jacobian ``|d angle_prime / d a| = scale / pi``.
+
+    This is the ``Angle`` (``angle-pi`` / ``angle-2pi``) reparameterisation
+    **without** the Cartesian ``(x, y)`` pair and its ``chi(2)`` auxiliary
+    radius.  A well-measured angle through ``Angle`` becomes a leptokurtic
+    scale mixture (the free radius mixes scales, giving an origin cusp the
+    flow fits poorly); the single coordinate is a clean unimodal bump -- the
+    same trade :class:`PolarisationPhaseReparameterisation` makes for the
+    informative ``phase``/``psi`` combination.  Use it for the *orthogonal*
+    combination (bare ``psi``), which is only weakly constrained.
+
+    Parameters
+    ----------
+    parameters : str or list
+        The angle name (e.g. ``"psi"``).  Exactly one.
+    prior_bounds : list or dict
+        Unused for the map itself (the coordinate is always rescaled from the
+        angle's natural period); required by the framework.
+    scale : float, optional
+        ``2.0`` (default) -> period ``pi`` (``psi``); ``1.0`` -> period
+        ``2*pi``.
+    prior : optional
+        Accepted for registry compatibility and ignored.
+    """
+
+    one_to_one = False
+    requires_bounded_prior = True
+
+    def __init__(
+        self,
+        parameters=None,
+        prior_bounds=None,
+        scale=2.0,
+        prior=None,
+        rng=None,
+        **kwargs,
+    ):
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        call = dict(parameters=parameters, prior_bounds=prior_bounds)
+        if "rng" in parent_params:
+            call["rng"] = rng
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
+
+        if len(self.parameters) != 1:
+            raise RuntimeError(
+                "SingleAngleReparameterisation acts on exactly one angle; got "
+                f"{self.parameters}"
+            )
+        self.scale = float(scale)
+        base = self.parameters[0]
+        self.prime_parameters = [f"{base}_prime"]
+        self.output_parameters = [f"{base}_prime"]
+        self._period = _TWO_PI / self.scale
+        self._log_j = float(np.log(self.scale / np.pi))
+
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        angle = np.mod(x[self.parameters[0]] * self.scale, _TWO_PI)
+        x_prime[self.prime_parameters[0]] = angle / np.pi - 1.0
+        return x, x_prime, log_j + self._log_j
+
+    def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
+        angle = np.mod((x_prime[self.prime_parameters[0]] + 1.0) * np.pi, _TWO_PI)
+        x[self.parameters[0]] = np.mod(angle / self.scale, self._period)
+        return x, x_prime, log_j - self._log_j
