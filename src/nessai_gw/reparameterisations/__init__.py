@@ -12,7 +12,7 @@ from .phase import (
     DeltaPhaseReparameterisation,
     PolarisationPhaseReparameterisation,
 )
-from .sky import RotatedAnglePair
+from .sky import EqualAreaSky, RotatedAnglePair
 from .spin import AlignedSpinReparameterisation
 from .time import DetectorCenterTimeReparameterisation
 

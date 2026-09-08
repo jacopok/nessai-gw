@@ -711,13 +711,18 @@ class PrimeSpaceTriangularGroupAction:
         self._prime_names = list(prime_names)
         names = set(self._prime_names)
 
-        # sky: ra_dec_{x,y,z} from the sky-ra-dec AnglePair
+        # sky: ra_dec_{x,y,z} from the sky-ra-dec AnglePair (3-coord path) or
+        # sky_u / sky_v from EqualAreaSky (2-coord path).
         self._sky = None
-        for prefix in ("ra_dec", "dec_ra"):
-            trip = [f"{prefix}_{c}" for c in ("x", "y", "z")]
-            if all(t in names for t in trip):
-                self._sky = tuple(trip)
-                break
+        self._sky2d = None
+        if "sky_u" in names and "sky_v" in names:
+            self._sky2d = ("sky_u", "sky_v")
+        else:
+            for prefix in ("ra_dec", "dec_ra"):
+                trip = [f"{prefix}_{c}" for c in ("x", "y", "z")]
+                if all(t in names for t in trip):
+                    self._sky = tuple(trip)
+                    break
 
         # psi: name_{x,y} from the angle-pi Angle reparam
         self._pair = {}
@@ -749,8 +754,8 @@ class PrimeSpaceTriangularGroupAction:
                 break
 
         missing = []
-        if self._sky is None:
-            missing.append("sky-ra-dec (ra_dec_x/_y/_z)")
+        if self._sky is None and self._sky2d is None:
+            missing.append("sky-ra-dec (ra_dec_x/_y/_z) or sky_u/sky_v")
         if "psi" not in self._pair:
             missing.append("psi (psi_x/_y)")
         if self._delta_phase is None:
@@ -776,15 +781,29 @@ class PrimeSpaceTriangularGroupAction:
         Returns ``(acted, aux)`` where ``aux`` carries the radii needed to
         re-encode.
         """
-        dx, dy, dz = (point_dict[n] for n in self._sky)
+        if self._sky2d is not None:
+            # EqualAreaSky: (sky_u, sky_v) -> detector-frame unit vector.
+            u = point_dict[self._sky2d[0]]
+            v = point_dict[self._sky2d[1]]
+            Rt = self._sky_R.to(u.dtype)
+            lam_f = _TWO_PI * u
+            z_f = torch.clamp(1.0 - 2.0 * v, -1.0, 1.0)
+            rho = torch.sqrt(torch.clamp(1.0 - z_f * z_f, min=0.0))
+            dx = rho * torch.cos(lam_f)
+            dy = rho * torch.sin(lam_f)
+            dz = z_f
+            r_sky = torch.ones_like(u)
+        else:
+            dx, dy, dz = (point_dict[n] for n in self._sky)
+            Rt = self._sky_R.to(dx.dtype)
+            r_sky = torch.sqrt(dx * dx + dy * dy + dz * dz + _EPS)
         # detector-frame (flow) -> equatorial: v_eq = R^T v_det
-        Rt = self._sky_R.to(dx.dtype)
         sx = Rt[0, 0] * dx + Rt[1, 0] * dy + Rt[2, 0] * dz
         sy = Rt[0, 1] * dx + Rt[1, 1] * dy + Rt[2, 1] * dz
         sz = Rt[0, 2] * dx + Rt[1, 2] * dy + Rt[2, 2] * dz
-        r_sky = torch.sqrt(sx * sx + sy * sy + sz * sz + _EPS)
+        norm = torch.sqrt(sx * sx + sy * sy + sz * sz + _EPS)
         ra = torch.remainder(torch.atan2(sy, sx), _TWO_PI)
-        sin_dec = torch.clamp(sz / r_sky, -1.0, 1.0)
+        sin_dec = torch.clamp(sz / norm, -1.0, 1.0)
 
         psi, r_psi = _decode_pair(
             point_dict, self._pair["psi"], _ANGLE_SCALE["psi"]
@@ -837,16 +856,25 @@ class PrimeSpaceTriangularGroupAction:
         ra_t = mapped["ra"]
         sin_dec_t = torch.clamp(mapped["sin_dec"], -1.0, 1.0)
         cos_dec_t = torch.sqrt(torch.clamp(1.0 - sin_dec_t ** 2, min=0.0))
-        r = aux["r_sky"]
-        sx, sy, sz = self._sky
-        ex = r * cos_dec_t * torch.cos(ra_t)
-        ey = r * cos_dec_t * torch.sin(ra_t)
-        ez = r * sin_dec_t
         # equatorial -> detector-frame (flow): v_det = R v_eq
-        Rf = self._sky_R.to(ex.dtype)
-        out[sx] = Rf[0, 0] * ex + Rf[0, 1] * ey + Rf[0, 2] * ez
-        out[sy] = Rf[1, 0] * ex + Rf[1, 1] * ey + Rf[1, 2] * ez
-        out[sz] = Rf[2, 0] * ex + Rf[2, 1] * ey + Rf[2, 2] * ez
+        Rf = self._sky_R.to(cos_dec_t.dtype)
+        ux = cos_dec_t * torch.cos(ra_t)
+        uy = cos_dec_t * torch.sin(ra_t)
+        uz = sin_dec_t
+        dxf = Rf[0, 0] * ux + Rf[0, 1] * uy + Rf[0, 2] * uz
+        dyf = Rf[1, 0] * ux + Rf[1, 1] * uy + Rf[1, 2] * uz
+        dzf = Rf[2, 0] * ux + Rf[2, 1] * uy + Rf[2, 2] * uz
+        if self._sky2d is not None:
+            lam_f = torch.remainder(torch.atan2(dyf, dxf), _TWO_PI)
+            z_f = torch.clamp(dzf, -1.0, 1.0)
+            out[self._sky2d[0]] = lam_f / _TWO_PI
+            out[self._sky2d[1]] = 0.5 * (1.0 - z_f)
+        else:
+            r = aux["r_sky"]
+            sx, sy, sz = self._sky
+            out[sx] = r * dxf
+            out[sy] = r * dyf
+            out[sz] = r * dzf
 
         px, py = self._pair["psi"]
         out[px], out[py] = _pair_from_angle(
@@ -1030,6 +1058,80 @@ class SkyOctantGaussianiser:
         return canon, log_j
 
 
+_SKY_PROBIT_EPS = 1e-7
+
+
+class SkyOctantProbit:
+    """Probit of the folded equal-area sky sub-square (2-coordinate sky path).
+
+    ``canonical_transform`` companion to
+    :class:`nessai_gw.reparameterisations.sky.EqualAreaSky`.  After the
+    triangular-detector group has folded the equal-area sky coordinates to the
+    fundamental sub-square ``sky_u in [0, 1/4), sky_v in [0, 1/2)`` (the ``Z4``
+    in-plane rotation acts by ``u -> u + k/4 mod 1`` and the ``Z2`` reflection
+    by ``v -> 1 - v``), this maps that sub-square back to two independent
+    standard normals::
+
+        a = Phi^-1(4 * sky_u)          sky_u in [0, 1/4)  ->  N(0, 1)
+        b = Phi^-1(2 * sky_v)          sky_v in [0, 1/2)  ->  N(0, 1)
+
+    Under the uniform-on-sphere prior ``4 sky_u`` and ``2 sky_v`` are exactly
+    ``U(0, 1)`` so ``a`` and ``b`` are exactly ``N(0, 1)`` and the base flow
+    sees no octant edge.  There is **no radial coordinate**: unlike
+    :class:`SkyOctantGaussianiser` this keeps the base-flow sky block 2-D.
+
+    Jacobian (sky block only)::
+
+        log|d(a, b)/d(sky_u, sky_v)| = log 8 - log phi(a) - log phi(b)
+    """
+
+    def __init__(self, param_names=None):
+        self._iu = self._iv = None
+        if param_names is not None:
+            self.bind(param_names)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        if "sky_u" not in names or "sky_v" not in names:
+            raise RuntimeError(
+                "SkyOctantProbit needs sky_u / sky_v in the prime parameters; "
+                f"got {names}."
+            )
+        self._iu = names.index("sky_u")
+        self._iv = names.index("sky_v")
+
+    def forward(self, canon):
+        """``canon -> (t, log|det dt/dcanon|)`` (sky block probit-mapped)."""
+        iu, iv = self._iu, self._iv
+        u = torch.clamp(4.0 * canon[:, iu], _SKY_PROBIT_EPS, 1.0 - _SKY_PROBIT_EPS)
+        v = torch.clamp(2.0 * canon[:, iv], _SKY_PROBIT_EPS, 1.0 - _SKY_PROBIT_EPS)
+        a = torch.special.ndtri(u)
+        b = torch.special.ndtri(v)
+        t = canon.clone()
+        t[:, iu] = a
+        t[:, iv] = b
+        log_j = (
+            np.log(8.0)
+            - _log_std_normal_pdf(a)
+            - _log_std_normal_pdf(b)
+        )
+        return t, log_j
+
+    def inverse(self, t):
+        """``t -> (canon, log|det dcanon/dt|)``."""
+        iu, iv = self._iu, self._iv
+        a, b = t[:, iu], t[:, iv]
+        canon = t.clone()
+        canon[:, iu] = 0.25 * torch.special.ndtr(a)
+        canon[:, iv] = 0.5 * torch.special.ndtr(b)
+        log_j = (
+            -np.log(8.0)
+            + _log_std_normal_pdf(a)
+            + _log_std_normal_pdf(b)
+        )
+        return canon, log_j
+
+
 def triangular_group_reparameterisations(
     sampling_parameters, reference_time, vertex=None
 ):
@@ -1170,7 +1272,9 @@ _DUMMY_PRIOR_BOUNDS = {
 }
 
 
-def _prime_parameter_names(sampling_parameters, reference_time, vertex=None):
+def _prime_parameter_names(
+    sampling_parameters, reference_time, vertex=None, sky_2d=False
+):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
     Computed by configuring a throwaway
@@ -1220,6 +1324,12 @@ def _prime_parameter_names(sampling_parameters, reference_time, vertex=None):
         probe.set_rescaling()
         prime = list(probe.prime_parameters)
         if prime:
+            if sky_2d:
+                # The probe builds the 3-coordinate ``sky-ra-dec`` AnglePair
+                # (it has no knowledge of the group proposal's EqualAreaSky
+                # override); swap the triple for the 2-coordinate names in
+                # place so the pre-bind placeholder has the right count/order.
+                prime = _swap_sky_triple_for_pair(prime)
             return prime
     except Exception as exc:  # pragma: no cover - defensive
         import warnings
@@ -1234,7 +1344,9 @@ def _prime_parameter_names(sampling_parameters, reference_time, vertex=None):
 
     out = []
     if "ra" in names and "dec" in names:
-        out += ["ra_dec_x", "ra_dec_y", "ra_dec_z"]
+        out += ["sky_u", "sky_v"] if sky_2d else [
+            "ra_dec_x", "ra_dec_y", "ra_dec_z"
+        ]
     for name in names:
         if name in ("ra", "dec"):
             continue
@@ -1250,6 +1362,18 @@ def _prime_parameter_names(sampling_parameters, reference_time, vertex=None):
         else:
             out.append(f"{name}_prime")
     return out
+
+
+def _swap_sky_triple_for_pair(prime):
+    """Replace ``ra_dec_{x,y,z}`` (or ``dec_ra_*``) with ``sky_u, sky_v``."""
+    for prefix in ("ra_dec", "dec_ra"):
+        trip = [f"{prefix}_{c}" for c in ("x", "y", "z")]
+        if all(t in prime for t in trip):
+            i = prime.index(trip[0])
+            return prime[:i] + ["sky_u", "sky_v"] + [
+                n for n in prime[i:] if n not in trip
+            ]
+    return prime
 
 
 def recommended_sky_azimuth_offset(action, ra, dec):
@@ -1315,6 +1439,7 @@ def make_triangular_group_flow_proposal(
     boundary_reflection=False,
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
+    sky_2d=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1396,6 +1521,13 @@ def make_triangular_group_flow_proposal(
             "gaussianise_sky is only supported on the prime-space path "
             "(prime_space=True)."
         )
+    if sky_2d and not prime_space:
+        raise RuntimeError("sky_2d is only supported on the prime-space path.")
+    if sky_2d and not gaussianise_sky:
+        raise RuntimeError(
+            "sky_2d needs gaussianise_sky (the SkyOctantProbit canonical "
+            "transform turns the folded equal-area sub-square into N(0, 1))."
+        )
 
     names = list(sampling_parameters)
     missing = sorted(
@@ -1418,7 +1550,7 @@ def make_triangular_group_flow_proposal(
 
     if prime_space:
         prime_names = _prime_parameter_names(
-            names, reference_time, vertex=vertex
+            names, reference_time, vertex=vertex, sky_2d=sky_2d
         )
         action = PrimeSpaceTriangularGroupAction(base_action, prime_names)
         gm_kwargs = {}
@@ -1431,8 +1563,10 @@ def make_triangular_group_flow_proposal(
                     "gaussianise_sky requires a version of nessai whose "
                     "make_group_mixture_flow accepts `canonical_transform`."
                 )
-            gm_kwargs["canonical_transform"] = SkyOctantGaussianiser(
-                prime_names
+            gm_kwargs["canonical_transform"] = (
+                SkyOctantProbit(prime_names)
+                if sky_2d
+                else SkyOctantGaussianiser(prime_names)
             )
             if boundary_reflection:
                 logger.warning(
@@ -1487,20 +1621,33 @@ def make_triangular_group_flow_proposal(
             if {"ra", "dec"} <= model_names and not (
                 {"ra", "dec"} & set(rep.parameters)
             ):
-                from .reparameterisations.sky import RotatedAnglePair
+                sky_bounds = {
+                    k: self.model.bounds[k] for k in ("ra", "dec")
+                }
+                if sky_2d:
+                    from .reparameterisations.sky import EqualAreaSky
 
-                rep.add_reparameterisation(
-                    RotatedAnglePair(
-                        parameters=["ra", "dec"],
-                        prior_bounds={
-                            k: self.model.bounds[k] for k in ("ra", "dec")
-                        },
-                        convention="ra-dec",
-                        rotation=base_action.sky_frame_rotation,
-                        radial_sigma=sky_radial_sigma,
-                        rng=self.rng,
+                    rep.add_reparameterisation(
+                        EqualAreaSky(
+                            parameters=["ra", "dec"],
+                            prior_bounds=sky_bounds,
+                            rotation=base_action.sky_frame_rotation,
+                            rng=self.rng,
+                        )
                     )
-                )
+                else:
+                    from .reparameterisations.sky import RotatedAnglePair
+
+                    rep.add_reparameterisation(
+                        RotatedAnglePair(
+                            parameters=["ra", "dec"],
+                            prior_bounds=sky_bounds,
+                            convention="ra-dec",
+                            rotation=base_action.sky_frame_rotation,
+                            radial_sigma=sky_radial_sigma,
+                            rng=self.rng,
+                        )
+                    )
             super().add_default_reparameterisations()
 
         def initialise(self, *args, **kwargs):
@@ -1644,6 +1791,7 @@ def make_et_group_flow_proposal(
     boundary_reflection=False,
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
+    sky_2d=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -1659,4 +1807,5 @@ def make_et_group_flow_proposal(
         boundary_reflection=boundary_reflection,
         gaussianise_sky=gaussianise_sky,
         sky_radial_sigma=sky_radial_sigma,
+        sky_2d=sky_2d,
     )

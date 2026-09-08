@@ -666,3 +666,175 @@ def test_gaussianise_sky_requires_prime_space():
             prime_space=False,
             gaussianise_sky=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# 2-D equal-area sky path (EqualAreaSky + SkyOctantProbit + sky_2d wiring)
+# ---------------------------------------------------------------------------
+from nessai_gw.group_mixture import SkyOctantProbit  # noqa: E402
+from nessai_gw.reparameterisations.sky import EqualAreaSky  # noqa: E402
+
+PRIME_NAMES_2D = [
+    "sky_u",
+    "sky_v",
+    "psi_x",
+    "psi_y",
+    "delta_phase",
+    "theta_jn_prime",
+    "t_det",
+]
+
+
+def _et_action(phase_reflection=False):
+    return ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, phase_reflection=phase_reflection
+    )
+
+
+def _sky_rotation():
+    return _et_action().sky_frame_rotation
+
+
+def test_equal_area_sky_round_trip_and_uniform_prior():
+    from nessai.livepoint import empty_structured_array
+
+    rep = EqualAreaSky(
+        parameters=["ra", "dec"],
+        prior_bounds={"ra": [0.0, 2 * np.pi], "dec": [-np.pi / 2, np.pi / 2]},
+        rotation=_sky_rotation(),
+    )
+    assert rep.prime_parameters == ["sky_u", "sky_v"]
+
+    rng = np.random.default_rng(0)
+    n = 20000
+    x = empty_structured_array(n, names=["ra", "dec"])
+    x["ra"] = rng.uniform(0, 2 * np.pi, n)
+    x["dec"] = np.arcsin(rng.uniform(-1, 1, n))
+    xp = empty_structured_array(n, names=["sky_u", "sky_v"])
+    x, xp, lj = rep.reparameterise(x, xp, np.zeros(n))
+
+    # uniform-on-sphere prior -> (u, v) uniform on the unit square, independent
+    for c in ("sky_u", "sky_v"):
+        assert xp[c].min() >= 0 and xp[c].max() <= 1
+        assert abs(xp[c].mean() - 0.5) < 0.02
+        assert abs(xp[c].std() - np.sqrt(1 / 12)) < 0.01
+    assert abs(np.corrcoef(xp["sky_u"], xp["sky_v"])[0, 1]) < 0.03
+
+    x2 = empty_structured_array(n, names=["ra", "dec"])
+    x2, xp, lj2 = rep.inverse_reparameterise(x2, xp.copy(), np.zeros(n))
+    dra = np.abs(x2["ra"] - x["ra"])
+    dra = np.minimum(dra, 2 * np.pi - dra)
+    assert dra.max() < 1e-9
+    assert np.abs(x2["dec"] - x["dec"]).max() < 1e-9
+    assert np.allclose(lj, -lj2, atol=1e-9)
+
+
+def _folded_sub_square(n, seed=3):
+    """canon tensor with sky_u in [0, 1/4), sky_v in [0, 1/2) (fundamental)."""
+    rng = np.random.default_rng(seed)
+    cols = {k: torch.as_tensor(rng.normal(size=n)) for k in PRIME_NAMES_2D}
+    cols["sky_u"] = torch.as_tensor(rng.uniform(0, 0.25, n))
+    cols["sky_v"] = torch.as_tensor(rng.uniform(0, 0.5, n))
+    return torch.stack([cols[k] for k in PRIME_NAMES_2D], dim=-1)
+
+
+def test_sky_octant_probit_round_trip_and_jacobian():
+    t = SkyOctantProbit(PRIME_NAMES_2D)
+    canon = _folded_sub_square(256)
+    base, ljf = t.forward(canon)
+    back, lji = t.inverse(base)
+    assert torch.allclose(back, canon, atol=1e-6)
+    assert torch.allclose(ljf, -lji, atol=1e-6)
+    for i, name in enumerate(PRIME_NAMES_2D):
+        if name not in ("sky_u", "sky_v"):
+            assert torch.allclose(base[:, i], canon[:, i])
+    # numeric Jacobian of the 2x2 sky block
+    iu, iv = PRIME_NAMES_2D.index("sky_u"), PRIME_NAMES_2D.index("sky_v")
+    eps = 1e-6
+    jac = torch.zeros(canon.shape[0], 2, 2, dtype=torch.float64)
+    for j, col in enumerate((iu, iv)):
+        for s in (+1, -1):
+            pert = canon.clone()
+            pert[:, col] += s * eps
+            fp, _ = t.forward(pert)
+            jac[:, :, j] += s * fp[:, [iu, iv]] / (2 * eps)
+    logdet = torch.log(torch.linalg.det(jac).abs())
+    assert torch.allclose(ljf, logdet, atol=1e-4)
+
+
+def test_sky_octant_probit_gaussianises_folded_prior():
+    rng = np.random.default_rng(0)
+    n = 200_000
+    canon = torch.zeros(n, len(PRIME_NAMES_2D), dtype=torch.float64)
+    canon[:, 0] = torch.as_tensor(rng.uniform(0, 0.25, n))  # sky_u
+    canon[:, 1] = torch.as_tensor(rng.uniform(0, 0.5, n))   # sky_v
+    base, _ = SkyOctantProbit(PRIME_NAMES_2D).forward(canon)
+    a, b = base[:, 0].numpy(), base[:, 1].numpy()
+    assert abs(a.mean()) < 0.02 and abs(b.mean()) < 0.02
+    assert abs(a.std() - 1.0) < 0.02 and abs(b.std() - 1.0) < 0.02
+    assert abs(np.corrcoef(a, b)[0, 1]) < 0.02
+
+
+def test_prime_space_action_2d_sky_matches_3d(prime_points):
+    """The 2-D equal-area sky action must be physically identical to the 3-D one."""
+    R = _sky_rotation()
+    base3 = _et_action(phase_reflection=True)
+    a3 = PrimeSpaceTriangularGroupAction(base3, PRIME_NAMES)
+    a2 = PrimeSpaceTriangularGroupAction(base3, PRIME_NAMES_2D)
+    assert a2._sky2d == ("sky_u", "sky_v")
+
+    # recover (ra, sin_dec) that prime_points encodes, then build the 2-D input
+    acted3, _ = a3._decode(prime_points)
+    ra, sin_dec = acted3["ra"], acted3["sin_dec"]
+    dec = torch.asin(torch.clamp(sin_dec, -1.0, 1.0))
+    cd = torch.cos(dec)
+    we = torch.stack([cd * torch.cos(ra), cd * torch.sin(ra), sin_dec])
+    Rt = torch.as_tensor(R)
+    wd = Rt @ we
+    lam = torch.remainder(torch.atan2(wd[1], wd[0]), 2 * np.pi)
+    z = torch.clamp(wd[2], -1.0, 1.0)
+    pts2 = {k: prime_points[k] for k in PRIME_NAMES_2D if k in prime_points}
+    pts2["sky_u"] = lam / (2 * np.pi)
+    pts2["sky_v"] = 0.5 * (1.0 - z)
+
+    for g in range(16):
+        modes = torch.full((ra.shape[0],), g)
+        m3 = a3(prime_points, modes)
+        m2 = a2(pts2, modes)
+        # compare the physical sky the two encodings imply
+        d3, _ = a3._decode(m3)
+        e2, _ = a2._decode(m2)
+        dra = torch.remainder(d3["ra"] - e2["ra"], 2 * np.pi)
+        dra = torch.minimum(dra, 2 * np.pi - dra)
+        assert dra.abs().max() < 1e-6, g
+        assert (d3["sin_dec"] - e2["sin_dec"]).abs().max() < 1e-6, g
+        # delta_phase / psi / theta_jn coordinates must match exactly
+        for c in ("delta_phase", "psi_x", "psi_y", "theta_jn_prime", "t_det"):
+            assert torch.allclose(m3[c], m2[c], atol=1e-6), (g, c)
+
+
+@requires_group_mixture
+def test_make_et_group_flow_proposal_sky_2d():
+    cls = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True
+    )
+    ct = getattr(cls._FlowModelClass, "canonical_transform", None)
+    assert isinstance(ct, SkyOctantProbit)
+    names = list(cls._FlowModelClass.param_names)
+    assert "sky_u" in names and "sky_v" in names
+    assert not any(n.startswith("ra_dec") for n in names)
+    # one fewer flow dimension than the 3-coordinate path
+    base = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
+    assert len(names) == len(base._FlowModelClass.param_names) - 1
+
+
+@requires_group_mixture
+def test_sky_2d_requires_gaussianise_and_prime_space():
+    with pytest.raises(RuntimeError, match="prime-space"):
+        make_et_group_flow_proposal(
+            BNS_PARAMETERS, REFERENCE_TIME, prime_space=False, sky_2d=True
+        )
+    with pytest.raises(RuntimeError, match="gaussianise_sky"):
+        make_et_group_flow_proposal(
+            BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True, gaussianise_sky=False
+        )
