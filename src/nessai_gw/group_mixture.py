@@ -1499,8 +1499,8 @@ def make_triangular_group_flow_proposal(
     boundary_reflection=False,
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
-    sky_2d=False,
-    psi_single=False,
+    sky_2d="auto",
+    psi_single=True,
     polarisation_quarter=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
@@ -1560,6 +1560,25 @@ def make_triangular_group_flow_proposal(
         ``+/-inf``).  Default ``"auto"`` -- on whenever ``prime_space`` is
         ``True``.  Pass ``False`` to opt out, or an explicit ``True`` with
         ``prime_space=False`` to get an error rather than a silent no-op.
+    sky_2d : bool or "auto", optional
+        Drop the auxiliary sky radial coordinate and carry the sky as the two
+        equal-area coordinates ``(sky_u, sky_v)`` (see
+        :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky` +
+        :class:`SkyOctantProbit`).  Default ``"auto"`` -- on whenever
+        ``prime_space`` and ``gaussianise_sky`` are both active (the machinery
+        it needs), off otherwise.  Requires the prime-space path.
+    psi_single : bool, optional
+        Carry ``psi`` as a single ``psi_prime`` coordinate
+        (:class:`~nessai_gw.reparameterisations.phase.SingleAngleReparameterisation`)
+        instead of the ``angle-pi`` Cartesian pair + ``chi(2)`` radius.  The
+        free radius of the pair turns a well-structured ``psi`` into a
+        leptokurtic origin cusp; the single coordinate is cleaner (measured
+        ~1.4 nat lower non-Gaussianity on a v16 ET-Delta fold).  Default
+        ``True``.
+    polarisation_quarter : bool, optional
+        Promote the phase sector from ``Z2`` to ``Z4`` by folding the
+        ``{psi -> psi + pi/2, phase -> phase - pi/2}`` polarisation/phase
+        quarter turn into the group (32 elements).  Default ``False``.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1583,6 +1602,10 @@ def make_triangular_group_flow_proposal(
             "gaussianise_sky is only supported on the prime-space path "
             "(prime_space=True)."
         )
+    if sky_2d == "auto":
+        # 2-D equal-area sky (no auxiliary radial coord) whenever the
+        # prime-space + gaussianise-sky machinery it needs is available.
+        sky_2d = bool(prime_space) and bool(gaussianise_sky)
     if sky_2d and not prime_space:
         raise RuntimeError("sky_2d is only supported on the prime-space path.")
     if sky_2d and not gaussianise_sky:
@@ -1874,8 +1897,8 @@ def make_et_group_flow_proposal(
     boundary_reflection=False,
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
-    sky_2d=False,
-    psi_single=False,
+    sky_2d="auto",
+    psi_single=True,
     polarisation_quarter=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""

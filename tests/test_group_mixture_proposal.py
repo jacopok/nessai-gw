@@ -625,9 +625,18 @@ def test_sky_octant_gaussianiser_gaussianises_uniform_prior():
 
 @requires_group_mixture
 def test_gaussianise_sky_on_by_default_for_prime_space():
+    # default sky_2d="auto" resolves on -> SkyOctantProbit
     on = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
     assert isinstance(
         getattr(on._FlowModelClass, "canonical_transform", None),
+        SkyOctantProbit,
+    )
+    # 3-coordinate sky still uses the Gaussianiser
+    on3 = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=False
+    )
+    assert isinstance(
+        getattr(on3._FlowModelClass, "canonical_transform", None),
         SkyOctantGaussianiser,
     )
     off = make_et_group_flow_proposal(
@@ -643,7 +652,7 @@ def test_gaussianise_sky_on_by_default_for_prime_space():
 @requires_group_mixture
 def test_make_et_group_flow_proposal_gaussianise_sky():
     cls = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, gaussianise_sky=True
+        BNS_PARAMETERS, REFERENCE_TIME, gaussianise_sky=True, sky_2d=False
     )
     ct = getattr(cls._FlowModelClass, "canonical_transform", None)
     assert isinstance(ct, SkyOctantGaussianiser)
@@ -652,6 +661,7 @@ def test_make_et_group_flow_proposal_gaussianise_sky():
         BNS_PARAMETERS,
         REFERENCE_TIME,
         gaussianise_sky=True,
+        sky_2d=False,
         boundary_reflection=True,
     )
     assert getattr(cls2._FlowModelClass, "reflect_parameters", None) is None
@@ -824,8 +834,17 @@ def test_make_et_group_flow_proposal_sky_2d():
     assert "sky_u" in names and "sky_v" in names
     assert not any(n.startswith("ra_dec") for n in names)
     # one fewer flow dimension than the 3-coordinate path
-    base = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
+    base = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=False
+    )
+    assert any(n.startswith("ra_dec") for n in base._FlowModelClass.param_names)
     assert len(names) == len(base._FlowModelClass.param_names) - 1
+    # on by default (prime-space + gaussianise-sky both active)
+    dflt = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
+    assert isinstance(
+        getattr(dflt._FlowModelClass, "canonical_transform", None),
+        SkyOctantProbit,
+    )
 
 
 @requires_group_mixture
@@ -911,13 +930,23 @@ def test_prime_space_action_single_psi_matches_pair(prime_points):
 @requires_group_mixture
 def test_make_et_group_flow_proposal_psi_single():
     cls = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True, sky_2d=False
     )
     names = list(cls._FlowModelClass.param_names)
     assert "psi_prime" in names
     assert "psi_x" not in names and "psi_y" not in names
-    base = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
+    base = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=False, sky_2d=False
+    )
+    assert "psi_x" in base._FlowModelClass.param_names
     assert len(names) == len(base._FlowModelClass.param_names) - 1
+    # on by default
+    dflt = list(
+        make_et_group_flow_proposal(
+            BNS_PARAMETERS, REFERENCE_TIME
+        )._FlowModelClass.param_names
+    )
+    assert "psi_prime" in dflt
     # combines with sky_2d
     both = make_et_group_flow_proposal(
         BNS_PARAMETERS, REFERENCE_TIME, psi_single=True, sky_2d=True
