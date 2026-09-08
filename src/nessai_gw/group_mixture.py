@@ -1502,6 +1502,10 @@ def make_triangular_group_flow_proposal(
     sky_2d="auto",
     psi_single=True,
     polarisation_quarter=True,
+    n_clusters_max=1,
+    cluster_method="gmm",
+    cluster_max_overlap=0.05,
+    cluster_min_size=200,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1582,6 +1586,22 @@ def make_triangular_group_flow_proposal(
         ``phase_reflection``).  This makes ``psi_prime`` unimodal in the base
         frame -- the ``{psi -> psi + pi/2}`` degeneracy is otherwise left for
         the base flow to model as a second mode.  Default ``True``.
+    n_clusters_max : int
+        If ``> 1``, use a *clustered* base flow: up to ``n_clusters_max``
+        independent group-mixture experts, one per data cluster (found each
+        training round by GMM + BIC, ``k`` in ``[1, n_clusters_max]``), each
+        with its own per-branch canonical standardisation and latent ball.
+        ``k`` collapses to 1 -- byte identical to the single-flow behaviour --
+        whenever the data is not decisively multi-modal.  Default ``1`` (off).
+    cluster_method : {"gmm", "kmeans"}
+        Clustering algorithm on the standardised folded base frame.
+    cluster_max_overlap : float
+        A ``k``-way split is accepted only if at most this fraction of points
+        are ambiguous between clusters (GMM responsibility < 0.8).  Smaller =
+        more conservative; ``k`` collapses to 1 when no split is clean.
+    cluster_min_size : int
+        Smallest allowed cluster (a split producing a smaller cluster is
+        rejected).
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1595,6 +1615,29 @@ def make_triangular_group_flow_proposal(
             "that ships nessai.flowmodel.group_mixture (GroupFlowProposalMixin, "
             "make_group_mixture_flow)."
         ) from exc
+
+    if int(n_clusters_max) > 1:
+        try:
+            from nessai.flowmodel.group_mixture import (
+                make_clustered_group_mixture_flow,
+            )
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "n_clusters_max > 1 requires a version of nessai whose "
+                "nessai.flowmodel.group_mixture ships "
+                "make_clustered_group_mixture_flow."
+            ) from exc
+
+        def _make_flow_model(**gm):
+            return make_clustered_group_mixture_flow(
+                n_clusters_max=int(n_clusters_max),
+                cluster_method=cluster_method,
+                max_cluster_overlap=float(cluster_max_overlap),
+                min_cluster_size=int(cluster_min_size),
+                **gm,
+            )
+    else:
+        _make_flow_model = make_group_mixture_flow
 
     from .proposals import GWReparamMixin
 
@@ -1675,7 +1718,7 @@ def make_triangular_group_flow_proposal(
                 for p in ("ra_dec_x", "ra_dec_y", "ra_dec_z")
                 if p in prime_names
             ]
-        flow_model_cls = make_group_mixture_flow(
+        flow_model_cls = _make_flow_model(
             group_action_fn=action,  # ignored on the prime-space path
             group_size=base_action.group_size,
             param_names=prime_names,
@@ -1686,7 +1729,7 @@ def make_triangular_group_flow_proposal(
         )
     else:
         action = None
-        flow_model_cls = make_group_mixture_flow(
+        flow_model_cls = _make_flow_model(
             group_action_fn=base_action,
             group_size=base_action.group_size,
             param_names=base_action.parameters,
@@ -1903,6 +1946,10 @@ def make_et_group_flow_proposal(
     sky_2d="auto",
     psi_single=True,
     polarisation_quarter=True,
+    n_clusters_max=1,
+    cluster_method="gmm",
+    cluster_max_overlap=0.05,
+    cluster_min_size=200,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -1921,4 +1968,8 @@ def make_et_group_flow_proposal(
         sky_2d=sky_2d,
         psi_single=psi_single,
         polarisation_quarter=polarisation_quarter,
+        n_clusters_max=n_clusters_max,
+        cluster_method=cluster_method,
+        cluster_max_overlap=cluster_max_overlap,
+        cluster_min_size=cluster_min_size,
     )

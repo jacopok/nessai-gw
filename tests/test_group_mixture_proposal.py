@@ -1038,3 +1038,29 @@ def test_make_et_group_flow_proposal_polarisation_quarter():
         phase_reflection=True,
     )
     assert off._FlowModelClass.group_size == 16
+
+
+def test_make_et_group_flow_proposal_clustered():
+    """n_clusters_max > 1 wires the clustered flow model; default is off."""
+    from nessai.flowmodel.group_mixture import (
+        ClusteredGroupMixtureFlowModel,
+        GroupMixtureFlowModel,
+    )
+
+    dflt = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
+    assert not issubclass(
+        dflt._FlowModelClass, ClusteredGroupMixtureFlowModel
+    )
+
+    clustered = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, n_clusters_max=3,
+        cluster_max_overlap=0.05, cluster_min_size=150,
+    )
+    fm = clustered._FlowModelClass
+    assert issubclass(fm, ClusteredGroupMixtureFlowModel)
+    assert issubclass(fm, GroupMixtureFlowModel)
+    assert fm.n_clusters_max == 3
+    assert fm.max_cluster_overlap == 0.05
+    assert fm.min_cluster_size == 150
+    # group geometry unchanged
+    assert fm.group_size == 32
