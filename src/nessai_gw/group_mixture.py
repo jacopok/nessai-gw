@@ -365,16 +365,27 @@ class TriangularDetectorGroupAction:
         vertex,
         phase_reflection=False,
         azimuth_offset=0.0,
+        polarisation_quarter=False,
     ):
         self.reference_time = float(reference_time)
-        self.phase_reflection = bool(phase_reflection)
+        #: Fold the (2, 2)-mode polarisation/phase quarter turn
+        #: ``{psi -> psi + pi/2, phase -> phase - pi/2}`` -- promotes the phase
+        #: sector from a ``Z2`` (``phase -> phase + pi``, its square) to a
+        #: ``Z4`` and doubles the group to 32.  Implies ``phase_reflection``.
+        self.polarisation_quarter = bool(polarisation_quarter)
+        self.phase_reflection = (
+            bool(phase_reflection) or self.polarisation_quarter
+        )
         #: In-plane rotation (rad) of the detector frame about the plane
         #: normal; moves the Z4 fundamental-domain seams off the sky peak.
         self.azimuth_offset = float(azimuth_offset)
-        #: Instance attribute (shadows the class default): 16 when the extra
-        #: ``phase -> phase + pi`` reflection is folded in, else 8.
+        #: Instance attribute (shadows the class default): 32 with the
+        #: polarisation/phase quarter turn, 16 with ``phase -> phase + pi``,
+        #: else 8.
         self.group_size = (
-            TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE
+            2 * TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE
+            if self.polarisation_quarter
+            else TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE
             if self.phase_reflection
             else TRIANGULAR_DETECTOR_GROUP_SIZE
         )
@@ -459,44 +470,44 @@ class TriangularDetectorGroupAction:
 
     # -- group action -------------------------------------------------
 
-    @staticmethod
-    def _decode(modes: torch.Tensor):
-        """Split a mode index into ``(k, reflected, phase_flipped)``.
+    def _decode(self, modes: torch.Tensor):
+        """Split a mode index into ``(k, reflected, phase_step)``.
 
         ``k`` in ``0..3`` is the ``Z4`` sky rotation, ``reflected`` the ``Z2``
-        detector-plane reflection, ``phase_flipped`` the extra ``Z2``
-        ``phase -> phase + pi`` (only reached for a 16-element action; always
-        ``False`` for modes ``0..7``).
+        detector-plane reflection.  ``phase_step`` is the phase-sector element:
+        a bool ``phase -> phase + pi`` flag for the 8/16-element group, or an
+        int ``0..3`` (``modes // 8``) for the 32-element polarisation/phase
+        ``Z4`` -- ``{psi -> psi + step*pi/2, phase -> phase - step*pi/2}``
+        (``step = 2`` reproduces the ``phase -> phase + pi`` flip).
         """
         k = torch.remainder(modes, 4).to(torch.float64)
         reflected = (
             torch.remainder(torch.div(modes, 4, rounding_mode="floor"), 2) == 1
         )
-        phase_flipped = torch.div(modes, 8, rounding_mode="floor") == 1
-        return k, reflected, phase_flipped
+        step = torch.div(modes, 8, rounding_mode="floor")
+        if self.polarisation_quarter:
+            return k, reflected, torch.remainder(step, 4)
+        return k, reflected, step == 1
 
-    @staticmethod
-    def _invert_modes(modes: torch.Tensor) -> torch.Tensor:
+    def _invert_modes(self, modes: torch.Tensor) -> torch.Tensor:
         """Index of the inverse element (the group is abelian)."""
         k = torch.remainder(modes, 4)
         refl = torch.remainder(torch.div(modes, 4, rounding_mode="floor"), 2)
         pf = torch.div(modes, 8, rounding_mode="floor")
+        if self.polarisation_quarter:
+            pf = torch.remainder(-pf, 4)
         return pf * 8 + refl * 4 + torch.remainder(-k, 4)
 
     # Public aliases of the mode helpers, for callers (e.g.
     # :class:`PrimeSpaceTriangularGroupAction`) that need to inspect group
     # elements without reaching into private names.
-    @staticmethod
-    def decode_modes(modes):
-        """Split a mode index into ``(k, reflected, phase_flipped)``."""
-        return TriangularDetectorGroupAction._decode(torch.as_tensor(modes))
+    def decode_modes(self, modes):
+        """Split a mode index into ``(k, reflected, phase_step)``."""
+        return self._decode(torch.as_tensor(modes))
 
-    @staticmethod
-    def invert_modes(modes):
+    def invert_modes(self, modes):
         """Index of the inverse element (the group is abelian)."""
-        return TriangularDetectorGroupAction._invert_modes(
-            torch.as_tensor(modes)
-        )
+        return self._invert_modes(torch.as_tensor(modes))
 
     def __call__(self, point_dict: dict, modes, inverse: bool = False) -> dict:
         """Apply the group element ``modes`` (or its inverse) to each point."""
@@ -511,7 +522,7 @@ class TriangularDetectorGroupAction:
         modes = torch.as_tensor(modes, device=ra.device)
         if inverse:
             modes = self._invert_modes(modes)
-        k, reflected, phase_flipped = self._decode(modes)
+        k, reflected, phase_step = self._decode(modes)
         k = k.to(ra.dtype)
         quarter = 0.5 * np.pi * k
 
@@ -528,10 +539,18 @@ class TriangularDetectorGroupAction:
 
         ra_t, dec_t, psi_t = self._from_frame(lam_f, beta_f, psi_f)
 
-        # Extra (2, 2)-mode reflection: phase -> phase + pi (16-element group).
-        phase_t = torch.where(
-            phase_flipped, torch.remainder(phase + np.pi, _TWO_PI), phase
-        )
+        if self.polarisation_quarter:
+            # (2, 2)-mode polarisation/phase quarter turn:
+            # psi -> psi + step*pi/2, phase -> phase - step*pi/2 (step in 0..3;
+            # step == 2 is the phase -> phase + pi flip).
+            shift = 0.5 * np.pi * phase_step.to(ra.dtype)
+            psi_t = torch.remainder(psi_t + shift, np.pi)
+            phase_t = torch.remainder(phase - shift, _TWO_PI)
+        else:
+            # Extra (2, 2)-mode reflection: phase -> phase + pi (16-element group).
+            phase_t = torch.where(
+                phase_step, torch.remainder(phase + np.pi, _TWO_PI), phase
+            )
 
         out = {
             "ra": ra_t,
@@ -574,6 +593,11 @@ class TriangularDetectorGroupAction:
         if self.phase_reflection:
             mask = mask & (
                 torch.remainder(point_dict["phase"], _TWO_PI) < np.pi
+            )
+        if self.polarisation_quarter:
+            # phase-sector Z4: also fold psi to [0, pi/2)
+            mask = mask & (
+                torch.remainder(point_dict["psi"], np.pi) < 0.5 * np.pi
             )
         return mask
 
@@ -908,9 +932,18 @@ class PrimeSpaceTriangularGroupAction:
         sign_ct_out = torch.where(
             aux["reflected"], -aux["sign_ct"], aux["sign_ct"]
         )
-        phase_inv_out = torch.where(
-            aux["phase_flipped"], aux["phase_inv"] + np.pi, aux["phase_inv"]
-        )
+        if self._action.polarisation_quarter:
+            # phase sector Z4: the invariant phase piece shifts by
+            # -step*pi/2; mapped["psi"] already carries +step*pi/2, so
+            # delta_phase stays invariant for the face-on branch and shifts
+            # by -step*pi for the face-off one.
+            phase_inv_out = aux["phase_inv"] - 0.5 * np.pi * aux[
+                "phase_step"
+            ].to(aux["phase_inv"].dtype)
+        else:
+            phase_inv_out = torch.where(
+                aux["phase_step"], aux["phase_inv"] + np.pi, aux["phase_inv"]
+            )
         delta_phase_new = phase_inv_out + sign_ct_out * mapped["psi"]
         angle = torch.remainder(
             delta_phase_new * _DELTA_PHASE_SCALE, _TWO_PI
@@ -927,13 +960,13 @@ class PrimeSpaceTriangularGroupAction:
         modes = torch.as_tensor(modes)
         if inverse:
             modes = self._action.invert_modes(modes)
-        _, reflected, phase_flipped = self._action.decode_modes(modes)
-        return reflected, phase_flipped
+        _, reflected, phase_step = self._action.decode_modes(modes)
+        return reflected, phase_step
 
     def __call__(self, point_dict, modes, inverse: bool = False):
         acted, aux = self._decode(point_dict)
         mapped = self._action(acted, modes, inverse=inverse)
-        aux["reflected"], aux["phase_flipped"] = self._mode_masks(
+        aux["reflected"], aux["phase_step"] = self._mode_masks(
             modes, inverse
         )
         return self._encode(point_dict, mapped, aux)
@@ -1468,6 +1501,7 @@ def make_triangular_group_flow_proposal(
     gaussianise_sky="auto",
     sky_2d=False,
     psi_single=False,
+    polarisation_quarter=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1574,6 +1608,7 @@ def make_triangular_group_flow_proposal(
         vertex=vertex,
         phase_reflection=phase_reflection,
         azimuth_offset=azimuth_offset,
+        polarisation_quarter=polarisation_quarter,
     )
 
     if prime_space:
@@ -1793,6 +1828,7 @@ class ETTriangleGroupAction(TriangularDetectorGroupAction):
         vertex=None,
         phase_reflection=False,
         azimuth_offset=0.0,
+        polarisation_quarter=False,
     ):
         super().__init__(
             reference_time,
@@ -1802,6 +1838,7 @@ class ETTriangleGroupAction(TriangularDetectorGroupAction):
             vertex=ET_EMR_VERTEX if vertex is None else vertex,
             phase_reflection=phase_reflection,
             azimuth_offset=azimuth_offset,
+            polarisation_quarter=polarisation_quarter,
         )
 
 
@@ -1839,6 +1876,7 @@ def make_et_group_flow_proposal(
     gaussianise_sky="auto",
     sky_2d=False,
     psi_single=False,
+    polarisation_quarter=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -1856,4 +1894,5 @@ def make_et_group_flow_proposal(
         sky_radial_sigma=sky_radial_sigma,
         sky_2d=sky_2d,
         psi_single=psi_single,
+        polarisation_quarter=polarisation_quarter,
     )

@@ -925,3 +925,78 @@ def test_make_et_group_flow_proposal_psi_single():
     bn = list(both._FlowModelClass.param_names)
     assert "psi_prime" in bn and "sky_u" in bn
     assert len(bn) == len(base._FlowModelClass.param_names) - 2
+
+
+# ---------------------------------------------------------------------------
+# 32-element group: the {psi+pi/2, phase-pi/2} polarisation/phase quarter turn
+# ---------------------------------------------------------------------------
+def test_polarisation_quarter_group_size_and_decode():
+    a = _et_action()
+    assert a.group_size == 8
+    a16 = _et_action(phase_reflection=True)
+    assert a16.group_size == 16
+    aq = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, polarisation_quarter=True
+    )
+    assert aq.group_size == 32 and aq.phase_reflection  # implies phase_reflection
+    modes = torch.arange(32)
+    k, refl, step = aq._decode(modes)
+    assert torch.equal(step, torch.div(modes, 8, rounding_mode="floor"))
+    # every element composed with its inverse is the identity, inverse is a perm
+    inv = aq.invert_modes(modes)
+    assert torch.equal(aq.invert_modes(inv), modes)
+    assert sorted(inv.tolist()) == list(range(32))
+
+
+def _pq_prime_action():
+    base = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, polarisation_quarter=True
+    )
+    return PrimeSpaceTriangularGroupAction(base, PRIME_NAMES)
+
+
+def test_polarisation_quarter_prime_action_round_trip(prime_points):
+    a = _pq_prime_action()
+    for g in range(32):
+        modes = torch.full((prime_points["ra_dec_x"].shape[0],), g)
+        fwd = a(prime_points, modes, inverse=False)
+        back = a(fwd, modes, inverse=True)
+        for c in PRIME_NAMES:
+            assert torch.allclose(
+                torch.as_tensor(back[c]), prime_points[c], atol=1e-6
+            ), (g, c)
+
+
+def test_polarisation_quarter_fundamental_domain_partitions_orbit(prime_points):
+    a = _pq_prime_action()
+    n = prime_points["ra_dec_x"].shape[0]
+    counts = torch.zeros(n)
+    for g in range(32):
+        modes = torch.full((n,), g)
+        img = a(prime_points, modes, inverse=True)
+        counts += a.in_fundamental_domain(img).float()
+    assert torch.all(counts == 1)
+
+
+def test_polarisation_quarter_preserves_physical_symmetry(prime_points):
+    """step==2 must reproduce the phase -> phase + pi flip (delta_phase + pi)."""
+    a = _pq_prime_action()
+    n = prime_points["ra_dec_x"].shape[0]
+    m0 = a(prime_points, torch.zeros(n, dtype=torch.long))
+    m2 = a(prime_points, torch.full((n,), 16))  # step = 16 // 8 = 2
+    d = torch.remainder(
+        (m2["delta_phase"] - m0["delta_phase"]) - 1.0, 2.0
+    )  # delta_phase_prime is in [-1, 1); +pi -> +1 unit
+    d = torch.minimum(d, 2.0 - d)
+    assert d.abs().max() < 1e-6
+    # psi unchanged by step 2 (psi -> psi + pi == psi)
+    assert torch.allclose(m2["theta_jn_prime"], m0["theta_jn_prime"], atol=1e-6)
+
+
+@requires_group_mixture
+def test_make_et_group_flow_proposal_polarisation_quarter():
+    cls = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, polarisation_quarter=True
+    )
+    fm = cls._FlowModelClass
+    assert fm.group_size == 32
