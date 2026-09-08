@@ -1501,7 +1501,7 @@ def make_triangular_group_flow_proposal(
     gaussianise_sky="auto",
     sky_2d="auto",
     psi_single=True,
-    polarisation_quarter=False,
+    polarisation_quarter=True,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1578,7 +1578,10 @@ def make_triangular_group_flow_proposal(
     polarisation_quarter : bool, optional
         Promote the phase sector from ``Z2`` to ``Z4`` by folding the
         ``{psi -> psi + pi/2, phase -> phase - pi/2}`` polarisation/phase
-        quarter turn into the group (32 elements).  Default ``False``.
+        quarter turn into the group (32 elements; forces
+        ``phase_reflection``).  This makes ``psi_prime`` unimodal in the base
+        frame -- the ``{psi -> psi + pi/2}`` degeneracy is otherwise left for
+        the base flow to model as a second mode.  Default ``True``.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1899,7 +1902,7 @@ def make_et_group_flow_proposal(
     gaussianise_sky="auto",
     sky_2d="auto",
     psi_single=True,
-    polarisation_quarter=False,
+    polarisation_quarter=True,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(

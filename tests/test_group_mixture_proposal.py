@@ -384,6 +384,7 @@ def test_make_et_group_flow_proposal(prime_space, phase_reflection):
         REFERENCE_TIME,
         prime_space=prime_space,
         phase_reflection=phase_reflection,
+        polarisation_quarter=False,
     )
     from nessai.proposal import FlowProposal
     from nessai.flowmodel.group_mixture import GroupFlowProposalMixin
@@ -1029,3 +1030,11 @@ def test_make_et_group_flow_proposal_polarisation_quarter():
     )
     fm = cls._FlowModelClass
     assert fm.group_size == 32
+    # on by default
+    dflt = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
+    assert dflt._FlowModelClass.group_size == 32
+    off = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, polarisation_quarter=False,
+        phase_reflection=True,
+    )
+    assert off._FlowModelClass.group_size == 16
