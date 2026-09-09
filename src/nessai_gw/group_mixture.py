@@ -1522,6 +1522,7 @@ def make_triangular_group_flow_proposal(
     cluster_method="gmm",
     cluster_max_overlap=0.05,
     cluster_min_size=200,
+    cluster_bg_weight=0.0,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1618,6 +1619,11 @@ def make_triangular_group_flow_proposal(
     cluster_min_size : int
         Smallest allowed cluster (a split producing a smaller cluster is
         rejected).
+    cluster_bg_weight : float
+        Weight of an always-on background expert (a group-mixture flow trained
+        on all live points, blended into the mixture at ``k >= 2`` so the
+        density never craters where the per-cluster experts leave off).  ``0``
+        (default) -> no background expert.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1650,6 +1656,7 @@ def make_triangular_group_flow_proposal(
                 cluster_method=cluster_method,
                 max_cluster_overlap=float(cluster_max_overlap),
                 min_cluster_size=int(cluster_min_size),
+                bg_weight=float(cluster_bg_weight),
                 **gm,
             )
     else:
@@ -1977,6 +1984,7 @@ def make_et_group_flow_proposal(
     cluster_method="gmm",
     cluster_max_overlap=0.05,
     cluster_min_size=200,
+    cluster_bg_weight=0.0,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -1999,4 +2007,5 @@ def make_et_group_flow_proposal(
         cluster_method=cluster_method,
         cluster_max_overlap=cluster_max_overlap,
         cluster_min_size=cluster_min_size,
+        cluster_bg_weight=cluster_bg_weight,
     )
