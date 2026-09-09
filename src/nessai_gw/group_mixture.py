@@ -509,6 +509,22 @@ class TriangularDetectorGroupAction:
         """Index of the inverse element (the group is abelian)."""
         return self._invert_modes(torch.as_tensor(modes))
 
+    @property
+    def mode_factor_sizes(self):
+        """Sizes of the commuting cyclic factors, little-endian in the mode
+        index (``k = modes % 4``, ``reflected = modes // 4 % 2``,
+        ``phase_step = modes // 8``): ``[4, 2]`` for the 8-element group,
+        ``[4, 2, 2]`` with ``phase_reflection``, ``[4, 2, 4]`` with
+        ``polarisation_quarter``.  Passed to the group-mixture wrapper so it
+        estimates the per-factor weight marginals independently (robust to
+        transient mode collapse) rather than the flat 8/16/32 joint counts.
+        """
+        if self.polarisation_quarter:
+            return [4, 2, 4]
+        if self.phase_reflection:
+            return [4, 2, 2]
+        return [4, 2]
+
     def __call__(self, point_dict: dict, modes, inverse: bool = False) -> dict:
         """Apply the group element ``modes`` (or its inverse) to each point."""
         ra = point_dict["ra"]
@@ -1690,6 +1706,8 @@ def make_triangular_group_flow_proposal(
         import inspect as _inspect
 
         _gm_params = _inspect.signature(make_group_mixture_flow).parameters
+        if "mode_factor_sizes" in _gm_params:
+            gm_kwargs["mode_factor_sizes"] = base_action.mode_factor_sizes
         if gaussianise_sky:
             if "canonical_transform" not in _gm_params:
                 raise RuntimeError(
@@ -1729,12 +1747,21 @@ def make_triangular_group_flow_proposal(
         )
     else:
         action = None
+        import inspect as _inspect
+
+        _extra = {}
+        if (
+            "mode_factor_sizes"
+            in _inspect.signature(make_group_mixture_flow).parameters
+        ):
+            _extra["mode_factor_sizes"] = base_action.mode_factor_sizes
         flow_model_cls = _make_flow_model(
             group_action_fn=base_action,
             group_size=base_action.group_size,
             param_names=base_action.parameters,
             in_fundamental_domain=base_action.in_fundamental_domain,
             min_canon_std=_MIN_CANON_STD,
+            **_extra,
         )
 
     class TriangularGroupFlowProposal(

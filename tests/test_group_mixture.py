@@ -148,6 +148,35 @@ def test_metadata_phase_reflection(phase_action):
     assert ETTriangleGroupAction.group_size == 8
 
 
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, [4, 2]),
+        ({"phase_reflection": True}, [4, 2, 2]),
+        ({"polarisation_quarter": True}, [4, 2, 4]),
+    ],
+)
+def test_mode_factor_sizes(kwargs, expected):
+    action = TriangularDetectorGroupAction(
+        REFERENCE_TIME,
+        plane_normal=(0.0, 0.0, 1.0),
+        vertex=(0.0, 0.0, 0.0),
+        **kwargs,
+    )
+    sizes = action.mode_factor_sizes
+    assert sizes == expected
+    prod = 1
+    for s in sizes:
+        prod *= s
+    assert prod == action.group_size
+    # The little-endian mixed-radix decode of the factor sizes must agree
+    # with the action's own mode decode.
+    modes = torch.arange(action.group_size)
+    k, refl, pf = action.decode_modes(modes)
+    assert torch.equal(modes % sizes[0], k.long())
+    assert torch.equal(torch.div(modes, sizes[0], rounding_mode="floor") % sizes[1], refl.long())
+
+
 @pytest.mark.parametrize("phase_reflection", [False, True])
 def test_public_mode_helpers_match_private(phase_reflection):
     action = ETTriangleGroupAction(
