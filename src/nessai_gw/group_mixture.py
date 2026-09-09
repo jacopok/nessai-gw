@@ -150,6 +150,8 @@ original one.
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import torch
 
@@ -1523,6 +1525,8 @@ def make_triangular_group_flow_proposal(
     cluster_max_overlap=0.05,
     cluster_min_size=200,
     cluster_bg_weight=0.0,
+    cluster_k_grow_patience=2,
+    cluster_centroid_ema=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1651,12 +1655,22 @@ def make_triangular_group_flow_proposal(
             ) from exc
 
         def _make_flow_model(**gm):
+            extra = {}
+            _sig = inspect.signature(make_clustered_group_mixture_flow)
+            if "k_grow_patience" in _sig.parameters:
+                extra["k_grow_patience"] = int(cluster_k_grow_patience)
+            if "centroid_ema" in _sig.parameters:
+                extra["centroid_ema"] = (
+                    None if cluster_centroid_ema is None
+                    else float(cluster_centroid_ema)
+                )
             return make_clustered_group_mixture_flow(
                 n_clusters_max=int(n_clusters_max),
                 cluster_method=cluster_method,
                 max_cluster_overlap=float(cluster_max_overlap),
                 min_cluster_size=int(cluster_min_size),
                 bg_weight=float(cluster_bg_weight),
+                **extra,
                 **gm,
             )
     else:
@@ -1985,6 +1999,8 @@ def make_et_group_flow_proposal(
     cluster_max_overlap=0.05,
     cluster_min_size=200,
     cluster_bg_weight=0.0,
+    cluster_k_grow_patience=2,
+    cluster_centroid_ema=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -2008,4 +2024,6 @@ def make_et_group_flow_proposal(
         cluster_max_overlap=cluster_max_overlap,
         cluster_min_size=cluster_min_size,
         cluster_bg_weight=cluster_bg_weight,
+        cluster_k_grow_patience=cluster_k_grow_patience,
+        cluster_centroid_ema=cluster_centroid_ema,
     )
