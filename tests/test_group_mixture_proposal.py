@@ -362,6 +362,148 @@ def test_prime_space_16_fundamental_domain_partitions_orbit(
         assert torch.all(dphase[canon] < np.pi + 1e-6), g
 
 
+# ---------------------------------------------------------------------------
+# arg-alpha-beta phase coordinates
+# ---------------------------------------------------------------------------
+ARG_AB_PRIME_NAMES = [
+    "ra_dec_x",
+    "ra_dec_y",
+    "ra_dec_z",
+    "arg_alpha",
+    "arg_beta",
+    "theta_jn_prime",
+    "t_det",
+]
+
+
+@pytest.fixture(scope="module")
+def arg_ab_prime_points():
+    rng = np.random.default_rng(7)
+    n = 4000
+    ra = rng.uniform(0, 2 * np.pi, n)
+    dec = np.arcsin(rng.uniform(-1, 1, n))
+    r_sky = rng.uniform(0.5, 1.5, n)
+    cd = np.cos(dec)
+    return {
+        "ra_dec_x": torch.as_tensor(r_sky * cd * np.cos(ra)),
+        "ra_dec_y": torch.as_tensor(r_sky * cd * np.sin(ra)),
+        "ra_dec_z": torch.as_tensor(r_sky * np.sin(dec)),
+        "arg_alpha": torch.as_tensor(rng.uniform(-1.0, 1.0, n)),
+        "arg_beta": torch.as_tensor(rng.uniform(-1.0, 1.0, n)),
+        "theta_jn_prime": torch.as_tensor(rng.uniform(-1, 1, n)),
+        "t_det": torch.as_tensor(rng.uniform(-20, 20, n)),
+    }
+
+
+def _arg_ab_of(psi, phase):
+    return (
+        torch.remainder(phase - psi, 2 * np.pi) / np.pi - 1.0,
+        torch.remainder(phase + psi, 2 * np.pi) / np.pi - 1.0,
+    )
+
+
+@pytest.mark.parametrize("polarisation_quarter", [False, True])
+def test_triangular_group_reparameterisations_arg_alpha_beta(
+    polarisation_quarter,
+):
+    reps = triangular_group_reparameterisations(
+        BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="arg-alpha-beta"
+    )
+    assert "phase" not in reps
+    assert reps["arg-alpha-beta"] == {"parameters": ["psi", "phase"]}
+    # the polarisation-phase / psi entries are gone
+    assert "psi" not in reps
+
+
+def test_triangular_group_reparameterisations_bad_phase_coordinates():
+    with pytest.raises(ValueError, match="phase_coordinates"):
+        triangular_group_reparameterisations(
+            BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="nope"
+        )
+
+
+def test_prime_parameter_names_arg_alpha_beta():
+    prime = _prime_parameter_names(
+        BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="arg-alpha-beta"
+    )
+    assert "arg_alpha" in prime and "arg_beta" in prime
+    assert "delta_phase" not in prime
+    assert "psi_x" not in prime and "psi_prime" not in prime
+
+
+@pytest.fixture(scope="module", params=[False, True],
+                ids=["group8", "group32"])
+def arg_ab_action(request):
+    base = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME,
+        polarisation_quarter=request.param,
+        phase_reflection=request.param,
+    )
+    return PrimeSpaceTriangularGroupAction(base, ARG_AB_PRIME_NAMES)
+
+
+def test_arg_ab_action_detected(arg_ab_action):
+    assert arg_ab_action._arg_ab == ("arg_alpha", "arg_beta")
+
+
+def test_arg_ab_action_inverse_round_trip(arg_ab_action, arg_ab_prime_points):
+    n = len(arg_ab_prime_points["ra_dec_x"])
+    for g in range(arg_ab_action._action.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        fwd = arg_ab_action(arg_ab_prime_points, modes)
+        back = arg_ab_action(fwd, modes, inverse=True)
+        for name in ARG_AB_PRIME_NAMES:
+            d = (back[name] - arg_ab_prime_points[name]).abs().max()
+            assert d < 1e-9, (g, name, float(d))
+
+
+def test_arg_ab_action_t_det_and_theta_jn(arg_ab_action, arg_ab_prime_points):
+    n = len(arg_ab_prime_points["ra_dec_x"])
+    for g in range(arg_ab_action._action.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        fwd = arg_ab_action(arg_ab_prime_points, modes)
+        assert torch.allclose(fwd["t_det"], arg_ab_prime_points["t_det"])
+        assert torch.allclose(
+            fwd["theta_jn_prime"].abs(),
+            arg_ab_prime_points["theta_jn_prime"].abs(),
+        )
+        for k in ("arg_alpha", "arg_beta"):
+            assert fwd[k].min() >= -1 - 1e-9 and fwd[k].max() < 1 + 1e-9
+
+
+def test_arg_ab_action_fundamental_domain_partitions_orbit(
+    arg_ab_action, arg_ab_prime_points
+):
+    count = _in_domain_count(
+        arg_ab_action, arg_ab_prime_points, arg_ab_action._action.group_size
+    )
+    assert torch.all(count == 1), count.unique(return_counts=True)
+
+
+def test_arg_ab_action_matches_physical(arg_ab_action, arg_ab_prime_points):
+    """The prime (arg_alpha, arg_beta) action equals the physical action on
+    (psi, phase) mapped through arg-alpha-beta."""
+    n = len(arg_ab_prime_points["ra_dec_x"])
+    acted, _ = arg_ab_action._decode(arg_ab_prime_points)
+    phys0 = {
+        "ra": acted["ra"],
+        "sin_dec": acted["sin_dec"],
+        "cos_theta_jn": torch.full_like(acted["ra"], 0.3),
+        "psi": acted["psi"],
+        "phase": acted["phase"],
+    }
+    base = arg_ab_action._action
+    for g in range(base.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        phys = base(phys0, modes)
+        aa, bb = _arg_ab_of(phys["psi"], phys["phase"])
+        fwd = arg_ab_action(arg_ab_prime_points, modes)
+        for got, want in ((fwd["arg_alpha"], aa), (fwd["arg_beta"], bb)):
+            d = torch.remainder(got - want, 2.0)
+            d = torch.minimum(d, 2.0 - d)
+            assert d.max() < 1e-6, g
+
+
 def test_prime_parameter_names():
     prime = _prime_parameter_names(BNS_PARAMETERS, REFERENCE_TIME)
     if not any(n.startswith("ra_dec") for n in prime):
@@ -682,7 +824,10 @@ def test_gaussianise_sky_requires_prime_space():
 # ---------------------------------------------------------------------------
 # 2-D equal-area sky path (EqualAreaSky + SkyOctantProbit + sky_2d wiring)
 # ---------------------------------------------------------------------------
-from nessai_gw.group_mixture import SkyOctantProbit  # noqa: E402
+from nessai_gw.group_mixture import (  # noqa: E402
+    SkyOctantProbit,
+    SkyOctantPullback,
+)
 from nessai_gw.reparameterisations.sky import EqualAreaSky  # noqa: E402
 
 PRIME_NAMES_2D = [
@@ -771,6 +916,68 @@ def test_sky_octant_probit_round_trip_and_jacobian():
             jac[:, :, j] += s * fp[:, [iu, iv]] / (2 * eps)
     logdet = torch.log(torch.linalg.det(jac).abs())
     assert torch.allclose(ljf, logdet, atol=1e-4)
+
+
+def _bumpy_q_grid(nu=48, nv=48):
+    u = (np.arange(nu) + 0.5) / nu
+    v = (np.arange(nv) + 0.5) / nv
+    U, V = np.meshgrid(u, v, indexing="ij")
+    return 0.3 + np.exp(-((U - 0.6) ** 2 + (V - 0.35) ** 2) / 0.02)
+
+
+def test_sky_octant_pullback_round_trip_and_jacobian():
+    t = SkyOctantPullback(_bumpy_q_grid(), PRIME_NAMES_2D)
+    canon = _folded_sub_square(256)
+    base, ljf = t.forward(canon)
+    back, lji = t.inverse(base)
+    assert torch.allclose(back, canon, atol=1e-6)
+    assert torch.allclose(ljf, -lji, atol=1e-6)
+    for i, name in enumerate(PRIME_NAMES_2D):
+        if name not in ("sky_u", "sky_v"):
+            assert torch.allclose(base[:, i], canon[:, i])
+    iu, iv = PRIME_NAMES_2D.index("sky_u"), PRIME_NAMES_2D.index("sky_v")
+    eps = 1e-6
+    jac = torch.zeros(canon.shape[0], 2, 2, dtype=torch.float64)
+    for j, col in enumerate((iu, iv)):
+        for s in (+1, -1):
+            pert = canon.clone()
+            pert[:, col] += s * eps
+            fp, _ = t.forward(pert)
+            jac[:, :, j] += s * fp[:, [iu, iv]] / (2 * eps)
+    logdet = torch.log(torch.linalg.det(jac).abs())
+    # piecewise-constant density vs finite-diff of a piecewise-linear map:
+    # agree except for the ~1/nu fraction of points straddling a cell wall.
+    assert (torch.abs(ljf - logdet) < 1e-3).float().mean() > 0.9
+
+
+def test_sky_octant_pullback_uniform_q_matches_probit():
+    """A flat q_grid must reduce to SkyOctantProbit."""
+    canon = _folded_sub_square(512)
+    flat = SkyOctantPullback(np.ones((32, 32)), PRIME_NAMES_2D)
+    ref = SkyOctantProbit(PRIME_NAMES_2D)
+    bf, ljf = flat.forward(canon.clone())
+    br, ljr = ref.forward(canon.clone())
+    assert torch.allclose(bf, br, atol=1e-6)
+    assert torch.allclose(ljf, ljr, atol=1e-6)
+
+
+def test_sky_octant_pullback_gaussianises_its_own_q():
+    """Sampling proportional to q_grid, the pullback yields ~N(0, 1)^2."""
+    q = _bumpy_q_grid(64, 64)
+    nu, nv = q.shape
+    rng = np.random.default_rng(1)
+    flat_p = (q / q.sum()).ravel()
+    idx = rng.choice(flat_p.size, size=150_000, p=flat_p)
+    iu, iv = np.unravel_index(idx, (nu, nv))
+    su = (iu + rng.uniform(size=idx.size)) * 0.25 / nu
+    sv = (iv + rng.uniform(size=idx.size)) * 0.5 / nv
+    canon = torch.zeros(idx.size, len(PRIME_NAMES_2D), dtype=torch.float64)
+    canon[:, 0] = torch.as_tensor(su)
+    canon[:, 1] = torch.as_tensor(sv)
+    base, _ = SkyOctantPullback(q, PRIME_NAMES_2D).forward(canon)
+    a, b = base[:, 0].numpy(), base[:, 1].numpy()
+    assert abs(a.mean()) < 0.03 and abs(b.mean()) < 0.03
+    assert abs(a.std() - 1.0) < 0.03 and abs(b.std() - 1.0) < 0.03
 
 
 def test_sky_octant_probit_gaussianises_folded_prior():
@@ -1040,6 +1247,7 @@ def test_make_et_group_flow_proposal_polarisation_quarter():
     assert off._FlowModelClass.group_size == 16
 
 
+@requires_group_mixture
 def test_make_et_group_flow_proposal_clustered():
     """n_clusters_max > 1 wires the clustered flow model; default is off."""
     from nessai.flowmodel.group_mixture import (

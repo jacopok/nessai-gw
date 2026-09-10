@@ -777,6 +777,17 @@ class PrimeSpaceTriangularGroupAction:
             "psi_prime" in names and "psi" not in self._pair
         )
 
+        # arg-alpha-beta: the two circular-polarisation phase coordinates
+        # (ArgAlphaBetaReparameterisation).  When present they REPLACE both the
+        # ``psi`` and ``delta_phase`` flow coordinates: they already fold the
+        # polarisation-quarter Z4 (they are invariant under it), so the only
+        # group action left on the phase sector is a joint ``+pi`` shift for the
+        # odd sky-Z4 rotations and an ``alpha <-> beta`` swap under the plane
+        # reflection -- applied directly in :meth:`_encode`.
+        self._arg_ab = None
+        if "arg_alpha" in names and "arg_beta" in names:
+            self._arg_ab = ("arg_alpha", "arg_beta")
+
         # delta_phase: single linear polarisation-phase coordinate
         self._delta_phase = None
         for cand in ("delta_phase", "delta_phase_prime"):
@@ -802,10 +813,11 @@ class PrimeSpaceTriangularGroupAction:
         missing = []
         if self._sky is None and self._sky2d is None:
             missing.append("sky-ra-dec (ra_dec_x/_y/_z) or sky_u/sky_v")
-        if "psi" not in self._pair and not self._psi_single:
-            missing.append("psi (psi_x/_y or psi_prime)")
-        if self._delta_phase is None:
-            missing.append("delta_phase")
+        if self._arg_ab is None:
+            if "psi" not in self._pair and not self._psi_single:
+                missing.append("psi (psi_x/_y or psi_prime)")
+            if self._delta_phase is None:
+                missing.append("delta_phase")
         if self._theta_jn is None:
             missing.append("theta_jn")
         if self._t_det is None:
@@ -815,8 +827,9 @@ class PrimeSpaceTriangularGroupAction:
                 f"prime space is missing {missing}, which the triangular-detector "
                 "group action needs; the prime-space path only applies to a "
                 "single-site triangular-detector run with the standard extrinsic parameters and "
-                "the nessai-gw reparameterisations (sky-ra-dec, angle-pi, "
-                "polarisation-phase, angle-sine, detector-center-time)."
+                "the nessai-gw reparameterisations (sky-ra-dec, angle-pi / "
+                "polarisation-phase or arg-alpha-beta, angle-sine, "
+                "detector-center-time)."
             )
 
     # -- decode / encode -------------------------------------------------
@@ -851,7 +864,27 @@ class PrimeSpaceTriangularGroupAction:
         ra = torch.remainder(torch.atan2(sy, sx), _TWO_PI)
         sin_dec = torch.clamp(sz / norm, -1.0, 1.0)
 
-        if self._psi_single:
+        if self._arg_ab is not None:
+            # arg-alpha-beta: (arg_alpha, arg_beta) = ((phase - psi) / pi - 1,
+            #                                          (phase + psi) / pi - 1).
+            # Recover (psi, phase); the map is a bijection on
+            # psi in [0, pi), phase in [0, 2*pi).  psi is fixed mod pi, phase
+            # only mod pi -> pick the branch reproducing arg_alpha.
+            au = torch.remainder(
+                (point_dict[self._arg_ab[0]] + 1.0) * np.pi, _TWO_PI
+            )
+            av = torch.remainder(
+                (point_dict[self._arg_ab[1]] + 1.0) * np.pi, _TWO_PI
+            )
+            psi = torch.remainder(0.5 * (av - au), np.pi)
+            ph0 = torch.remainder(0.5 * (av + au), np.pi)
+            e0 = torch.cos(torch.remainder(ph0 - psi, _TWO_PI) - au)
+            e1 = torch.cos(torch.remainder(ph0 + np.pi - psi, _TWO_PI) - au)
+            phase = torch.where(
+                e1 > e0, torch.remainder(ph0 + np.pi, _TWO_PI), ph0
+            )
+            r_psi = torch.ones_like(ra)
+        elif self._psi_single:
             ang = point_dict["psi_prime"]
             psi = torch.remainder(
                 (ang + 1.0) * np.pi / _ANGLE_SCALE["psi"], np.pi
@@ -878,11 +911,14 @@ class PrimeSpaceTriangularGroupAction:
         # ``phase`` itself is group-invariant, so recover the invariant piece and
         # let :meth:`_encode` rebuild delta_phase from the group-transformed psi
         # and cos(theta_jn) sign.
-        delta_phase = torch.remainder(
-            (point_dict[self._delta_phase] + 1.0) * np.pi / _DELTA_PHASE_SCALE,
-            _TWO_PI,
-        )
-        phase = delta_phase - sign_ct * psi
+        if self._arg_ab is None:
+            delta_phase = torch.remainder(
+                (point_dict[self._delta_phase] + 1.0)
+                * np.pi
+                / _DELTA_PHASE_SCALE,
+                _TWO_PI,
+            )
+            phase = delta_phase - sign_ct * psi
 
         # The flow coordinate is the detector-centre arrival time (invariant
         # under the group), so it is not decoded here -- :meth:`_encode` copies
@@ -929,7 +965,9 @@ class PrimeSpaceTriangularGroupAction:
             out[sy] = r * dyf
             out[sz] = r * dzf
 
-        if self._psi_single:
+        if self._arg_ab is not None:
+            pass  # psi is not a flow coordinate on this path
+        elif self._psi_single:
             a = torch.remainder(
                 mapped["psi"] * _ANGLE_SCALE["psi"], _TWO_PI
             )
@@ -942,6 +980,15 @@ class PrimeSpaceTriangularGroupAction:
 
         u = point_dict[self._theta_jn]
         out[self._theta_jn] = torch.where(aux["reflected"], -u, u)
+
+        if self._arg_ab is not None:
+            # Re-encode straight from the group-transformed (psi, phase):
+            # arg_alpha = ((phase - psi) mod 2 pi) / pi - 1, likewise arg_beta.
+            au = torch.remainder(mapped["phase"] - mapped["psi"], _TWO_PI)
+            av = torch.remainder(mapped["phase"] + mapped["psi"], _TWO_PI)
+            out[self._arg_ab[0]] = au / np.pi - 1.0
+            out[self._arg_ab[1]] = av / np.pi - 1.0
+            return {n: out[n] for n in self._prime_names}
 
         # delta_phase = phase_invariant + sign(cos theta_jn)_out * psi_out.
         # The reflection flips both sign(cos theta_jn) and psi (psi -> pi - psi,
@@ -991,6 +1038,12 @@ class PrimeSpaceTriangularGroupAction:
 
     def in_fundamental_domain(self, point_dict):
         acted, aux = self._decode(point_dict)
+        if self._arg_ab is not None:
+            # (arg_alpha, arg_beta) are a bijective image of (psi, phase), so the
+            # base predicate's raw psi / phase cuts (psi in [0, pi/2), phase in
+            # [0, pi)) are genuine half-plane cuts in (arg_alpha, arg_beta) and
+            # select exactly one image per orbit.
+            return self._action.in_fundamental_domain(acted)
         if self._action.phase_reflection:
             # The base action folds the phase-reflection Z2 by testing
             # ``phase in [0, pi)`` on the raw invariant phase.  In prime space
@@ -1200,8 +1253,183 @@ class SkyOctantProbit:
         return canon, log_j
 
 
+def _lerp_cdf(x, edges, cdf):
+    """Piecewise-linear CDF value at ``x`` (``edges``/``cdf`` 1-D, monotone)."""
+    n = edges.numel() - 1
+    du = edges[1] - edges[0]
+    i = torch.clamp(((x - edges[0]) / du).floor().long(), 0, n - 1)
+    frac = (x - edges[i]) / du
+    return cdf[i] + frac * (cdf[i + 1] - cdf[i]), i
+
+
+def _invert_cdf(y, edges, cdf):
+    """Inverse of :func:`_lerp_cdf`: ``x`` such that ``lerp_cdf(x) == y``."""
+    i = torch.clamp(torch.searchsorted(cdf, y, right=True) - 1, 0, cdf.numel() - 2)
+    span = cdf[i + 1] - cdf[i]
+    frac = torch.where(span > 0, (y - cdf[i]) / span, torch.zeros_like(y))
+    return edges[i] + frac * (edges[i + 1] - edges[i]), i
+
+
+class SkyOctantPullback:
+    r"""Prior-pullback PIT of the folded equal-area sky sub-square.
+
+    Drop-in replacement for :class:`SkyOctantProbit` (same
+    ``canonical_transform`` contract, same ``sky_u`` / ``sky_v`` prime
+    coordinates) that maps the fundamental sub-square
+    ``sky_u in [0, 1/4), sky_v in [0, 1/2)`` to two standard normals through the
+    **exact 2-D probability-integral transform of a supplied density**
+    ``q(sky_u, sky_v)`` rather than the uniform one::
+
+        u1 = F_u(sky_u)            (marginal CDF of q in sky_u)
+        u2 = F_{v|u}(sky_v)        (conditional CDF of q in sky_v given the
+                                    sky_u cell)
+        a  = Phi^-1(u1),   b = Phi^-1(u2)
+
+    The intended ``q`` is the note's analytic prior-pullback sky density
+    (arXiv:.../triangle_degeneracy; the frozen-(2, 2) marginal likelihood
+    ``exp(sky_density.lnp)``, weighted by the volumetric prior, then **folded to
+    the fundamental domain** -- sum of the eight group images).  On the octomodal
+    ET BNS posterior the folded ``q`` predicts the folded sky posterior to
+    KL ~= 0.5 nat (vs ~2.2 nat for the uniform sub-square), so the base flow only
+    has to learn the small residual + the true (weak) localisation on top.
+
+    ``q`` is passed in as a dense grid of **cell-centre densities**
+    ``q_grid[i, j]`` over ``sky_u in [0, 1/4)`` x ``sky_v in [0, 1/2)`` (uniform
+    cells).  It need not be normalised.  The Jacobian uses the piecewise-constant
+    density that is *exactly* the derivative of the piecewise-linear CDFs built
+    from the same grid, so the map and ``log_j`` are consistent::
+
+        log|d(a, b)/d(sky_u, sky_v)| = log q_hat(sky_u, sky_v)
+                                       - log phi(a) - log phi(b)
+
+    with ``q_hat`` the (normalised) piecewise-constant density.
+
+    Parameters
+    ----------
+    q_grid : array_like
+        ``(Nu, Nv)`` non-negative folded-``q`` density at the centres of a
+        uniform grid over ``sky_u in [0, 1/4)`` x ``sky_v in [0, 1/2)``.
+    param_names : list of str, optional
+        Prime-parameter names; must contain ``sky_u`` and ``sky_v``.  Bind later
+        with :meth:`bind` if not given.
+    """
+
+    def __init__(self, q_grid, param_names=None):
+        q = np.asarray(q_grid, dtype=float)
+        if q.ndim != 2:
+            raise ValueError(f"q_grid must be 2-D, got shape {q.shape}")
+        nu, nv = q.shape
+        du, dv = 0.25 / nu, 0.5 / nv
+        q = np.clip(q, 0.0, None)
+        norm = q.sum() * du * dv
+        if not norm > 0:
+            raise ValueError("q_grid integrates to zero.")
+        q = q / norm
+
+        m_u = q.sum(axis=1) * dv                      # marginal density in sky_u
+        C_u = np.concatenate([[0.0], np.cumsum(m_u) * du])
+        C_u /= C_u[-1]
+        cond = q / np.clip(q.sum(axis=1, keepdims=True) * dv, 1e-300, None)
+        C_v = np.concatenate(
+            [np.zeros((nu, 1)), np.cumsum(cond, axis=1) * dv], axis=1
+        )
+        C_v /= C_v[:, -1:]
+
+        self._nu, self._nv = nu, nv
+        self._u_edges = torch.as_tensor(
+            np.linspace(0.0, 0.25, nu + 1), dtype=torch.float64
+        )
+        self._v_edges = torch.as_tensor(
+            np.linspace(0.0, 0.5, nv + 1), dtype=torch.float64
+        )
+        self._C_u = torch.as_tensor(C_u, dtype=torch.float64)
+        self._C_v = torch.as_tensor(C_v, dtype=torch.float64)
+        self._log_m_u = torch.as_tensor(np.log(m_u), dtype=torch.float64)
+        self._log_cond = torch.as_tensor(
+            np.log(np.clip(cond, 1e-300, None)), dtype=torch.float64
+        )
+        self._iu = self._iv = None
+        if param_names is not None:
+            self.bind(param_names)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        if "sky_u" not in names or "sky_v" not in names:
+            raise RuntimeError(
+                "SkyOctantPullback needs sky_u / sky_v in the prime "
+                f"parameters; got {names}."
+            )
+        self._iu = names.index("sky_u")
+        self._iv = names.index("sky_v")
+
+    def _dtype_cast(self, ref):
+        return (
+            self._u_edges.to(ref.dtype), self._v_edges.to(ref.dtype),
+            self._C_u.to(ref.dtype), self._C_v.to(ref.dtype),
+            self._log_m_u.to(ref.dtype), self._log_cond.to(ref.dtype),
+        )
+
+    def forward(self, canon):
+        iu, iv = self._iu, self._iv
+        ue, ve, Cu, Cv, log_mu, log_cond = self._dtype_cast(canon)
+        su = torch.clamp(canon[:, iu], _SKY_PROBIT_EPS, 0.25 - _SKY_PROBIT_EPS)
+        sv = torch.clamp(canon[:, iv], _SKY_PROBIT_EPS, 0.5 - _SKY_PROBIT_EPS)
+
+        u1, iu_cell = _lerp_cdf(su, ue, Cu)
+        dvv = ve[1] - ve[0]
+        jv = torch.clamp(((sv - ve[0]) / dvv).floor().long(), 0, self._nv - 1)
+        frac_v = (sv - ve[jv]) / dvv
+        row = Cv[iu_cell]
+        u2 = torch.gather(row, 1, jv[:, None])[:, 0] + frac_v * (
+            torch.gather(row, 1, (jv + 1)[:, None])[:, 0]
+            - torch.gather(row, 1, jv[:, None])[:, 0]
+        )
+
+        a = torch.special.ndtri(torch.clamp(u1, _SKY_PROBIT_EPS, 1 - _SKY_PROBIT_EPS))
+        b = torch.special.ndtri(torch.clamp(u2, _SKY_PROBIT_EPS, 1 - _SKY_PROBIT_EPS))
+        t = canon.clone()
+        t[:, iu] = a
+        t[:, iv] = b
+        log_q = log_mu[iu_cell] + torch.gather(
+            log_cond[iu_cell], 1, jv[:, None]
+        )[:, 0]
+        log_j = log_q - _log_std_normal_pdf(a) - _log_std_normal_pdf(b)
+        return t, log_j
+
+    def inverse(self, t):
+        iu, iv = self._iu, self._iv
+        ue, ve, Cu, Cv, log_mu, log_cond = self._dtype_cast(t)
+        a, b = t[:, iu], t[:, iv]
+        u1 = torch.clamp(torch.special.ndtr(a), _SKY_PROBIT_EPS, 1 - _SKY_PROBIT_EPS)
+        u2 = torch.clamp(torch.special.ndtr(b), _SKY_PROBIT_EPS, 1 - _SKY_PROBIT_EPS)
+
+        su, iu_cell = _invert_cdf(u1, ue, Cu)
+        row = Cv[iu_cell]
+        jv = torch.clamp(
+            torch.searchsorted(row, u2[:, None], right=True)[:, 0] - 1,
+            0, self._nv - 2,
+        )
+        c0 = torch.gather(row, 1, jv[:, None])[:, 0]
+        c1 = torch.gather(row, 1, (jv + 1)[:, None])[:, 0]
+        span = c1 - c0
+        frac = torch.where(span > 0, (u2 - c0) / span, torch.zeros_like(u2))
+        sv = ve[jv] + frac * (ve[jv + 1] - ve[jv])
+
+        canon = t.clone()
+        canon[:, iu] = su
+        canon[:, iv] = sv
+        log_q = log_mu[iu_cell] + torch.gather(
+            log_cond[iu_cell], 1, jv[:, None]
+        )[:, 0]
+        log_j = -log_q + _log_std_normal_pdf(a) + _log_std_normal_pdf(b)
+        return canon, log_j
+
+
 def triangular_group_reparameterisations(
-    sampling_parameters, reference_time, vertex=None
+    sampling_parameters,
+    reference_time,
+    vertex=None,
+    phase_coordinates="polarisation-phase",
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -1254,6 +1482,16 @@ def triangular_group_reparameterisations(
         Earth-fixed detector position (metres) for the ``detector-center-time``
         reparameterisation.  Defaults to :data:`ET_EMR_VERTEX`; pass the value
         from :func:`detector_vertex` for a different geometry.
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta"}, optional
+        ``"polarisation-phase"`` (default): the single ``delta_phase`` coordinate
+        described above, ``psi`` carried separately (``angle-pi`` /
+        ``SingleAngle``).  ``"arg-alpha-beta"``: replace **both** ``psi`` and
+        ``phase`` with the two circular-polarisation phases ``arg_alpha =
+        (phase - psi)`` and ``arg_beta = (phase + psi)``
+        (:class:`~nessai_gw.reparameterisations.phase.ArgAlphaBetaReparameterisation`),
+        which put the likelihood ridge on a flow axis.  Must match the
+        ``phase_coordinates`` passed to
+        :func:`make_triangular_group_flow_proposal`.
 
     Returns
     -------
@@ -1262,6 +1500,11 @@ def triangular_group_reparameterisations(
     """
     if vertex is None:
         vertex = ET_EMR_VERTEX
+    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta"):
+        raise ValueError(
+            "phase_coordinates must be 'polarisation-phase' or "
+            f"'arg-alpha-beta'; got {phase_coordinates!r}"
+        )
 
     # ``polarisation-phase`` reads x-space ``psi`` and ``theta_jn`` on its
     # inverse, and ``detector-center-time`` reads x-space ``ra`` / ``dec``, so
@@ -1302,11 +1545,23 @@ def triangular_group_reparameterisations(
                 "scale": _GEOCENT_SCALE,
             }
         elif name == "phase":
-            # delta_phase = phase + sign(cos theta_jn) * psi (polarisation-phase):
-            # makes the likelihood-constrained polarisation/phase combination an
-            # explicit flow axis.  ``psi`` (angle-pi) and ``theta_jn``
-            # (angle-sine) are prerequisites.
-            reps[name] = {"reparameterisation": "polarisation-phase"}
+            if phase_coordinates == "arg-alpha-beta":
+                # arg_alpha = (phase - psi), arg_beta = (phase + psi): both
+                # circular-polarisation phases on the flow axes.  Keyed by the
+                # reparameterisation name (not "phase") with an explicit
+                # ``parameters`` list, which both nessai 0.15.x and 0.16.x
+                # thread through verbatim -- keying by "phase" would make one of
+                # them append "phase" a second time.  Added after the loop.
+                continue
+            else:
+                # delta_phase = phase + sign(cos theta_jn) * psi
+                # (polarisation-phase): makes the likelihood-constrained
+                # polarisation/phase combination an explicit flow axis.  ``psi``
+                # (angle-pi) and ``theta_jn`` (angle-sine) are prerequisites.
+                reps[name] = {"reparameterisation": "polarisation-phase"}
+
+    if phase_coordinates == "arg-alpha-beta" and "phase" in sampling_parameters:
+        reps["arg-alpha-beta"] = {"parameters": ["psi", "phase"]}
     return reps
 
 
@@ -1342,7 +1597,7 @@ _DUMMY_PRIOR_BOUNDS = {
 
 def _prime_parameter_names(
     sampling_parameters, reference_time, vertex=None, sky_2d=False,
-    psi_single=False,
+    psi_single=False, phase_coordinates="polarisation-phase",
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -1386,7 +1641,8 @@ def _prime_parameter_names(
             _StubModel(),
             poolsize=100,
             reparameterisations=triangular_group_reparameterisations(
-                names, reference_time, vertex=vertex
+                names, reference_time, vertex=vertex,
+                phase_coordinates=phase_coordinates,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -1399,7 +1655,12 @@ def _prime_parameter_names(
                 # override); swap the triple for the 2-coordinate names in
                 # place so the pre-bind placeholder has the right count/order.
                 prime = _swap_sky_triple_for_pair(prime)
-            if psi_single and "psi_x" in prime and "psi_y" in prime:
+            if (
+                phase_coordinates != "arg-alpha-beta"
+                and psi_single
+                and "psi_x" in prime
+                and "psi_y" in prime
+            ):
                 i = prime.index("psi_x")
                 prime = prime[:i] + ["psi_prime"] + [
                     n for n in prime[i:] if n not in ("psi_x", "psi_y")
@@ -1425,9 +1686,15 @@ def _prime_parameter_names(
         if name in ("ra", "dec"):
             continue
         if name == "phase":
-            # the group wiring carries ``phase`` as the single ``delta_phase``
-            # polarisation-phase coordinate (no ``_x``/``_y`` pair, no suffix)
-            out.append("delta_phase")
+            if phase_coordinates == "arg-alpha-beta":
+                # arg-alpha-beta consumes both psi and phase -> emit the pair
+                # here and skip psi below.
+                out += ["arg_alpha", "arg_beta"]
+            else:
+                # single ``delta_phase`` polarisation-phase coordinate
+                out.append("delta_phase")
+        elif name == "psi" and phase_coordinates == "arg-alpha-beta":
+            continue  # folded into (arg_alpha, arg_beta)
         elif name == "geocent_time":
             # detector-center-time: single ``t_det`` coordinate (no suffix)
             out.append("t_det")
@@ -1518,8 +1785,10 @@ def make_triangular_group_flow_proposal(
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
     sky_2d="auto",
+    sky_pullback=None,
     psi_single=True,
     polarisation_quarter=True,
+    phase_coordinates="polarisation-phase",
     n_clusters_max=1,
     cluster_method="gmm",
     cluster_max_overlap=0.05,
@@ -1603,6 +1872,16 @@ def make_triangular_group_flow_proposal(
         :class:`SkyOctantProbit`).  Default ``"auto"`` -- on whenever
         ``prime_space`` and ``gaussianise_sky`` are both active (the machinery
         it needs), off otherwise.  Requires the prime-space path.
+    sky_pullback : array_like or None, optional
+        ``(Nu, Nv)`` grid of the analytic prior-pullback sky density ``q``,
+        **folded to the fundamental sub-square** ``sky_u in [0, 1/4)`` x
+        ``sky_v in [0, 1/2)`` (see
+        :class:`SkyOctantPullback` and :func:`folded_sky_pullback_grid`).  When
+        given, :class:`SkyOctantPullback` replaces :class:`SkyOctantProbit` as
+        the group-mixture ``canonical_transform``: the base flow then sees the
+        folded sky posterior mapped (exact 2-D PIT of ``q``) to ~two standard
+        normals rather than the uniform sub-square, so it need only learn the
+        small residual.  Requires ``sky_2d``.  Default ``None`` (uniform PIT).
     psi_single : bool, optional
         Carry ``psi`` as a single ``psi_prime`` coordinate
         (:class:`~nessai_gw.reparameterisations.phase.SingleAngleReparameterisation`)
@@ -1618,6 +1897,17 @@ def make_triangular_group_flow_proposal(
         ``phase_reflection``).  This makes ``psi_prime`` unimodal in the base
         frame -- the ``{psi -> psi + pi/2}`` degeneracy is otherwise left for
         the base flow to model as a second mode.  Default ``True``.
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta"}, optional
+        ``"polarisation-phase"`` (default): ``delta_phase = phase + sign(cos
+        theta_jn) psi`` + a separate ``psi`` coordinate.  ``"arg-alpha-beta"``:
+        carry both circular-polarisation phases ``arg_alpha = (phase - psi)``
+        and ``arg_beta = (phase + psi)`` as flow axes instead (folds out ``psi``
+        and ``delta_phase``); on the octomodal ET BNS fold this cut base-flow
+        NLL by ~1 nat over the equivalently-grouped ``delta_phase`` block.  The
+        polarisation-quarter Z4 still acts on ``(arg_alpha, arg_beta)`` and is
+        kept as a weight-learned group factor -- keep ``polarisation_quarter``
+        as you would otherwise.  Must match the ``phase_coordinates`` passed to
+        :func:`triangular_group_reparameterisations`.
     n_clusters_max : int
         If ``> 1``, use a *clustered* base flow: up to ``n_clusters_max``
         independent group-mixture experts, one per data cluster (found each
@@ -1709,6 +1999,22 @@ def make_triangular_group_flow_proposal(
             "sky_2d needs gaussianise_sky (the SkyOctantProbit canonical "
             "transform turns the folded equal-area sub-square into N(0, 1))."
         )
+    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta"):
+        raise ValueError(
+            "phase_coordinates must be 'polarisation-phase' or "
+            f"'arg-alpha-beta'; got {phase_coordinates!r}"
+        )
+    if sky_pullback is not None:
+        if not sky_2d:
+            raise RuntimeError(
+                "sky_pullback needs sky_2d (it replaces the SkyOctantProbit "
+                "PIT of the (sky_u, sky_v) sub-square)."
+            )
+        sky_pullback = np.asarray(sky_pullback, dtype=float)
+        if sky_pullback.ndim != 2:
+            raise ValueError(
+                f"sky_pullback must be a 2-D grid; got shape {sky_pullback.shape}"
+            )
 
     names = list(sampling_parameters)
     missing = sorted(
@@ -1733,7 +2039,7 @@ def make_triangular_group_flow_proposal(
     if prime_space:
         prime_names = _prime_parameter_names(
             names, reference_time, vertex=vertex, sky_2d=sky_2d,
-            psi_single=psi_single,
+            psi_single=psi_single, phase_coordinates=phase_coordinates,
         )
         action = PrimeSpaceTriangularGroupAction(base_action, prime_names)
         gm_kwargs = {}
@@ -1748,11 +2054,16 @@ def make_triangular_group_flow_proposal(
                     "gaussianise_sky requires a version of nessai whose "
                     "make_group_mixture_flow accepts `canonical_transform`."
                 )
-            gm_kwargs["canonical_transform"] = (
-                SkyOctantProbit(prime_names)
-                if sky_2d
-                else SkyOctantGaussianiser(prime_names)
-            )
+            if not sky_2d:
+                gm_kwargs["canonical_transform"] = SkyOctantGaussianiser(
+                    prime_names
+                )
+            elif sky_pullback is not None:
+                gm_kwargs["canonical_transform"] = SkyOctantPullback(
+                    sky_pullback, prime_names
+                )
+            else:
+                gm_kwargs["canonical_transform"] = SkyOctantProbit(prime_names)
             if boundary_reflection:
                 logger.warning(
                     "gaussianise_sky pushes the octant walls to +/-inf; "
@@ -1812,8 +2123,11 @@ def make_triangular_group_flow_proposal(
             # rather than an oblique equatorial wedge (see RotatedAnglePair).
             rep = self._reparameterisation
             model_names = set(self.model.names)
-            if psi_single and "psi" in model_names and "psi" not in set(
-                rep.parameters
+            if (
+                phase_coordinates != "arg-alpha-beta"
+                and psi_single
+                and "psi" in model_names
+                and "psi" not in set(rep.parameters)
             ):
                 # Single ``psi_prime`` coordinate instead of the angle-pi
                 # Cartesian pair + chi(2) radius (the bare psi is only weakly
@@ -2005,8 +2319,10 @@ def make_et_group_flow_proposal(
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
     sky_2d="auto",
+    sky_pullback=None,
     psi_single=True,
     polarisation_quarter=True,
+    phase_coordinates="polarisation-phase",
     n_clusters_max=1,
     cluster_method="gmm",
     cluster_max_overlap=0.05,
@@ -2031,8 +2347,10 @@ def make_et_group_flow_proposal(
         gaussianise_sky=gaussianise_sky,
         sky_radial_sigma=sky_radial_sigma,
         sky_2d=sky_2d,
+        sky_pullback=sky_pullback,
         psi_single=psi_single,
         polarisation_quarter=polarisation_quarter,
+        phase_coordinates=phase_coordinates,
         n_clusters_max=n_clusters_max,
         cluster_method=cluster_method,
         cluster_max_overlap=cluster_max_overlap,
