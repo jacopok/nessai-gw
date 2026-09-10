@@ -1527,8 +1527,19 @@ def make_triangular_group_flow_proposal(
     cluster_bg_weight=0.0,
     cluster_k_grow_patience=2,
     cluster_centroid_ema=None,
+    flow_model_factory=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
+
+    ``flow_model_factory`` (optional): a callable used *instead of*
+    :func:`nessai.flowmodel.group_mixture.make_clustered_group_mixture_flow`
+    when ``n_clusters_max > 1``.  It is called with the group keyword arguments
+    (``group_action_fn`` / ``prime_space_action`` / ``param_names`` /
+    ``group_size`` / ``mode_factor_sizes`` / ``canonical_transform`` / ...) and
+    must return a ``FlowModel`` subclass.  Use it to plug in a bespoke
+    clustering strategy (e.g. a fixed rule-based split); pre-bind its own
+    configuration with :func:`functools.partial`.  The ``cluster_*`` arguments
+    above are then ignored.
 
     The returned class combines :class:`nessai_gw.proposals.GWReparamMixin`
     (GW reparameterisations by parameter name),
@@ -1642,7 +1653,9 @@ def make_triangular_group_flow_proposal(
             "make_group_mixture_flow)."
         ) from exc
 
-    if int(n_clusters_max) > 1:
+    if int(n_clusters_max) > 1 and flow_model_factory is not None:
+        _make_flow_model = flow_model_factory
+    elif int(n_clusters_max) > 1:
         try:
             from nessai.flowmodel.group_mixture import (
                 make_clustered_group_mixture_flow,
@@ -2001,6 +2014,7 @@ def make_et_group_flow_proposal(
     cluster_bg_weight=0.0,
     cluster_k_grow_patience=2,
     cluster_centroid_ema=None,
+    flow_model_factory=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -2026,4 +2040,5 @@ def make_et_group_flow_proposal(
         cluster_bg_weight=cluster_bg_weight,
         cluster_k_grow_patience=cluster_k_grow_patience,
         cluster_centroid_ema=cluster_centroid_ema,
+        flow_model_factory=flow_model_factory,
     )
