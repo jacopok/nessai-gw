@@ -9,6 +9,7 @@ from nessai.livepoint import (
 from nessai.utils.testing import assert_structured_arrays_equal
 
 from nessai_gw.reparameterisations import (
+    ArgAlphaBetaReparameterisation,
     DeltaPhaseReparameterisation,
     PolarisationPhaseReparameterisation,
 )
@@ -195,4 +196,76 @@ class TestPolarisationPhase:
         )
         if scale == 1.0:
             np.testing.assert_allclose(x_i["phase"], phase, rtol=1e-9)
+        np.testing.assert_allclose(log_j_i, 0.0, atol=1e-10)
+
+
+class TestArgAlphaBeta:
+    """Tests for :class:`ArgAlphaBetaReparameterisation`."""
+
+    prior_bounds = {"psi": [0.0, np.pi], "phase": [0.0, 2 * np.pi]}
+
+    def _reparam(self):
+        return ArgAlphaBetaReparameterisation(
+            parameters=["psi", "phase"], prior_bounds=self.prior_bounds
+        )
+
+    def test_init(self):
+        reparam = self._reparam()
+        assert reparam.parameters == ["psi", "phase"]
+        assert reparam.prime_parameters == ["arg_alpha", "arg_beta"]
+        np.testing.assert_allclose(reparam._log_j, np.log(2.0 / np.pi**2))
+
+    def test_bad_parameters(self):
+        with pytest.raises(RuntimeError, match="must act on"):
+            ArgAlphaBetaReparameterisation(
+                parameters=["phase"], prior_bounds={"phase": [0, 6.28]}
+            )
+
+    def test_reparameterise_values(self):
+        reparam = self._reparam()
+        n = 50
+        phase = np.random.uniform(0, 2 * np.pi, n)
+        psi = np.random.uniform(0, np.pi, n)
+        x = dict_to_live_points({"phase": phase, "psi": psi})
+        x_prime = empty_structured_array(n, names=["arg_alpha", "arg_beta"])
+        log_j = np.zeros(n)
+        _, x_prime, log_j = reparam.reparameterise(x, x_prime, log_j)
+
+        for name in ("arg_alpha", "arg_beta"):
+            assert np.all(x_prime[name] >= -1.0)
+            assert np.all(x_prime[name] < 1.0)
+        np.testing.assert_allclose(
+            (x_prime["arg_alpha"] + 1.0) * np.pi,
+            np.mod(phase - psi, 2 * np.pi),
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(
+            (x_prime["arg_beta"] + 1.0) * np.pi,
+            np.mod(phase + psi, 2 * np.pi),
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(log_j, np.log(2.0 / np.pi**2), atol=1e-12)
+
+    @pytest.mark.integration_test
+    def test_bijective_on_the_full_cell(self):
+        """Exact round-trip for every (psi in [0, pi), phase in [0, 2 pi))."""
+        reparam = self._reparam()
+        n = 2000
+        phase = np.random.uniform(0, 2 * np.pi, n)
+        psi = np.random.uniform(0, np.pi, n)
+        x = dict_to_live_points({"phase": phase, "psi": psi})
+        x_prime = empty_structured_array(n, names=["arg_alpha", "arg_beta"])
+        log_j = np.zeros(n)
+        x_f, x_prime_f, log_j_f = reparam.reparameterise(
+            x.copy(), x_prime.copy(), log_j.copy()
+        )
+        np.testing.assert_array_equal(x_f["phase"], phase)
+        x_in = x_f.copy()
+        x_in["phase"] = np.nan
+        x_in["psi"] = np.nan
+        x_i, _, log_j_i = reparam.inverse_reparameterise(
+            x_in, x_prime_f.copy(), log_j_f.copy()
+        )
+        np.testing.assert_allclose(x_i["phase"], phase, atol=1e-8)
+        np.testing.assert_allclose(x_i["psi"], psi, atol=1e-8)
         np.testing.assert_allclose(log_j_i, 0.0, atol=1e-10)

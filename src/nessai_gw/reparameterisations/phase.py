@@ -216,6 +216,126 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         return x, x_prime, log_j - self._log_j
 
 
+class ArgAlphaBetaReparameterisation(Reparameterisation):
+    r"""Polarisation/phase block as the two circular-polarisation phases.
+
+    For the dominant (2, 2) mode the strain of a triangular detector in the
+    frozen long-wavelength limit is ``h = alpha Z(n) + beta conj(Z(n))`` with
+
+        alpha = c_+ e^{-2i psi} e^{2i phi_c} / d_L ,
+        beta  = c_- e^{+2i psi} e^{2i phi_c} / d_L ,
+
+    so the *phases* the extrinsic likelihood actually constrains are
+
+        arg(alpha) = 2 phi_c - 2 psi ,      arg(beta) = 2 phi_c + 2 psi .
+
+    Half of each -- ``(phase - psi)`` and ``(phase + psi)`` -- is a tight ridge
+    coordinate (folded circular std ~0.4-0.75 rad on the octomodal ET BNS
+    posterior, vs ~2.5 rad for ``delta_phase = phase + sign(cos theta_jn) psi``
+    and ~2.3 rad for bare ``psi``).  Putting *both* circular-polarisation phases
+    on the flow axes (rather than ``delta_phase`` + a separate broad ``psi``)
+    aligns the coordinate grid with the likelihood ridge -- a flow-fit study on
+    the folded octomodal posterior cut NLL by ~1 nat relative to the
+    equivalently-folded ``(psi, delta_phase)`` block, with ``(psi, phi_c)`` on
+    the axes ("Poincare" chart) giving no gain.
+
+    This reparameterisation replaces **both** the ``psi`` (``angle-pi`` /
+    ``SingleAngle``) and ``phase`` (``polarisation-phase``) flow coordinates with
+    the single bounded pair ::
+
+        arg_alpha = ((phase - psi)  mod 2*pi) / pi - 1   in [-1, 1)
+        arg_beta  = ((phase + psi)  mod 2*pi) / pi - 1   in [-1, 1)
+
+    On ``psi in [0, pi)``, ``phase in [0, 2*pi)`` this map is an exact
+    **bijection** (a shear + scale of the ``(psi, phase)`` fundamental cell onto
+    the ``[-1, 1)^2`` square), constant Jacobian
+    ``|d(arg_alpha, arg_beta) / d(psi, phase)| = 2 / pi**2``.  It does *not* fold
+    the ``phi_c -> phi_c + pi/2`` polarisation-quarter degeneracy -- that stays a
+    weight-learned factor of the group mixture
+    (:class:`~nessai_gw.group_mixture.TriangularDetectorGroupAction` with
+    ``polarisation_quarter=True``), on which the group acts here by half-integer
+    shifts of ``arg_alpha`` / ``arg_beta`` (and an ``alpha <-> beta`` swap under
+    the plane reflection).
+
+    Requires nothing beyond ``psi`` and ``phase`` themselves (independent of the
+    inclination, unlike ``polarisation-phase``).  The inverse returns the
+    representative with ``psi in [0, pi)``.
+
+    Parameters
+    ----------
+    parameters : list of str
+        Must be ``["psi", "phase"]`` (in any order).
+    prior_bounds : list or dict, optional
+        Unused -- the coordinates are always rescaled from ``[0, 2*pi)``.
+    prior : optional
+        Accepted for registry compatibility and ignored.
+    """
+
+    one_to_one = False
+
+    def __init__(
+        self,
+        parameters=None,
+        prior_bounds=None,
+        prior=None,
+        rng=None,
+        **kwargs,
+    ):
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        call = dict(parameters=parameters, prior_bounds=prior_bounds)
+        if "rng" in parent_params:
+            call["rng"] = rng
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
+
+        if set(self.parameters) != {"psi", "phase"}:
+            raise RuntimeError(
+                "ArgAlphaBetaReparameterisation must act on ['psi', 'phase']; "
+                f"got {self.parameters}"
+            )
+        # deterministic coordinate order regardless of the input order.  On
+        # 0.15.x ``parameters`` is a writable attribute; on newer nessai it is a
+        # read-only alias for ``input_parameters`` -- set whichever exists.
+        if isinstance(
+            getattr(type(self), "parameters", None), property
+        ):
+            self.input_parameters = ["psi", "phase"]
+        else:
+            self.parameters = ["psi", "phase"]
+        self.prime_parameters = ["arg_alpha", "arg_beta"]
+        if hasattr(self, "output_parameters"):
+            self.output_parameters = list(self.prime_parameters)
+        # 2 / pi**2 = (1/pi) * (1/pi) * |det [[-1, 1], [1, 1]]|
+        self._log_j = float(np.log(2.0) - 2.0 * np.log(np.pi))
+
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        psi = x["psi"]
+        phase = x["phase"]
+        au = np.mod(phase - psi, _TWO_PI)
+        av = np.mod(phase + psi, _TWO_PI)
+        x_prime[self.prime_parameters[0]] = au / np.pi - 1.0
+        x_prime[self.prime_parameters[1]] = av / np.pi - 1.0
+        return x, x_prime, log_j + self._log_j
+
+    def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
+        au = np.mod((x_prime[self.prime_parameters[0]] + 1.0) * np.pi, _TWO_PI)
+        av = np.mod((x_prime[self.prime_parameters[1]] + 1.0) * np.pi, _TWO_PI)
+        # au = phase - psi, av = phase + psi (both mod 2 pi).  psi is fixed mod
+        # pi; phase is fixed only mod pi, so pick the [0, 2 pi) branch that
+        # reproduces au.
+        psi = np.mod(0.5 * (av - au), np.pi)
+        phase = np.mod(0.5 * (av + au), np.pi)
+        e0 = np.cos(np.mod(phase - psi, _TWO_PI) - au)
+        e1 = np.cos(np.mod(phase + np.pi - psi, _TWO_PI) - au)
+        x["phase"] = np.where(e1 > e0, np.mod(phase + np.pi, _TWO_PI), phase)
+        x["psi"] = psi
+        return x, x_prime, log_j - self._log_j
+
+
 class SingleAngleReparameterisation(Reparameterisation):
     r"""Map one periodic angle to a single bounded coordinate -- no radius.
 

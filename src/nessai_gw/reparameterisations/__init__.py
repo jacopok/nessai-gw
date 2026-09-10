@@ -9,6 +9,7 @@ from nessai.reparameterisations import (
 
 from .distance import DistanceReparameterisation
 from .phase import (
+    ArgAlphaBetaReparameterisation,
     DeltaPhaseReparameterisation,
     PolarisationPhaseReparameterisation,
     SingleAngleReparameterisation,
@@ -76,6 +77,11 @@ known_reparameterisations.add_reparameterisation(
     "polarisation-phase",
     PolarisationPhaseReparameterisation,
     {"scale": 1.0},
+)
+known_reparameterisations.add_reparameterisation(
+    "arg-alpha-beta",
+    ArgAlphaBetaReparameterisation,
+    {},
 )
 
 known_reparameterisations.add_reparameterisation(
