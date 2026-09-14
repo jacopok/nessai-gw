@@ -8,9 +8,11 @@ from nessai.reparameterisations import (
 )
 
 from .distance import DistanceReparameterisation
+from .inclination import PolarisationEllipseReparameterisation
 from .phase import (
     ArgAlphaBetaReparameterisation,
     DeltaPhaseReparameterisation,
+    FittedPhaseRotation,
     PolarisationPhaseReparameterisation,
     SingleAngleReparameterisation,
 )
@@ -82,6 +84,27 @@ known_reparameterisations.add_reparameterisation(
     "arg-alpha-beta",
     ArgAlphaBetaReparameterisation,
     {},
+)
+known_reparameterisations.add_reparameterisation(
+    "single-angle",
+    SingleAngleReparameterisation,
+    {"scale": 2.0},
+)
+known_reparameterisations.add_reparameterisation(
+    "fitted-phase-rotation",
+    FittedPhaseRotation,
+    {"angle": 0.0, "psi0": 0.0, "phase0": 0.0},
+)
+
+known_reparameterisations.add_reparameterisation(
+    "polarisation-ellipse",
+    PolarisationEllipseReparameterisation,
+    {"scale": 1.0, "adaptive_width": False},
+)
+known_reparameterisations.add_reparameterisation(
+    "polarization-ellipse",
+    PolarisationEllipseReparameterisation,
+    {"scale": 1.0, "adaptive_width": False},
 )
 
 known_reparameterisations.add_reparameterisation(

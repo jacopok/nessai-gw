@@ -355,6 +355,23 @@ class TriangularDetectorGroupAction:
         per-element weights from data and importance sampling corrects the
         residual, so nothing here needs it to be exact.  Default ``False``
         (the long-wavelength-exact 8-element group).
+    polarisation_offset : float, optional
+        Only used with ``polarisation_quarter``.  The canonical-point test in
+        :meth:`in_fundamental_domain` picks the image with
+        ``psi mod pi < pi/2`` -- an arbitrary seam, exactly like the sky's Z4
+        wedge boundary that :func:`recommended_sky_azimuth_offset` /
+        ``azimuth_offset`` exist to move.  If a run's actual ``psi`` posterior
+        straddles that seam (its bulk sits near ``0`` or ``pi/2``), points on
+        either side fold to *different* ``phase_step`` images even though
+        they are the same continuous population -- an apparent bimodal
+        ``(psi, phase)`` split that is really just the arbitrary zero-point
+        cutting through the peak, not a second solution.  This shifts the
+        seam: the test becomes
+        ``(psi - polarisation_offset) mod pi < pi/2``.  Use
+        :func:`recommended_polarisation_offset` on a localised run's ``psi``
+        to pick it, then retrain from scratch (like ``azimuth_offset``, this
+        only changes which orbit representative is canonical -- the group
+        action on the physical parameters is unchanged).  Default ``0.0``.
     """
 
     parameters = TRIANGULAR_DETECTOR_PARAMETERS
@@ -368,8 +385,12 @@ class TriangularDetectorGroupAction:
         phase_reflection=False,
         azimuth_offset=0.0,
         polarisation_quarter=False,
+        polarisation_offset=0.0,
     ):
         self.reference_time = float(reference_time)
+        #: Shifts the psi-based seam ``in_fundamental_domain`` uses to pick
+        #: the canonical ``phase_step`` image; see the class docstring.
+        self.polarisation_offset = float(polarisation_offset)
         #: Fold the (2, 2)-mode polarisation/phase quarter turn
         #: ``{psi -> psi + pi/2, phase -> phase - pi/2}`` -- promotes the phase
         #: sector from a ``Z2`` (``phase -> phase + pi``, its square) to a
@@ -613,9 +634,13 @@ class TriangularDetectorGroupAction:
                 torch.remainder(point_dict["phase"], _TWO_PI) < np.pi
             )
         if self.polarisation_quarter:
-            # phase-sector Z4: also fold psi to [0, pi/2)
+            # phase-sector Z4: also fold (psi - polarisation_offset) to
+            # [0, pi/2) -- the offset moves this seam off the psi peak (see
+            # the class docstring / recommended_polarisation_offset).
             mask = mask & (
-                torch.remainder(point_dict["psi"], np.pi) < 0.5 * np.pi
+                torch.remainder(
+                    point_dict["psi"] - self.polarisation_offset, np.pi
+                ) < 0.5 * np.pi
             )
         return mask
 
@@ -734,10 +759,28 @@ class PrimeSpaceTriangularGroupAction:
     prime_names : list of str
         The flow's prime-parameter names, in order.  Re-bind after the proposal
         is initialised with :meth:`bind`.
+    ellipse : nessai_gw._ellipse.PolarisationEllipse, optional
+        Present when ``theta_jn`` uses the ``polarisation-ellipse``
+        reparameterisation, whose prime coordinate is the residual
+        ``(cos theta_jn - cos iota*(n)) / scale`` rather than the ``angle-sine``
+        coordinate.  The residual is still odd under the plane reflection and
+        invariant under the quarter turn, so the group action on it is
+        unchanged; the ellipse is needed only to recover
+        ``sign(cos theta_jn)`` for the ``delta_phase`` coordinate.
+    ellipse_scale : float, optional
+        The ``scale`` the reparameterisation was built with (default 1).
     """
 
-    def __init__(self, action, prime_names):
+    def __init__(self, action, prime_names, ellipse=None, ellipse_scale=1.0,
+                 ellipse_coordinate="angle"):
         self._action = action
+        # ``polarisation-ellipse``: the theta_jn prime is the residual
+        # ``cos theta_jn - cos iota*(n)``, so ``sign(cos theta_jn)`` -- which the
+        # delta_phase coordinate needs -- is no longer just ``-sign(u)``.  The
+        # ellipse recovers it from the (already decoded) sky.
+        self._ellipse = ellipse
+        self._ellipse_scale = float(ellipse_scale)
+        self._ellipse_coordinate = ellipse_coordinate
         # Flow sky coordinates are detector-frame (see RotatedAnglePair); the
         # decode/encode below work in equatorial coordinates, so rotate in and
         # out with the action's fixed sky-frame rotation.
@@ -902,7 +945,28 @@ class PrimeSpaceTriangularGroupAction:
         # a dummy.  ``sign(cos theta_jn) = -sign(u)`` is what the phase
         # coordinate needs.
         u_theta = point_dict[self._theta_jn]
-        sign_ct = -torch.sign(u_theta)
+        if self._ellipse is None:
+            sign_ct = -torch.sign(u_theta)
+        else:
+            # residual coordinate: cos theta_jn = scale * u + cos iota*(n)
+            cos_star = self._ellipse.cos_iota_torch(ra, sin_dec)
+            # heteroskedastic residual: the reparameterisation divides by
+            # s(|cos iota*|); undo it here so cos theta_jn -- and its sign --
+            # come back exact.  s == 1 unless adaptive_width fitted a width.
+            width = self._ellipse.residual_width_torch(
+                torch.abs(torch.clamp(cos_star, -1.0, 1.0))
+            )
+            if self._ellipse_coordinate == "cos":
+                cos_ct = self._ellipse_scale * width * u_theta + cos_star
+            else:
+                cos_ct = torch.cos(
+                    u_theta * (0.5 * np.pi * self._ellipse_scale) * width
+                    + torch.arccos(torch.clamp(cos_star, -1.0, 1.0))
+                )
+            sign_ct = torch.sign(cos_ct)
+            sign_ct = torch.where(
+                sign_ct == 0, torch.ones_like(sign_ct), sign_ct
+            )
         cos_theta_jn = torch.zeros_like(ra)
 
         # The flow carries the single coordinate
@@ -1430,6 +1494,10 @@ def triangular_group_reparameterisations(
     reference_time,
     vertex=None,
     phase_coordinates="polarisation-phase",
+    polarisation_ellipse=None,
+    polarisation_ellipse_scale=1.0,
+    polarisation_ellipse_coordinate="angle",
+    polarisation_ellipse_adaptive_width=False,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -1482,16 +1550,28 @@ def triangular_group_reparameterisations(
         Earth-fixed detector position (metres) for the ``detector-center-time``
         reparameterisation.  Defaults to :data:`ET_EMR_VERTEX`; pass the value
         from :func:`detector_vertex` for a different geometry.
-    phase_coordinates : {"polarisation-phase", "arg-alpha-beta"}, optional
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "independent"}, optional
         ``"polarisation-phase"`` (default): the single ``delta_phase`` coordinate
         described above, ``psi`` carried separately (``angle-pi`` /
         ``SingleAngle``).  ``"arg-alpha-beta"``: replace **both** ``psi`` and
         ``phase`` with the two circular-polarisation phases ``arg_alpha =
         (phase - psi)`` and ``arg_beta = (phase + psi)``
         (:class:`~nessai_gw.reparameterisations.phase.ArgAlphaBetaReparameterisation`),
-        which put the likelihood ridge on a flow axis.  Must match the
-        ``phase_coordinates`` passed to
-        :func:`make_triangular_group_flow_proposal`.
+        which put the likelihood ridge on a flow axis.  ``"independent"``:
+        ``psi`` and ``phase`` each on their own ``single-angle`` axis, no
+        mixing at all -- the right choice when a branch's discrete structure
+        sits entirely on one of the two (e.g. the ET-Delta plateau branch,
+        where ``phase`` is cleanly bimodal and ``psi`` is a plain, single-
+        valued spread; see :mod:`nessai_gw._polarisation_branch`'s module
+        docstring), so mixing them the way ``arg-alpha-beta`` does only smears
+        that bimodality diagonally across both flow axes instead of confining
+        it to one.  ``"independent"`` only works with ``prime_space=False``
+        (plain ``phase`` is not group-invariant the simple closed-form way
+        ``delta_phase`` is built to be, so :class:`PrimeSpaceTriangularGroupAction`
+        has no fast-path support for it -- passing it with ``prime_space=True``
+        fails loudly, "prime space is missing ... delta_phase", rather than
+        silently doing the wrong thing).  Must match the ``phase_coordinates``
+        passed to :func:`make_triangular_group_flow_proposal`.
 
     Returns
     -------
@@ -1500,10 +1580,10 @@ def triangular_group_reparameterisations(
     """
     if vertex is None:
         vertex = ET_EMR_VERTEX
-    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta"):
+    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
         raise ValueError(
-            "phase_coordinates must be 'polarisation-phase' or "
-            f"'arg-alpha-beta'; got {phase_coordinates!r}"
+            "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
+            f"or 'independent'; got {phase_coordinates!r}"
         )
 
     # ``polarisation-phase`` reads x-space ``psi`` and ``theta_jn`` on its
@@ -1516,9 +1596,18 @@ def triangular_group_reparameterisations(
     # ``phase`` / ``geocent_time`` first here.  ``psi`` (``angle-pi``) and the
     # sky ``AnglePair`` are added later by ``add_default_reparameterisations``
     # and so are always behind these.
+    # ``check_order`` walks the list in reverse for the inverse pass, so a
+    # reparameterisation must sort *ahead of* everything it consumes there.
+    # ``polarisation-phase`` reads ``psi`` and ``theta_jn``;
+    # ``detector-center-time`` and ``polarisation-ellipse`` read ``ra`` / ``dec``
+    # -- and ``polarisation-ellipse`` supplies the ``theta_jn`` that
+    # ``polarisation-phase`` needs, so it has to sit between the two.
+    _rank = {"phase": 0, "geocent_time": 0}
+    if polarisation_ellipse is not None:
+        _rank["geocent_time"] = 1
+        _rank["theta_jn"] = 1
     ordered_names = sorted(
-        sampling_parameters,
-        key=lambda n: 0 if n in ("phase", "geocent_time") else 1,
+        sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
     reps = {}
     for name in ordered_names:
@@ -1530,10 +1619,26 @@ def triangular_group_reparameterisations(
                 "update_bounds": False,
             }
         elif name == "theta_jn":
-            reps[name] = {
-                "reparameterisation": "angle-sine",
-                "update_bounds": False,
-            }
+            if polarisation_ellipse is not None:
+                # The sky position *forces* the inclination (the continuous
+                # frozen-limit degeneracy); sample the residual about it.  Still
+                # odd under the plane reflection and invariant under the quarter
+                # turn, so the group action on the coordinate is unchanged.
+                # ``ra`` / ``dec`` (sky-ra-dec) are prerequisites.
+                reps[name] = {
+                    "reparameterisation": "polarisation-ellipse",
+                    "ellipse": polarisation_ellipse,
+                    "coordinate": polarisation_ellipse_coordinate,
+                    "scale": float(polarisation_ellipse_scale),
+                    "adaptive_width": bool(
+                        polarisation_ellipse_adaptive_width
+                    ),
+                }
+            else:
+                reps[name] = {
+                    "reparameterisation": "angle-sine",
+                    "update_bounds": False,
+                }
         elif name == "geocent_time":
             # t_det = geocent_time + delay(ra, dec): the invariant
             # detector-centre arrival time.  ``ra`` / ``dec`` (sky-ra-dec) are
@@ -1553,6 +1658,11 @@ def triangular_group_reparameterisations(
                 # thread through verbatim -- keying by "phase" would make one of
                 # them append "phase" a second time.  Added after the loop.
                 continue
+            elif phase_coordinates == "independent":
+                # phase on its own single-angle axis, psi left to the default
+                # psi_single handling -- no mixing at all.  Only valid with
+                # prime_space=False; see this function's docstring.
+                reps[name] = {"reparameterisation": "single-angle", "scale": 2.0}
             else:
                 # delta_phase = phase + sign(cos theta_jn) * psi
                 # (polarisation-phase): makes the likelihood-constrained
@@ -1598,6 +1708,9 @@ _DUMMY_PRIOR_BOUNDS = {
 def _prime_parameter_names(
     sampling_parameters, reference_time, vertex=None, sky_2d=False,
     psi_single=False, phase_coordinates="polarisation-phase",
+    polarisation_ellipse=None, polarisation_ellipse_scale=1.0,
+    polarisation_ellipse_coordinate="angle",
+    polarisation_ellipse_adaptive_width=False,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -1643,6 +1756,10 @@ def _prime_parameter_names(
             reparameterisations=triangular_group_reparameterisations(
                 names, reference_time, vertex=vertex,
                 phase_coordinates=phase_coordinates,
+                polarisation_ellipse=polarisation_ellipse,
+                polarisation_ellipse_scale=polarisation_ellipse_scale,
+                polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
+                polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -1773,6 +1890,54 @@ def recommended_sky_azimuth_offset(action, ra, dec):
     }
 
 
+def recommended_polarisation_offset(psi):
+    """Fold ``psi`` to its canonical half and report where it sits.
+
+    The mirror of :func:`recommended_sky_azimuth_offset`, for the
+    ``polarisation_offset`` seam (see
+    :class:`TriangularDetectorGroupAction`'s docstring) instead of the sky's
+    Z4 wedge: with ``polarisation_quarter``, the two candidate ``psi``
+    images of any physical point are always exactly ``pi/2`` apart (mod
+    ``pi``), so folding ``psi`` to ``[0, pi/2)`` and checking its circular
+    concentration there works exactly like the sky case, one dimension down
+    (a Z2 rather than a Z4 division of the circle -- but the fold interval is
+    the same ``pi/2``, so the formulas match with ``4 psi_f`` in place of
+    ``4 lam_f``).
+
+    Returns a dict with the same four keys as
+    :func:`recommended_sky_azimuth_offset` (``concentration``,
+    ``circ_mean_lambda`` -- here the folded ``psi``'s circular mean --,
+    ``recommended_azimuth_offset`` -- here the recommended
+    ``polarisation_offset`` --, ``fraction_near_seam``, ``n``), so the two can
+    be inspected/reported the same way.
+
+    Parameters
+    ----------
+    psi : array_like
+        Live-point ``psi`` values (radians) -- from a canonically-folded,
+        reasonably localised run.  Pass a single branch's own ``psi`` (e.g.
+        via :func:`nessai_gw._polarisation_branch.diagonal_split_mask`) if
+        splitting into branches; the two branches can end up wanting
+        different offsets, exactly as they wanted different phase bases (see
+        :func:`nessai_gw._polarisation_branch.fit_phase_rotation`).
+    """
+    psi = np.asarray(psi, dtype=float)
+    psi_f = np.mod(psi, 0.5 * np.pi)
+    z = np.mean(np.exp(4j * psi_f))
+    circ_mean = np.mod(np.angle(z) / 4.0, 0.5 * np.pi)
+    return {
+        "concentration": float(np.abs(z)),
+        "circ_mean_lambda": float(circ_mean),
+        "recommended_azimuth_offset": float(
+            np.mod(circ_mean - 0.25 * np.pi, 0.5 * np.pi)
+        ),
+        "fraction_near_seam": float(
+            np.mean((psi_f < 0.15) | (psi_f > 0.5 * np.pi - 0.15))
+        ),
+        "n": int(psi.size),
+    }
+
+
 def make_triangular_group_flow_proposal(
     sampling_parameters,
     reference_time,
@@ -1788,6 +1953,7 @@ def make_triangular_group_flow_proposal(
     sky_pullback=None,
     psi_single=True,
     polarisation_quarter=True,
+    polarisation_offset=0.0,
     phase_coordinates="polarisation-phase",
     n_clusters_max=1,
     cluster_method="gmm",
@@ -1797,6 +1963,10 @@ def make_triangular_group_flow_proposal(
     cluster_k_grow_patience=2,
     cluster_centroid_ema=None,
     flow_model_factory=None,
+    polarisation_ellipse=None,
+    polarisation_ellipse_scale=1.0,
+    polarisation_ellipse_coordinate="angle",
+    polarisation_ellipse_adaptive_width=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -1897,7 +2067,18 @@ def make_triangular_group_flow_proposal(
         ``phase_reflection``).  This makes ``psi_prime`` unimodal in the base
         frame -- the ``{psi -> psi + pi/2}`` degeneracy is otherwise left for
         the base flow to model as a second mode.  Default ``True``.
-    phase_coordinates : {"polarisation-phase", "arg-alpha-beta"}, optional
+    polarisation_offset : float, optional
+        Only used with ``polarisation_quarter``.  See
+        :class:`TriangularDetectorGroupAction`'s docstring -- the ``psi``
+        seam the canonical-point test uses (``psi mod pi < pi/2``) is
+        arbitrary, exactly like the sky's Z4 wedge boundary
+        ``azimuth_offset`` exists to move; if the run's actual ``psi``
+        posterior straddles it, points fold to different ``phase_step``
+        images and the ``(psi, phase)`` corner looks like two offset ridges
+        rather than one.  Use :func:`recommended_polarisation_offset` on a
+        localised run's ``psi`` (per branch, if splitting) to pick it, then
+        retrain from scratch.  Default ``0.0``.
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "independent"}, optional
         ``"polarisation-phase"`` (default): ``delta_phase = phase + sign(cos
         theta_jn) psi`` + a separate ``psi`` coordinate.  ``"arg-alpha-beta"``:
         carry both circular-polarisation phases ``arg_alpha = (phase - psi)``
@@ -1906,7 +2087,15 @@ def make_triangular_group_flow_proposal(
         NLL by ~1 nat over the equivalently-grouped ``delta_phase`` block.  The
         polarisation-quarter Z4 still acts on ``(arg_alpha, arg_beta)`` and is
         kept as a weight-learned group factor -- keep ``polarisation_quarter``
-        as you would otherwise.  Must match the ``phase_coordinates`` passed to
+        as you would otherwise.  ``"independent"``: no mixing at all, ``psi``
+        and ``phase`` each on their own axis -- for a branch whose discrete
+        structure sits entirely on ``phase`` (mixing in ``psi`` only smears it
+        diagonally across two axes instead of confining it to one; see
+        :mod:`nessai_gw._polarisation_branch`).  Requires
+        ``prime_space=False`` -- raises during proposal construction otherwise
+        (:class:`PrimeSpaceTriangularGroupAction` has no fast-path support for
+        a bare, non-group-invariant ``phase``).  Must match the
+        ``phase_coordinates`` passed to
         :func:`triangular_group_reparameterisations`.
     n_clusters_max : int
         If ``> 1``, use a *clustered* base flow: up to ``n_clusters_max``
@@ -1929,6 +2118,34 @@ def make_triangular_group_flow_proposal(
         on all live points, blended into the mixture at ``k >= 2`` so the
         density never craters where the per-cluster experts leave off).  ``0``
         (default) -> no background expert.
+    polarisation_ellipse : nessai_gw._ellipse.PolarisationEllipse, optional
+        Sample the inclination *relative to the value the sky position forces*
+        (the ``polarisation-ellipse`` reparameterisation) instead of with
+        ``angle-sine``.  ``G_8`` is only a discrete subgroup of a degeneracy
+        that is continuous over the whole sky: fixing the sky fixes the
+        polarisation ellipse, so the folded posterior is still a curved sheet
+        ``cos theta_jn ~ cos iota*(n)`` and the ``theta_jn`` prime coordinate
+        comes out flat-topped or bimodal.  Subtracting the lock makes it a
+        single unimodal residual.  Measured on the ET-Delta v70 nested samples,
+        through the multimodal middle of the run (``-lnX`` 30-50) this takes
+        the folded ``theta_jn_prime`` excess kurtosis from about ``-1.2`` to
+        about ``0`` and the nearest-neighbour ``KL(p || Gaussian)`` of the
+        folded 11-dimensional live-point set down by 0.04-0.43 nats out of
+        1.6-4.6.  Needs a fiducial signal (typically the maximum-likelihood
+        point), so it is opt-in; ``None`` (the default) keeps ``angle-sine``.
+    polarisation_ellipse_coordinate : {"angle", "cos"}, optional
+        Whether the residual is taken in ``theta_jn`` or in ``cos theta_jn``;
+        see :class:`~nessai_gw.reparameterisations.PolarisationEllipseReparameterisation`.
+        ``"angle"`` (the default) keeps ``angle-sine``'s constant Jacobian and
+        its smooth prime-space prior, which matters early in a run before the
+        likelihood has locked the sheet.
+    polarisation_ellipse_scale : float, optional
+        Prime-space scale of that coordinate (default 1).
+    polarisation_ellipse_adaptive_width : bool, optional
+        Pass ``adaptive_width=True`` to the ``polarisation-ellipse``
+        reparameterisation: the residual is divided by a fitted sky-dependent
+        width so the flow coordinate is homoskedastic (the plain residual fans
+        out towards the face-on points).  Default ``False``.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -1999,10 +2216,17 @@ def make_triangular_group_flow_proposal(
             "sky_2d needs gaussianise_sky (the SkyOctantProbit canonical "
             "transform turns the folded equal-area sub-square into N(0, 1))."
         )
-    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta"):
+    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
         raise ValueError(
-            "phase_coordinates must be 'polarisation-phase' or "
-            f"'arg-alpha-beta'; got {phase_coordinates!r}"
+            "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
+            f"or 'independent'; got {phase_coordinates!r}"
+        )
+    if phase_coordinates == "independent" and prime_space:
+        raise RuntimeError(
+            "phase_coordinates='independent' needs prime_space=False -- plain "
+            "phase is not group-invariant the closed-form way delta_phase is, "
+            "so PrimeSpaceTriangularGroupAction has no fast-path support for "
+            "it."
         )
     if sky_pullback is not None:
         if not sky_2d:
@@ -2034,14 +2258,23 @@ def make_triangular_group_flow_proposal(
         phase_reflection=phase_reflection,
         azimuth_offset=azimuth_offset,
         polarisation_quarter=polarisation_quarter,
+        polarisation_offset=polarisation_offset,
     )
 
     if prime_space:
         prime_names = _prime_parameter_names(
             names, reference_time, vertex=vertex, sky_2d=sky_2d,
             psi_single=psi_single, phase_coordinates=phase_coordinates,
+            polarisation_ellipse=polarisation_ellipse,
+            polarisation_ellipse_scale=polarisation_ellipse_scale,
+            polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
+            polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
         )
-        action = PrimeSpaceTriangularGroupAction(base_action, prime_names)
+        action = PrimeSpaceTriangularGroupAction(
+            base_action, prime_names, ellipse=polarisation_ellipse,
+            ellipse_scale=polarisation_ellipse_scale,
+            ellipse_coordinate=polarisation_ellipse_coordinate,
+        )
         gm_kwargs = {}
         import inspect as _inspect
 
@@ -2218,6 +2451,30 @@ def make_triangular_group_flow_proposal(
                     )
             except Exception as exc:  # pragma: no cover - diagnostic only
                 logger.debug("sky azimuth diagnostic failed: %s", exc)
+            try:
+                names = getattr(getattr(x, "dtype", None), "names", None) or ()
+                if base_action.polarisation_quarter and "psi" in names:
+                    d = recommended_polarisation_offset(x["psi"])
+                    logger.debug(
+                        "[polarisation] folded-psi concentration %.3f, "
+                        "circ-mean %.3f rad; current polarisation_offset "
+                        "%.4f, recommended extra offset %.4f rad (%.1f deg); "
+                        "%.1f%% of points near the psi seam. %s",
+                        d["concentration"],
+                        d["circ_mean_lambda"],
+                        base_action.polarisation_offset,
+                        d["recommended_azimuth_offset"],
+                        np.degrees(d["recommended_azimuth_offset"]),
+                        100 * d["fraction_near_seam"],
+                        (
+                            "Well localised -- a recentre + full retrain is "
+                            "worthwhile."
+                            if d["concentration"] > 0.5
+                            else "Not localised enough to recentre yet."
+                        ),
+                    )
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                logger.debug("polarisation offset diagnostic failed: %s", exc)
             return out
 
     # nessai checkpoints the sampler (hence the proposal *instance*) with
@@ -2273,6 +2530,7 @@ class ETTriangleGroupAction(TriangularDetectorGroupAction):
         phase_reflection=False,
         azimuth_offset=0.0,
         polarisation_quarter=False,
+        polarisation_offset=0.0,
     ):
         super().__init__(
             reference_time,
@@ -2283,6 +2541,7 @@ class ETTriangleGroupAction(TriangularDetectorGroupAction):
             phase_reflection=phase_reflection,
             azimuth_offset=azimuth_offset,
             polarisation_quarter=polarisation_quarter,
+            polarisation_offset=polarisation_offset,
         )
 
 
@@ -2322,6 +2581,7 @@ def make_et_group_flow_proposal(
     sky_pullback=None,
     psi_single=True,
     polarisation_quarter=True,
+    polarisation_offset=0.0,
     phase_coordinates="polarisation-phase",
     n_clusters_max=1,
     cluster_method="gmm",
@@ -2331,6 +2591,10 @@ def make_et_group_flow_proposal(
     cluster_k_grow_patience=2,
     cluster_centroid_ema=None,
     flow_model_factory=None,
+    polarisation_ellipse=None,
+    polarisation_ellipse_scale=1.0,
+    polarisation_ellipse_coordinate="angle",
+    polarisation_ellipse_adaptive_width=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -2350,6 +2614,7 @@ def make_et_group_flow_proposal(
         sky_pullback=sky_pullback,
         psi_single=psi_single,
         polarisation_quarter=polarisation_quarter,
+        polarisation_offset=polarisation_offset,
         phase_coordinates=phase_coordinates,
         n_clusters_max=n_clusters_max,
         cluster_method=cluster_method,
@@ -2359,4 +2624,8 @@ def make_et_group_flow_proposal(
         cluster_k_grow_patience=cluster_k_grow_patience,
         cluster_centroid_ema=cluster_centroid_ema,
         flow_model_factory=flow_model_factory,
+        polarisation_ellipse=polarisation_ellipse,
+        polarisation_ellipse_scale=polarisation_ellipse_scale,
+        polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
+        polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
     )

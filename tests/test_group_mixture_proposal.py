@@ -16,6 +16,7 @@ from nessai_gw.group_mixture import (  # noqa: E402
     PrimeSpaceTriangularGroupAction,
     TriangularDetectorGroupAction,
     _prime_parameter_names,
+    recommended_polarisation_offset,
     recommended_sky_azimuth_offset,
     triangular_group_reparameterisations,
     make_et_group_flow_proposal,
@@ -422,6 +423,34 @@ def test_triangular_group_reparameterisations_bad_phase_coordinates():
         )
 
 
+def test_triangular_group_reparameterisations_independent():
+    reps = triangular_group_reparameterisations(
+        BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="independent"
+    )
+    assert reps["phase"] == {"reparameterisation": "single-angle", "scale": 2.0}
+    # psi is untouched here -- left to the default psi_single handling
+    assert "psi" not in reps
+    assert "arg-alpha-beta" not in reps
+
+
+@requires_group_mixture
+def test_make_et_group_flow_proposal_independent_needs_physical_space():
+    with pytest.raises(RuntimeError, match="prime_space=False"):
+        make_et_group_flow_proposal(
+            BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="independent",
+            prime_space=True,
+        )
+
+
+@requires_group_mixture
+def test_make_et_group_flow_proposal_independent_physical_space_builds():
+    cls = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="independent",
+        prime_space=False,
+    )
+    assert cls is not None
+
+
 def test_prime_parameter_names_arg_alpha_beta():
     prime = _prime_parameter_names(
         BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="arg-alpha-beta"
@@ -672,6 +701,70 @@ def test_recommended_sky_azimuth_offset_centres_the_wedge():
     d1 = recommended_sky_azimuth_offset(a1, ra, dec)
     assert d1["circ_mean_lambda"] == pytest.approx(np.pi / 4, abs=0.02)
     assert d1["recommended_azimuth_offset"] == pytest.approx(0.0, abs=0.02)
+
+
+def test_recommended_polarisation_offset_centres_the_seam():
+    """A psi blob straddling the pi/2 seam: the recommended offset moves its
+    folded circular mean to pi/4, and re-measuring confirms it."""
+    rng = np.random.default_rng(1)
+    # centred near the pi/2 seam itself -- the worst case for the default
+    # (unshifted) fold, exactly what motivates this offset.
+    psi = np.mod(rng.normal(0.5 * np.pi, 0.08, 4000), np.pi)
+    d0 = recommended_polarisation_offset(psi)
+    assert d0["concentration"] > 0.8
+    offset = d0["recommended_azimuth_offset"]
+    psi_shifted = np.mod(psi - offset, np.pi)
+    d1 = recommended_polarisation_offset(psi_shifted)
+    assert d1["circ_mean_lambda"] == pytest.approx(np.pi / 4, abs=0.02)
+    assert d1["recommended_azimuth_offset"] == pytest.approx(0.0, abs=0.02)
+
+
+def test_recommended_polarisation_offset_low_concentration_when_spread_out():
+    rng = np.random.default_rng(2)
+    psi = rng.uniform(0, np.pi, 4000)
+    d = recommended_polarisation_offset(psi)
+    assert d["concentration"] < 0.2
+
+
+def test_polarisation_offset_moves_the_seam_not_the_group_action():
+    """Every physical point still has exactly one canonical image among the
+    32, for any polarisation_offset -- the offset only relabels which image
+    that is, it must not break exclusivity/coverage of the fold."""
+    rng = np.random.default_rng(3)
+    n = 500
+    ra = torch.as_tensor(rng.uniform(0, 2 * np.pi, n))
+    dec = torch.asin(torch.as_tensor(rng.uniform(-1, 1, n)))
+    psi = torch.as_tensor(rng.uniform(0, np.pi, n))
+    cos_theta_jn = torch.as_tensor(rng.uniform(-1, 1, n))
+    phase = torch.as_tensor(rng.uniform(0, 2 * np.pi, n))
+    point = dict(ra=ra, sin_dec=torch.sin(dec), psi=psi,
+                cos_theta_jn=cos_theta_jn, phase=phase)
+
+    for offset in (0.0, 0.4, -0.9, np.pi / 2, 2.3):
+        action = ETTriangleGroupAction(
+            reference_time=REFERENCE_TIME, polarisation_quarter=True,
+            polarisation_offset=offset,
+        )
+        seen = torch.zeros(n, dtype=torch.bool)
+        for g in range(action.group_size):
+            modes = torch.full((n,), g, dtype=torch.long)
+            image = action(point, modes)
+            canon = action.in_fundamental_domain(image)
+            # exactly one image per point should be canonical
+            assert not torch.any(canon & seen), offset
+            seen |= canon
+        assert torch.all(seen), offset
+
+
+def test_polarisation_offset_default_matches_unshifted_behaviour():
+    action0 = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, polarisation_quarter=True,
+    )
+    action1 = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, polarisation_quarter=True,
+        polarisation_offset=0.0,
+    )
+    assert action0.polarisation_offset == action1.polarisation_offset == 0.0
 
 
 @requires_group_mixture
@@ -1272,3 +1365,172 @@ def test_make_et_group_flow_proposal_clustered():
     assert fm.min_cluster_size == 150
     # group geometry unchanged
     assert fm.group_size == 32
+
+
+# ---------------------------------------------------------------------------
+# polarisation-ellipse inclination coordinate
+# ---------------------------------------------------------------------------
+ELLIPSE_FIDUCIAL = dict(ra=3.4462, dec=-0.4081, psi=1.57, theta_jn=0.3491)
+
+
+@pytest.fixture(scope="module")
+def ellipse():
+    from nessai_gw._ellipse import PolarisationEllipse
+    from nessai_gw.group_mixture import ET_EMR_PLANE_NORMAL
+
+    return PolarisationEllipse(
+        ET_EMR_PLANE_NORMAL, REFERENCE_TIME, ELLIPSE_FIDUCIAL
+    )
+
+
+def test_reparameterisations_use_the_ellipse_for_theta_jn(ellipse):
+    reps = triangular_group_reparameterisations(
+        BNS_PARAMETERS, REFERENCE_TIME, polarisation_ellipse=ellipse
+    )
+    assert reps["theta_jn"]["reparameterisation"] == "polarisation-ellipse"
+    assert reps["theta_jn"]["ellipse"] is ellipse
+    assert reps["theta_jn"]["adaptive_width"] is False
+    reps_w = triangular_group_reparameterisations(
+        BNS_PARAMETERS, REFERENCE_TIME, polarisation_ellipse=ellipse,
+        polarisation_ellipse_adaptive_width=True,
+    )
+    assert reps_w["theta_jn"]["adaptive_width"] is True
+    # theta_jn supplies what polarisation-phase consumes on the inverse, and
+    # consumes ra/dec itself, so it must sit between phase and the sky.
+    order = list(reps)
+    assert order.index("phase") < order.index("theta_jn")
+    assert order.index("theta_jn") < order.index("geocent_time")
+
+
+def test_reparameterisations_default_to_angle_sine():
+    reps = triangular_group_reparameterisations(BNS_PARAMETERS, REFERENCE_TIME)
+    assert reps["theta_jn"]["reparameterisation"] == "angle-sine"
+
+
+@pytest.mark.parametrize("coordinate", ["angle", "cos"])
+def test_prime_action_recovers_sign_cos_theta_jn(ellipse, coordinate):
+    """The fold needs sign(cos theta_jn); with a residual coordinate it can no
+    longer read it off the sign of the prime, so the ellipse must supply it."""
+    action = PrimeSpaceTriangularGroupAction(
+        ETTriangleGroupAction(reference_time=REFERENCE_TIME),
+        PRIME_NAMES,
+        ellipse=ellipse,
+        ellipse_coordinate=coordinate,
+    )
+    rng = np.random.default_rng(11)
+    n = 3000
+    ra = rng.uniform(0, 2 * np.pi, n)
+    dec = np.arcsin(rng.uniform(-1, 1, n))
+    theta_jn = np.arccos(rng.uniform(-1, 1, n))
+    centre = ellipse.cos_iota(ra, dec)
+    if coordinate == "cos":
+        prime = np.cos(theta_jn) - centre
+    else:
+        prime = (theta_jn - np.arccos(np.clip(centre, -1, 1))) * 2.0 / np.pi
+    cos_dec = np.cos(dec)
+    # the flow's sky coordinates are detector-frame (RotatedAnglePair), so feed
+    # v_det = R v_eq -- _decode rotates back with R^T.
+    v_eq = np.stack(
+        [cos_dec * np.cos(ra), cos_dec * np.sin(ra), np.sin(dec)], axis=-1
+    )
+    v_det = v_eq @ np.asarray(action._action.sky_frame_rotation).T
+    points = {
+        "ra_dec_x": torch.as_tensor(v_det[:, 0].copy()),
+        "ra_dec_y": torch.as_tensor(v_det[:, 1].copy()),
+        "ra_dec_z": torch.as_tensor(v_det[:, 2].copy()),
+        "psi_x": torch.as_tensor(np.cos(2.0 * rng.uniform(0, np.pi, n))),
+        "psi_y": torch.as_tensor(np.sin(2.0 * rng.uniform(0, np.pi, n))),
+        "delta_phase": torch.as_tensor(rng.uniform(-1.0, 1.0, n)),
+        "theta_jn_prime": torch.as_tensor(prime),
+        "t_det": torch.as_tensor(rng.uniform(-20, 20, n)),
+    }
+    _, aux = action._decode(points)
+    assert np.array_equal(
+        aux["sign_ct"].numpy(), np.sign(np.cos(theta_jn))
+    )
+
+
+@pytest.mark.parametrize("coordinate", ["angle", "cos"])
+def test_prime_action_sign_cos_theta_jn_with_adaptive_width(coordinate):
+    """Sign recovery must survive the heteroskedastic residual: _decode has to
+    undo the same s(|cos iota*|) the reparameterisation divided by."""
+    from nessai_gw._ellipse import PolarisationEllipse
+    from nessai_gw.group_mixture import ET_EMR_PLANE_NORMAL
+
+    e = PolarisationEllipse(
+        ET_EMR_PLANE_NORMAL, REFERENCE_TIME, ELLIPSE_FIDUCIAL
+    )
+    e.set_width([0.0, 0.2, 0.6, 1.0], [0.06, 0.09, 0.3, 0.55])
+    action = PrimeSpaceTriangularGroupAction(
+        ETTriangleGroupAction(reference_time=REFERENCE_TIME),
+        PRIME_NAMES, ellipse=e, ellipse_coordinate=coordinate,
+    )
+    rng = np.random.default_rng(11)
+    n = 3000
+    ra = rng.uniform(0, 2 * np.pi, n)
+    dec = np.arcsin(rng.uniform(-1, 1, n))
+    theta_jn = np.arccos(rng.uniform(-1, 1, n))
+    centre = e.cos_iota(ra, dec)
+    s = e.residual_width(np.abs(np.clip(centre, -1, 1)))
+    if coordinate == "cos":
+        prime = (np.cos(theta_jn) - centre) / s
+    else:
+        prime = (theta_jn - np.arccos(np.clip(centre, -1, 1))) * (2.0 / np.pi) / s
+    cos_dec = np.cos(dec)
+    v_eq = np.stack(
+        [cos_dec * np.cos(ra), cos_dec * np.sin(ra), np.sin(dec)], axis=-1
+    )
+    v_det = v_eq @ np.asarray(action._action.sky_frame_rotation).T
+    points = {
+        "ra_dec_x": torch.as_tensor(v_det[:, 0].copy()),
+        "ra_dec_y": torch.as_tensor(v_det[:, 1].copy()),
+        "ra_dec_z": torch.as_tensor(v_det[:, 2].copy()),
+        "psi_x": torch.as_tensor(np.cos(2.0 * rng.uniform(0, np.pi, n))),
+        "psi_y": torch.as_tensor(np.sin(2.0 * rng.uniform(0, np.pi, n))),
+        "delta_phase": torch.as_tensor(rng.uniform(-1.0, 1.0, n)),
+        "theta_jn_prime": torch.as_tensor(prime),
+        "t_det": torch.as_tensor(rng.uniform(-20, 20, n)),
+    }
+    _, aux = action._decode(points)
+    assert np.array_equal(
+        aux["sign_ct"].numpy(), np.sign(np.cos(theta_jn))
+    )
+
+
+@pytest.mark.parametrize("g", range(ETTriangleGroupAction.group_size))
+def test_prime_action_with_ellipse_width_round_trips(prime_points, g):
+    """The group action round-trips with a non-trivial residual width set."""
+    from nessai_gw._ellipse import PolarisationEllipse
+    from nessai_gw.group_mixture import ET_EMR_PLANE_NORMAL
+
+    e = PolarisationEllipse(
+        ET_EMR_PLANE_NORMAL, REFERENCE_TIME, ELLIPSE_FIDUCIAL
+    )
+    e.set_width([0.0, 0.2, 0.6, 1.0], [0.1, 0.14, 0.35, 0.6])
+    action = PrimeSpaceTriangularGroupAction(
+        ETTriangleGroupAction(reference_time=REFERENCE_TIME),
+        PRIME_NAMES, ellipse=e,
+    )
+    modes = torch.full(
+        (prime_points["t_det"].shape[0],), g, dtype=torch.long
+    )
+    moved = action(prime_points, modes)
+    back = action(moved, modes, inverse=True)
+    for name in PRIME_NAMES:
+        assert torch.allclose(back[name], prime_points[name], atol=1e-8), name
+
+
+@pytest.mark.parametrize("g", range(ETTriangleGroupAction.group_size))
+def test_prime_action_with_ellipse_round_trips(ellipse, prime_points, g):
+    action = PrimeSpaceTriangularGroupAction(
+        ETTriangleGroupAction(reference_time=REFERENCE_TIME),
+        PRIME_NAMES,
+        ellipse=ellipse,
+    )
+    modes = torch.full((prime_points["t_det"].shape[0],), g, dtype=torch.long)
+    moved = action(prime_points, modes)
+    back = action(moved, modes, inverse=True)
+    for name in PRIME_NAMES:
+        assert torch.allclose(
+            back[name], prime_points[name], atol=1e-8
+        ), name

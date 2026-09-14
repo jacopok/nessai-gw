@@ -336,6 +336,130 @@ class ArgAlphaBetaReparameterisation(Reparameterisation):
         return x, x_prime, log_j - self._log_j
 
 
+class FittedPhaseRotation(Reparameterisation):
+    r"""A fitted, branch-local rotation of ``(psi, phase)`` -- decorrelates
+    what :class:`ArgAlphaBetaReparameterisation`'s fixed 45-degree shear and
+    the identity (plain ``psi``, ``phase``) both leave correlated.
+
+    Neither of the two "natural" bases is generically the right one: the
+    correlation between the flow-facing coordinates ``ArgAlphaBetaReparameterisation``
+    builds is set by the *local* ratio ``c_-/c_+ = ((1-cos iota)/(1+cos
+    iota))**2``, which is small near circular polarisation and of order 1
+    near the plateau -- so the 45-degree shear undershoots the right angle
+    for one regime and overshoots it for the other, and plain ``(psi,
+    phase)`` (a 0-degree "rotation") fares no better.  Measured on the
+    ET-Delta v70 plateau/clump split
+    (:func:`nessai_gw._polarisation_branch.fit_distance_floor_split`): raw
+    ``corr(psi, phase)`` is -0.55 (plateau) and +0.76 (clump); a fixed
+    45-degree shear leaves correlations of 0.59 and 0.86 respectively.  The
+    angle that actually diagonalises each branch's covariance
+    (:func:`nessai_gw._polarisation_branch.fit_phase_rotation`) is 111
+    degrees for the plateau and 73 degrees for the clump -- neither the 0
+    nor the 45 built into the other two options, and different from each
+    other, which is why one fixed choice cannot serve both branches.
+
+    This applies that fitted rotation directly, about a fitted centre ::
+
+        p1 = (phase - phase0) cos(angle) - (psi - psi0) sin(angle)
+        p2 = (phase - phase0) sin(angle) + (psi - psi0) cos(angle)
+
+    A pure rotation (plus a constant shift) has unit Jacobian determinant, so
+    ``log_j`` is unchanged.  Unlike :class:`ArgAlphaBetaReparameterisation`
+    and :class:`SingleAngleReparameterisation`, ``p1``/``p2`` are **not**
+    wrapped to a period -- ``angle``, ``psi0``, ``phase0`` are fit once from a
+    single branch's own live points (via
+    :func:`~nessai_gw._polarisation_branch.fit_phase_rotation`), whose
+    ``(psi, phase)`` occupy a bounded sub-region that does not itself wrap, so
+    there is nothing to fold.  This is a *branch-local* coordinate: it is
+    only meaningful for live points already restricted to the branch it was
+    fit on (see the plateau/clump split), not as a global replacement for
+    ``ArgAlphaBetaReparameterisation``.
+
+    Diagonalising the covariance does **not** remove every feature of the
+    ``(psi, phase)`` corner: on both branches the rotated coordinates still
+    show two parallel, offset ridges rather than one blob (a real, roughly
+    ``phase -> phase + pi/2``-shaped discrete near-degeneracy this
+    reparameterisation was not built to fold) -- see the module docstring of
+    :mod:`nessai_gw._polarisation_branch`. Rotating removes the *correlation*
+    a suboptimal linear basis introduces; it does not fold an additional
+    discrete symmetry, which is a different problem.
+
+    Parameters
+    ----------
+    parameters : list of str
+        Must be ``["psi", "phase"]`` (in any order).
+    prior_bounds : list or dict, optional
+        Unused.
+    angle : float
+        Rotation angle in radians, e.g. from
+        :func:`~nessai_gw._polarisation_branch.fit_phase_rotation`.
+    psi0, phase0 : float
+        Centre the rotation is taken about (typically each branch's own
+        mean).
+    prior : optional
+        Accepted for registry compatibility and ignored.
+    """
+
+    one_to_one = False
+
+    def __init__(
+        self,
+        parameters=None,
+        prior_bounds=None,
+        angle=0.0,
+        psi0=0.0,
+        phase0=0.0,
+        prior=None,
+        rng=None,
+        **kwargs,
+    ):
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        call = dict(parameters=parameters, prior_bounds=prior_bounds)
+        if "rng" in parent_params:
+            call["rng"] = rng
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
+
+        if set(self.parameters) != {"psi", "phase"}:
+            raise RuntimeError(
+                "FittedPhaseRotation must act on ['psi', 'phase']; got "
+                f"{self.parameters}"
+            )
+        if isinstance(
+            getattr(type(self), "parameters", None), property
+        ):
+            self.input_parameters = ["psi", "phase"]
+        else:
+            self.parameters = ["psi", "phase"]
+        self.prime_parameters = ["phase_rot_1", "phase_rot_2"]
+        if hasattr(self, "output_parameters"):
+            self.output_parameters = list(self.prime_parameters)
+        self.angle = float(angle)
+        self.psi0 = float(psi0)
+        self.phase0 = float(phase0)
+        self._cos, self._sin = np.cos(self.angle), np.sin(self.angle)
+
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        dpsi = x["psi"] - self.psi0
+        dphase = x["phase"] - self.phase0
+        x_prime[self.prime_parameters[0]] = dphase * self._cos - dpsi * self._sin
+        x_prime[self.prime_parameters[1]] = dphase * self._sin + dpsi * self._cos
+        return x, x_prime, log_j
+
+    def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
+        p1 = x_prime[self.prime_parameters[0]]
+        p2 = x_prime[self.prime_parameters[1]]
+        dphase = p1 * self._cos + p2 * self._sin
+        dpsi = -p1 * self._sin + p2 * self._cos
+        x["phase"] = dphase + self.phase0
+        x["psi"] = dpsi + self.psi0
+        return x, x_prime, log_j
+
+
 class SingleAngleReparameterisation(Reparameterisation):
     r"""Map one periodic angle to a single bounded coordinate -- no radius.
 

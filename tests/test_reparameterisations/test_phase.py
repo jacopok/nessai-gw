@@ -11,6 +11,7 @@ from nessai.utils.testing import assert_structured_arrays_equal
 from nessai_gw.reparameterisations import (
     ArgAlphaBetaReparameterisation,
     DeltaPhaseReparameterisation,
+    FittedPhaseRotation,
     PolarisationPhaseReparameterisation,
 )
 
@@ -269,3 +270,88 @@ class TestArgAlphaBeta:
         np.testing.assert_allclose(x_i["phase"], phase, atol=1e-8)
         np.testing.assert_allclose(x_i["psi"], psi, atol=1e-8)
         np.testing.assert_allclose(log_j_i, 0.0, atol=1e-10)
+
+
+class TestFittedPhaseRotation:
+    """Tests for :class:`FittedPhaseRotation`."""
+
+    def _reparam(self, angle=0.3, psi0=0.5, phase0=1.2):
+        return FittedPhaseRotation(
+            parameters=["psi", "phase"], prior_bounds=None,
+            angle=angle, psi0=psi0, phase0=phase0,
+        )
+
+    def test_init(self):
+        reparam = self._reparam(angle=0.7, psi0=0.1, phase0=-0.2)
+        assert reparam.parameters == ["psi", "phase"]
+        assert reparam.prime_parameters == ["phase_rot_1", "phase_rot_2"]
+        assert reparam.angle == pytest.approx(0.7)
+        assert reparam.psi0 == pytest.approx(0.1)
+        assert reparam.phase0 == pytest.approx(-0.2)
+
+    def test_bad_parameters(self):
+        with pytest.raises(RuntimeError, match="must act on"):
+            FittedPhaseRotation(parameters=["phase"])
+
+    def test_zero_angle_is_a_plain_shift(self):
+        """angle=0 should reduce to p1=phase-phase0, p2=psi-psi0."""
+        reparam = self._reparam(angle=0.0, psi0=0.5, phase0=1.2)
+        n = 20
+        phase = np.random.uniform(0, 2 * np.pi, n)
+        psi = np.random.uniform(0, np.pi, n)
+        x = dict_to_live_points({"phase": phase, "psi": psi})
+        x_prime = empty_structured_array(n, names=["phase_rot_1", "phase_rot_2"])
+        log_j = np.zeros(n)
+        _, x_prime, log_j = reparam.reparameterise(x, x_prime, log_j)
+        np.testing.assert_allclose(x_prime["phase_rot_1"], phase - 1.2)
+        np.testing.assert_allclose(x_prime["phase_rot_2"], psi - 0.5)
+        np.testing.assert_allclose(log_j, 0.0)
+
+    def test_jacobian_is_unity(self):
+        """A pure rotation + shift has unit Jacobian regardless of angle."""
+        reparam = self._reparam(angle=1.234)
+        n = 10
+        x = dict_to_live_points({
+            "phase": np.random.uniform(0, 2 * np.pi, n),
+            "psi": np.random.uniform(0, np.pi, n),
+        })
+        x_prime = empty_structured_array(n, names=["phase_rot_1", "phase_rot_2"])
+        log_j_in = np.random.uniform(-1, 1, n)
+        _, _, log_j_out = reparam.reparameterise(x, x_prime, log_j_in.copy())
+        np.testing.assert_allclose(log_j_out, log_j_in)
+
+    @pytest.mark.parametrize("angle", [0.0, 0.7, -1.9, 3.0])
+    def test_round_trip(self, angle):
+        reparam = self._reparam(angle=angle)
+        n = 500
+        phase = np.random.uniform(0, 2 * np.pi, n)
+        psi = np.random.uniform(0, np.pi, n)
+        x = dict_to_live_points({"phase": phase, "psi": psi})
+        x_prime = empty_structured_array(n, names=["phase_rot_1", "phase_rot_2"])
+        log_j = np.zeros(n)
+        x_f, x_prime_f, log_j_f = reparam.reparameterise(
+            x.copy(), x_prime.copy(), log_j.copy()
+        )
+        x_in = x_f.copy()
+        x_in["phase"] = np.nan
+        x_in["psi"] = np.nan
+        x_i, _, log_j_i = reparam.inverse_reparameterise(
+            x_in, x_prime_f.copy(), log_j_f.copy()
+        )
+        np.testing.assert_allclose(x_i["phase"], phase, atol=1e-10)
+        np.testing.assert_allclose(x_i["psi"], psi, atol=1e-10)
+        np.testing.assert_allclose(log_j_i, 0.0, atol=1e-12)
+
+    def test_rotation_preserves_the_norm(self):
+        """A genuine rotation (about the fitted centre) preserves distances --
+        a cheap sanity check that it isn't secretly rescaling."""
+        reparam = self._reparam(angle=0.9, psi0=0.0, phase0=0.0)
+        n = 30
+        phase = np.random.uniform(-1, 1, n)
+        psi = np.random.uniform(-1, 1, n)
+        x = dict_to_live_points({"phase": phase, "psi": psi})
+        x_prime = empty_structured_array(n, names=["phase_rot_1", "phase_rot_2"])
+        _, x_prime, _ = reparam.reparameterise(x, x_prime, np.zeros(n))
+        r_before = np.hypot(phase, psi)
+        r_after = np.hypot(x_prime["phase_rot_1"], x_prime["phase_rot_2"])
+        np.testing.assert_allclose(r_after, r_before, atol=1e-10)
