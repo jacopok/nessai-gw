@@ -205,11 +205,26 @@ _DELTA_PHASE_SCALE = 1.0
 #: Tuned for an ET-scale site; a very different geometry may want it revisited.
 _GEOCENT_SCALE = 5e-3
 
-#: Floor for the group-mixture wrapper's per-element canonical std.  Lowered
-#: from nessai's ``1e-2`` default so a genuinely narrow prime dimension
-#: (``geocent_time``) is standardised by its real width, not the floor.
-#: Tuned for an ET-scale site; a very different geometry may want it revisited.
-_MIN_CANON_STD = 1e-3
+#: Pure numerical-safety floor on a single branch's *raw* measured
+#: canonical std (nessai's ``DiscreteGroupMixtureFlowWrapper`` clamps to
+#: this before anything else, purely to avoid a literal std of 0). The real
+#: defence against an over-narrow canonicalisation -- e.g. a genuinely
+#: narrow prime dimension like ``geocent_time`` -- is
+#: ``_CANON_STD_RATIO_CAP`` below, which is relative rather than absolute,
+#: so this no longer needs per-site tuning; it should stay far below any
+#: real posterior width.
+_MIN_CANON_STD = 1e-6
+
+#: Every group element (branch) of the flow's canonical mixture is a
+#: symmetric copy of the same mode, so its canonical std should agree with
+#: every other element's up to real per-branch heterogeneity. Each branch's
+#: std is clamped to within this factor of the cross-branch average rather
+#: than to a fixed absolute floor -- see the ``canon_std_ratio_cap``
+#: docstring in ``nessai.flowmodel.group_mixture.make_group_mixture_flow``.
+#: Tightened to 2 (from an initial 5) for the ET-Delta v43 run; revisit if
+#: the one-off "canonical std capped" warning fires persistently for a
+#: genuinely (not just transiently) asymmetric mode.
+_CANON_STD_RATIO_CAP = 2.0
 
 
 def detector_plane_normal(interferometers) -> np.ndarray:
@@ -2321,6 +2336,7 @@ def make_triangular_group_flow_proposal(
             prime_space_action=action,
             prime_space_in_domain=action.in_fundamental_domain,
             min_canon_std=_MIN_CANON_STD,
+            canon_std_ratio_cap=_CANON_STD_RATIO_CAP,
             **gm_kwargs,
         )
     else:
@@ -2339,6 +2355,7 @@ def make_triangular_group_flow_proposal(
             param_names=base_action.parameters,
             in_fundamental_domain=base_action.in_fundamental_domain,
             min_canon_std=_MIN_CANON_STD,
+            canon_std_ratio_cap=_CANON_STD_RATIO_CAP,
             **_extra,
         )
 
