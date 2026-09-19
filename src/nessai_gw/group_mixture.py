@@ -226,6 +226,14 @@ _MIN_CANON_STD = 1e-6
 #: genuinely (not just transiently) asymmetric mode.
 _CANON_STD_RATIO_CAP = 2.0
 
+#: Analogous cap on the canonical *mean*: each branch's mean is clamped to
+#: within this many cross-branch-average standard deviations of the
+#: cross-branch average mean -- see the ``canon_mean_offset_cap`` docstring
+#: in ``nessai.flowmodel.group_mixture.make_group_mixture_flow``. Set to 0
+#: for the ET-Delta v44 run to test forcing every branch to exactly share
+#: the cross-branch average mean (no per-branch mean offset at all).
+_CANON_MEAN_OFFSET_CAP = 0.0
+
 
 def detector_plane_normal(interferometers) -> np.ndarray:
     """Unit normal to the plane of a triangular interferometer.
@@ -2337,6 +2345,7 @@ def make_triangular_group_flow_proposal(
             prime_space_in_domain=action.in_fundamental_domain,
             min_canon_std=_MIN_CANON_STD,
             canon_std_ratio_cap=_CANON_STD_RATIO_CAP,
+            canon_mean_offset_cap=_CANON_MEAN_OFFSET_CAP,
             **gm_kwargs,
         )
     else:
@@ -2356,6 +2365,7 @@ def make_triangular_group_flow_proposal(
             in_fundamental_domain=base_action.in_fundamental_domain,
             min_canon_std=_MIN_CANON_STD,
             canon_std_ratio_cap=_CANON_STD_RATIO_CAP,
+            canon_mean_offset_cap=_CANON_MEAN_OFFSET_CAP,
             **_extra,
         )
 
