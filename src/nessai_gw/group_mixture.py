@@ -866,6 +866,23 @@ class PrimeSpaceTriangularGroupAction:
         if "arg_alpha" in names and "arg_beta" in names:
             self._arg_ab = ("arg_alpha", "arg_beta")
 
+        # arg-alpha-beta-locked: as arg-alpha-beta, but each phase measured
+        # relative to the sky-forced lock
+        # (LockedArgAlphaBetaReparameterisation).  Unlike the raw pair the
+        # residual is *not* shift-invariant under the phase-sector Z4 (the
+        # lock has no dependence on it at all, so the raw shift survives
+        # uncancelled) -- :meth:`_decode` / :meth:`_encode` recompute the lock
+        # at the pre- / post-fold sky position directly rather than assuming
+        # any shortcut, so this needs ``self._ellipse``.
+        self._arg_ab_locked = None
+        if "arg_alpha_lock" in names and "arg_beta_lock" in names:
+            self._arg_ab_locked = ("arg_alpha_lock", "arg_beta_lock")
+            if self._ellipse is None:
+                raise RuntimeError(
+                    "prime space has 'arg_alpha_lock'/'arg_beta_lock' but no "
+                    "`ellipse` was passed to PrimeSpaceTriangularGroupAction."
+                )
+
         # delta_phase: single linear polarisation-phase coordinate
         self._delta_phase = None
         for cand in ("delta_phase", "delta_phase_prime"):
@@ -891,7 +908,7 @@ class PrimeSpaceTriangularGroupAction:
         missing = []
         if self._sky is None and self._sky2d is None:
             missing.append("sky-ra-dec (ra_dec_x/_y/_z) or sky_u/sky_v")
-        if self._arg_ab is None:
+        if self._arg_ab is None and self._arg_ab_locked is None:
             if "psi" not in self._pair and not self._psi_single:
                 missing.append("psi (psi_x/_y or psi_prime)")
             if self._delta_phase is None:
@@ -962,6 +979,29 @@ class PrimeSpaceTriangularGroupAction:
                 e1 > e0, torch.remainder(ph0 + np.pi, _TWO_PI), ph0
             )
             r_psi = torch.ones_like(ra)
+        elif self._arg_ab_locked is not None:
+            # Add the sky-forced lock back (evaluated at the pre-fold sky
+            # position) to recover the raw arg_alpha / arg_beta, then invert
+            # exactly as the unlocked pair above.
+            lock_alpha, lock_beta = self._ellipse.arg_alpha_beta_torch(
+                ra, sin_dec
+            )
+            au = torch.remainder(
+                point_dict[self._arg_ab_locked[0]] * np.pi + lock_alpha,
+                _TWO_PI,
+            )
+            av = torch.remainder(
+                point_dict[self._arg_ab_locked[1]] * np.pi + lock_beta,
+                _TWO_PI,
+            )
+            psi = torch.remainder(0.5 * (av - au), np.pi)
+            ph0 = torch.remainder(0.5 * (av + au), np.pi)
+            e0 = torch.cos(torch.remainder(ph0 - psi, _TWO_PI) - au)
+            e1 = torch.cos(torch.remainder(ph0 + np.pi - psi, _TWO_PI) - au)
+            phase = torch.where(
+                e1 > e0, torch.remainder(ph0 + np.pi, _TWO_PI), ph0
+            )
+            r_psi = torch.ones_like(ra)
         elif self._psi_single:
             ang = point_dict["psi_prime"]
             psi = torch.remainder(
@@ -1010,7 +1050,7 @@ class PrimeSpaceTriangularGroupAction:
         # ``phase`` itself is group-invariant, so recover the invariant piece and
         # let :meth:`_encode` rebuild delta_phase from the group-transformed psi
         # and cos(theta_jn) sign.
-        if self._arg_ab is None:
+        if self._arg_ab is None and self._arg_ab_locked is None:
             delta_phase = torch.remainder(
                 (point_dict[self._delta_phase] + 1.0)
                 * np.pi
@@ -1064,7 +1104,7 @@ class PrimeSpaceTriangularGroupAction:
             out[sy] = r * dyf
             out[sz] = r * dzf
 
-        if self._arg_ab is not None:
+        if self._arg_ab is not None or self._arg_ab_locked is not None:
             pass  # psi is not a flow coordinate on this path
         elif self._psi_single:
             a = torch.remainder(
@@ -1087,6 +1127,25 @@ class PrimeSpaceTriangularGroupAction:
             av = torch.remainder(mapped["phase"] + mapped["psi"], _TWO_PI)
             out[self._arg_ab[0]] = au / np.pi - 1.0
             out[self._arg_ab[1]] = av / np.pi - 1.0
+            return {n: out[n] for n in self._prime_names}
+
+        if self._arg_ab_locked is not None:
+            # Re-derive the raw (post-fold) arg_alpha / arg_beta from the
+            # group-transformed (psi, phase) exactly as the unlocked pair
+            # does, then subtract the lock re-evaluated at the *post-fold*
+            # sky position -- recomputed directly rather than assumed
+            # invariant, since the residual is not shift-invariant under the
+            # phase-sector Z4 (see the class docstring in
+            # LockedArgAlphaBetaReparameterisation).
+            au = torch.remainder(mapped["phase"] - mapped["psi"], _TWO_PI)
+            av = torch.remainder(mapped["phase"] + mapped["psi"], _TWO_PI)
+            lock_alpha_t, lock_beta_t = self._ellipse.arg_alpha_beta_torch(
+                mapped["ra"], mapped["sin_dec"]
+            )
+            d_alpha = torch.remainder(au - lock_alpha_t + np.pi, _TWO_PI) - np.pi
+            d_beta = torch.remainder(av - lock_beta_t + np.pi, _TWO_PI) - np.pi
+            out[self._arg_ab_locked[0]] = d_alpha / np.pi
+            out[self._arg_ab_locked[1]] = d_beta / np.pi
             return {n: out[n] for n in self._prime_names}
 
         # delta_phase = phase_invariant + sign(cos theta_jn)_out * psi_out.
@@ -1137,11 +1196,13 @@ class PrimeSpaceTriangularGroupAction:
 
     def in_fundamental_domain(self, point_dict):
         acted, aux = self._decode(point_dict)
-        if self._arg_ab is not None:
+        if self._arg_ab is not None or self._arg_ab_locked is not None:
             # (arg_alpha, arg_beta) are a bijective image of (psi, phase), so the
             # base predicate's raw psi / phase cuts (psi in [0, pi/2), phase in
             # [0, pi)) are genuine half-plane cuts in (arg_alpha, arg_beta) and
-            # select exactly one image per orbit.
+            # select exactly one image per orbit.  The locked pair decodes to
+            # the same (psi, phase) via the lock-plus-residual reconstruction,
+            # so the predicate applies unchanged.
             return self._action.in_fundamental_domain(acted)
         if self._action.phase_reflection:
             # The base action folds the phase-reflection Z2 by testing
@@ -1533,6 +1594,8 @@ def triangular_group_reparameterisations(
     polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
+    polarisation_ellipse_lock_distance=False,
+    fiducial_distance=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -1585,14 +1648,20 @@ def triangular_group_reparameterisations(
         Earth-fixed detector position (metres) for the ``detector-center-time``
         reparameterisation.  Defaults to :data:`ET_EMR_VERTEX`; pass the value
         from :func:`detector_vertex` for a different geometry.
-    phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "independent"}, optional
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "arg-alpha-beta-locked", "independent"}, optional
         ``"polarisation-phase"`` (default): the single ``delta_phase`` coordinate
         described above, ``psi`` carried separately (``angle-pi`` /
         ``SingleAngle``).  ``"arg-alpha-beta"``: replace **both** ``psi`` and
         ``phase`` with the two circular-polarisation phases ``arg_alpha =
         (phase - psi)`` and ``arg_beta = (phase + psi)``
         (:class:`~nessai_gw.reparameterisations.phase.ArgAlphaBetaReparameterisation`),
-        which put the likelihood ridge on a flow axis.  ``"independent"``:
+        which put the likelihood ridge on a flow axis.
+        ``"arg-alpha-beta-locked"``: the same two phases, each further measured
+        relative to the sky-forced lock
+        (:class:`~nessai_gw.reparameterisations.phase.LockedArgAlphaBetaReparameterisation`,
+        the amplitude-block companion to ``polarisation_ellipse``'s
+        ``theta_jn`` lock; ``triangle_degeneracy/triangle_manifold_reparameterization.tex``).
+        Requires ``polarisation_ellipse``.  ``"independent"``:
         ``psi`` and ``phase`` each on their own ``single-angle`` axis, no
         mixing at all -- the right choice when a branch's discrete structure
         sits entirely on one of the two (e.g. the ET-Delta plateau branch,
@@ -1607,6 +1676,16 @@ def triangular_group_reparameterisations(
         fails loudly, "prime space is missing ... delta_phase", rather than
         silently doing the wrong thing).  Must match the ``phase_coordinates``
         passed to :func:`make_triangular_group_flow_proposal`.
+    polarisation_ellipse_lock_distance : bool, optional
+        Also lock ``luminosity_distance`` to the sky-forced ``d_L*(n)``
+        (:class:`~nessai_gw.reparameterisations.distance.PolarisationDistanceReparameterisation`),
+        the same treatment ``polarisation_ellipse`` already gives ``theta_jn``.
+        Requires ``polarisation_ellipse`` and ``fiducial_distance``. Default
+        ``False``.
+    fiducial_distance : float, optional
+        The fiducial signal's own distance, needed only when
+        ``polarisation_ellipse_lock_distance`` is set (the ellipse's
+        ``fiducial`` dict has no distance field of its own).
 
     Returns
     -------
@@ -1615,10 +1694,27 @@ def triangular_group_reparameterisations(
     """
     if vertex is None:
         vertex = ET_EMR_VERTEX
-    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
+    if phase_coordinates not in (
+        "polarisation-phase", "arg-alpha-beta", "arg-alpha-beta-locked",
+        "independent",
+    ):
         raise ValueError(
-            "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
-            f"or 'independent'; got {phase_coordinates!r}"
+            "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta', "
+            f"'arg-alpha-beta-locked' or 'independent'; got {phase_coordinates!r}"
+        )
+    if phase_coordinates == "arg-alpha-beta-locked" and polarisation_ellipse is None:
+        raise ValueError(
+            "phase_coordinates='arg-alpha-beta-locked' requires "
+            "polarisation_ellipse."
+        )
+    if polarisation_ellipse_lock_distance and polarisation_ellipse is None:
+        raise ValueError(
+            "polarisation_ellipse_lock_distance requires polarisation_ellipse."
+        )
+    if polarisation_ellipse_lock_distance and fiducial_distance is None:
+        raise ValueError(
+            "polarisation_ellipse_lock_distance requires fiducial_distance "
+            "(the fiducial signal's own distance)."
         )
 
     # ``polarisation-phase`` reads x-space ``psi`` and ``theta_jn`` on its
@@ -1641,6 +1737,8 @@ def triangular_group_reparameterisations(
     if polarisation_ellipse is not None:
         _rank["geocent_time"] = 1
         _rank["theta_jn"] = 1
+        if polarisation_ellipse_lock_distance:
+            _rank["luminosity_distance"] = 1
     ordered_names = sorted(
         sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
@@ -1684,8 +1782,21 @@ def triangular_group_reparameterisations(
                 "reference_time": float(reference_time),
                 "scale": _GEOCENT_SCALE,
             }
+        elif name == "luminosity_distance":
+            if polarisation_ellipse_lock_distance:
+                # The sky position also forces the distance (the same
+                # continuous degeneracy as the theta_jn lock); sample the
+                # residual about it.  Exactly invariant under the discrete
+                # group, so PrimeSpaceTriangularGroupAction needs no special
+                # handling -- see PolarisationDistanceReparameterisation.
+                reps[name] = {
+                    "reparameterisation": "polarisation-distance",
+                    "ellipse": polarisation_ellipse,
+                    "fiducial_distance": float(fiducial_distance),
+                }
+            # else: left to add_default_reparameterisations ("distance").
         elif name == "phase":
-            if phase_coordinates == "arg-alpha-beta":
+            if phase_coordinates in ("arg-alpha-beta", "arg-alpha-beta-locked"):
                 # arg_alpha = (phase - psi), arg_beta = (phase + psi): both
                 # circular-polarisation phases on the flow axes.  Keyed by the
                 # reparameterisation name (not "phase") with an explicit
@@ -1707,6 +1818,14 @@ def triangular_group_reparameterisations(
 
     if phase_coordinates == "arg-alpha-beta" and "phase" in sampling_parameters:
         reps["arg-alpha-beta"] = {"parameters": ["psi", "phase"]}
+    elif (
+        phase_coordinates == "arg-alpha-beta-locked"
+        and "phase" in sampling_parameters
+    ):
+        reps["arg-alpha-beta-locked"] = {
+            "parameters": ["psi", "phase"],
+            "ellipse": polarisation_ellipse,
+        }
     return reps
 
 
@@ -1746,6 +1865,8 @@ def _prime_parameter_names(
     polarisation_ellipse=None, polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
+    polarisation_ellipse_lock_distance=False,
+    fiducial_distance=None,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -1795,6 +1916,8 @@ def _prime_parameter_names(
                 polarisation_ellipse_scale=polarisation_ellipse_scale,
                 polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
                 polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
+                polarisation_ellipse_lock_distance=polarisation_ellipse_lock_distance,
+                fiducial_distance=fiducial_distance,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -1842,14 +1965,20 @@ def _prime_parameter_names(
                 # arg-alpha-beta consumes both psi and phase -> emit the pair
                 # here and skip psi below.
                 out += ["arg_alpha", "arg_beta"]
+            elif phase_coordinates == "arg-alpha-beta-locked":
+                out += ["arg_alpha_lock", "arg_beta_lock"]
             else:
                 # single ``delta_phase`` polarisation-phase coordinate
                 out.append("delta_phase")
-        elif name == "psi" and phase_coordinates == "arg-alpha-beta":
+        elif name == "psi" and phase_coordinates in (
+            "arg-alpha-beta", "arg-alpha-beta-locked",
+        ):
             continue  # folded into (arg_alpha, arg_beta)
         elif name == "geocent_time":
             # detector-center-time: single ``t_det`` coordinate (no suffix)
             out.append("t_det")
+        elif name == "luminosity_distance" and polarisation_ellipse_lock_distance:
+            out.append("distance_lock")
         elif name in _ANGLE_SCALE:
             out += (
                 [f"{name}_prime"]
@@ -2002,6 +2131,8 @@ def make_triangular_group_flow_proposal(
     polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
+    polarisation_ellipse_lock_distance=False,
+    fiducial_distance=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -2251,10 +2382,26 @@ def make_triangular_group_flow_proposal(
             "sky_2d needs gaussianise_sky (the SkyOctantProbit canonical "
             "transform turns the folded equal-area sub-square into N(0, 1))."
         )
-    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
+    if phase_coordinates not in (
+        "polarisation-phase", "arg-alpha-beta", "arg-alpha-beta-locked",
+        "independent",
+    ):
         raise ValueError(
-            "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
-            f"or 'independent'; got {phase_coordinates!r}"
+            "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta', "
+            f"'arg-alpha-beta-locked' or 'independent'; got {phase_coordinates!r}"
+        )
+    if phase_coordinates == "arg-alpha-beta-locked" and polarisation_ellipse is None:
+        raise ValueError(
+            "phase_coordinates='arg-alpha-beta-locked' requires "
+            "polarisation_ellipse."
+        )
+    if polarisation_ellipse_lock_distance and polarisation_ellipse is None:
+        raise ValueError(
+            "polarisation_ellipse_lock_distance requires polarisation_ellipse."
+        )
+    if polarisation_ellipse_lock_distance and fiducial_distance is None:
+        raise ValueError(
+            "polarisation_ellipse_lock_distance requires fiducial_distance."
         )
     if phase_coordinates == "independent" and prime_space:
         raise RuntimeError(
@@ -2304,6 +2451,8 @@ def make_triangular_group_flow_proposal(
             polarisation_ellipse_scale=polarisation_ellipse_scale,
             polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
             polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
+            polarisation_ellipse_lock_distance=polarisation_ellipse_lock_distance,
+            fiducial_distance=fiducial_distance,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -2652,6 +2801,8 @@ def make_et_group_flow_proposal(
     polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
+    polarisation_ellipse_lock_distance=False,
+    fiducial_distance=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -2685,4 +2836,6 @@ def make_et_group_flow_proposal(
         polarisation_ellipse_scale=polarisation_ellipse_scale,
         polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
         polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
+        polarisation_ellipse_lock_distance=polarisation_ellipse_lock_distance,
+        fiducial_distance=fiducial_distance,
     )

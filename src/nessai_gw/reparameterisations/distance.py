@@ -1,8 +1,11 @@
+import numpy as np
 from nessai.reparameterisations import (
+    Reparameterisation,
     RescaleToBounds,
 )
 
 from .. import nessai_logger
+from .._ellipse import PolarisationEllipse
 from .distance_converters import get_distance_converter
 
 logger = nessai_logger.getChild(__name__)
@@ -106,3 +109,137 @@ class DistanceReparameterisation(RescaleToBounds):
         self.detect_edges_kwargs["x_range"] = self.prior_bounds[
             self.parameters[0]
         ]
+
+
+class PolarisationDistanceReparameterisation(Reparameterisation):
+    r"""Distance measured relative to the value the sky position forces.
+
+    Companion to
+    :class:`~nessai_gw.reparameterisations.inclination.PolarisationEllipseReparameterisation`:
+    for a single triangular detector in the frozen long-wavelength limit,
+    solving for the two-complex-dimensional amplitude block at every sky
+    direction ``n`` against a fixed fiducial response also forces a distance
+    ``d_L*(n) = d_{L,0} \times`` :meth:`PolarisationEllipse.distance_scale`,
+    ``d_{L,0}`` the fiducial signal's own distance
+    (``triangle_degeneracy/triangle_manifold_reparameterization.tex``). This
+    reparameterisation makes it an axis::
+
+        distance_prime = ln(d_L) - ln(d_L*(n))
+
+    Unlike the inclination lock this residual needs no special handling in
+    :class:`~nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction`:
+    ``d_L*(n)`` is exactly invariant under the discrete group (a plane
+    reflection swaps ``alpha <-> beta``, which swaps the two terms of
+    ``sqrt|alpha| + sqrt|beta|`` and leaves it unchanged; a quarter turn
+    multiplies both by a unit-modulus phase), the group never touches
+    ``luminosity_distance`` at all, and so this coordinate is simply carried
+    through the fold unchanged, exactly like an ordinary z-scored parameter.
+
+    ``ra`` and ``dec`` are held fixed by this map, so the Jacobian is that of
+    ``d_L -> ln(d_L)`` alone::
+
+        log |d distance_prime / d d_L| = -log(d_L)
+
+    Requires ``ra`` and ``dec`` on both the forward and the inverse pass.
+
+    Parameters
+    ----------
+    parameters : Union[str, List[str]]
+        Name of the parameter; must be ``luminosity_distance``.
+    prior_bounds : Union[list, dict], optional
+        Unused -- the coordinate is a residual about a sky-dependent centre,
+        not a rescaling of the prior range.
+    ellipse : PolarisationEllipse
+        The sky -> amplitude-block map (shared with the theta_jn lock).
+    fiducial_distance : float
+        The fiducial signal's own ``d_L*(n_0) = d_{L,0}``: the ellipse's own
+        ``fiducial`` dict has no ``luminosity_distance`` field (solving for the
+        amplitude block is scale-invariant in the reference response), so this
+        calibration point has to be given separately.
+    plane_normal, reference_time, fiducial, azimuth_offset : optional
+        Forwarded to :class:`~nessai_gw._ellipse.PolarisationEllipse` when
+        ``ellipse`` is not given.
+    prior : optional
+        Accepted for registry compatibility and ignored.
+    """
+
+    one_to_one = False
+
+    def __init__(
+        self,
+        parameters=None,
+        prior_bounds=None,
+        ellipse=None,
+        plane_normal=None,
+        reference_time=None,
+        fiducial=None,
+        azimuth_offset=0.0,
+        fiducial_distance=None,
+        prior=None,
+        rng=None,
+        **kwargs,
+    ):
+        import inspect
+
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        call = dict(parameters=parameters, prior_bounds=prior_bounds)
+        if "rng" in parent_params:
+            call["rng"] = rng
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
+
+        if self.parameters != ["luminosity_distance"]:
+            raise RuntimeError(
+                "PolarisationDistanceReparameterisation must act on "
+                f"'luminosity_distance'; got {self.parameters}"
+            )
+        if ellipse is None:
+            if plane_normal is None or reference_time is None or fiducial is None:
+                raise ValueError(
+                    "PolarisationDistanceReparameterisation requires either "
+                    "`ellipse` or all of `plane_normal`, `reference_time` and "
+                    "`fiducial`."
+                )
+            ellipse = PolarisationEllipse(
+                plane_normal, reference_time, fiducial,
+                azimuth_offset=azimuth_offset,
+            )
+        self.ellipse = ellipse
+        if fiducial_distance is None:
+            raise ValueError(
+                "PolarisationDistanceReparameterisation requires "
+                "`fiducial_distance` (the fiducial signal's own distance)."
+            )
+        self.fiducial_distance = float(fiducial_distance)
+        self._log_fiducial_distance = float(np.log(self.fiducial_distance))
+
+        self.prime_parameters = ["distance_lock"]
+        if hasattr(self, "output_parameters"):
+            self.output_parameters = ["distance_lock"]
+        self.requires = ["ra", "dec"]
+        if hasattr(self, "inverse_input_parameters"):
+            self.inverse_input_parameters = list(
+                dict.fromkeys(
+                    list(self.inverse_input_parameters or []) + ["ra", "dec"]
+                )
+            )
+
+    def _log_dstar(self, x):
+        return self._log_fiducial_distance + np.log(
+            self.ellipse.distance_scale(x["ra"], x["dec"])
+        )
+
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        dl = x["luminosity_distance"]
+        x_prime[self.prime_parameters[0]] = np.log(dl) - self._log_dstar(x)
+        return x, x_prime, log_j - np.log(dl)
+
+    def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
+        u = x_prime[self.prime_parameters[0]]
+        log_dl = u + self._log_dstar(x)
+        x["luminosity_distance"] = np.exp(log_dl)
+        return x, x_prime, log_j + log_dl

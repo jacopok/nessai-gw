@@ -25,7 +25,7 @@ dependencies = [
     # TODO: bump once nessai ships nessai.flowmodel.group_mixture in a release;
     # nessai_gw.group_mixture's proposal factory needs it (imported lazily and
     # guarded until then).
-    "nessai>=0.14.0",
+    "nessai",
     "numpy",
     "scipy",
 ]

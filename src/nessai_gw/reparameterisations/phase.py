@@ -6,6 +6,7 @@ from nessai.reparameterisations import (
 )
 
 from .. import nessai_logger
+from .._ellipse import PolarisationEllipse
 
 logger = nessai_logger.getChild(__name__)
 
@@ -532,4 +533,158 @@ class SingleAngleReparameterisation(Reparameterisation):
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
         angle = np.mod((x_prime[self.prime_parameters[0]] + 1.0) * np.pi, _TWO_PI)
         x[self.parameters[0]] = np.mod(angle / self.scale, self._period)
+        return x, x_prime, log_j - self._log_j
+
+
+def _wrap_pi(x):
+    """Wrap to ``(-pi, pi]``."""
+    return np.mod(x + np.pi, _TWO_PI) - np.pi
+
+
+class LockedArgAlphaBetaReparameterisation(Reparameterisation):
+    r"""``arg_alpha`` / ``arg_beta`` measured relative to the sky-forced lock.
+
+    Companion to
+    :class:`~nessai_gw.reparameterisations.inclination.PolarisationEllipseReparameterisation`
+    (the ``theta_jn`` lock) and
+    :class:`~nessai_gw.reparameterisations.distance.PolarisationDistanceReparameterisation`
+    (the distance lock): fixing a fiducial response and solving for the
+    amplitude block at every sky direction ``n`` also forces the two
+    circular-polarisation phases ``arg_alpha, arg_beta`` (see
+    :class:`ArgAlphaBetaReparameterisation`) --
+    ``arg_alpha^*(n), arg_beta^*(n) = `` :meth:`PolarisationEllipse.arg_alpha`,
+    :meth:`~nessai_gw._ellipse.PolarisationEllipse.arg_beta`
+    (``triangle_degeneracy/triangle_manifold_reparameterization.tex``). This
+    reparameterisation makes both residuals axes::
+
+        arg_alpha_lock = wrap(arg_alpha - arg_alpha*(n)) / pi   in (-1, 1]
+        arg_beta_lock  = wrap(arg_beta  - arg_beta*(n))  / pi   in (-1, 1]
+
+    with ``arg_alpha = phase - psi``, ``arg_beta = phase + psi`` (both
+    ``mod 2*pi``) as in :class:`ArgAlphaBetaReparameterisation`, and ``wrap``
+    taking the representative in ``(-pi, pi]``. Locking only shifts the centre
+    of each coordinate, not the map's shape, so the Jacobian is exactly
+    :class:`ArgAlphaBetaReparameterisation`'s constant ``2 / pi**2``.
+
+    Under the discrete group (:mod:`nessai_gw.group_mixture`) both the raw
+    ``arg_alpha, arg_beta`` and the lock ``arg_alpha^*(n), arg_beta^*(n)`` are
+    built from the same physical response ``Z(n)``, so they transform
+    identically: a quarter turn shifts both equally (the shift cancels in the
+    residual) and a plane reflection swaps ``alpha <-> beta`` in both, so the
+    residual only swaps, never shifts.
+    :class:`~nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction` still
+    needs ``ra``, ``dec`` to add the lock back and recover the raw ``(psi,
+    phase)`` the physical group action itself acts on.
+
+    Requires ``ra`` and ``dec`` in addition to ``psi`` and ``phase``, on both
+    the forward and the inverse pass.
+
+    Parameters
+    ----------
+    parameters : list of str
+        Must be ``["psi", "phase"]`` (in any order).
+    prior_bounds : list or dict, optional
+        Unused.
+    ellipse : PolarisationEllipse
+        The sky -> amplitude-block map (shared with the theta_jn / distance
+        locks).
+    plane_normal, reference_time, fiducial, azimuth_offset : optional
+        Forwarded to :class:`~nessai_gw._ellipse.PolarisationEllipse` when
+        ``ellipse`` is not given.
+    prior : optional
+        Accepted for registry compatibility and ignored.
+    """
+
+    one_to_one = False
+
+    def __init__(
+        self,
+        parameters=None,
+        prior_bounds=None,
+        ellipse=None,
+        plane_normal=None,
+        reference_time=None,
+        fiducial=None,
+        azimuth_offset=0.0,
+        prior=None,
+        rng=None,
+        **kwargs,
+    ):
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        call = dict(parameters=parameters, prior_bounds=prior_bounds)
+        if "rng" in parent_params:
+            call["rng"] = rng
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
+
+        if set(self.parameters) != {"psi", "phase"}:
+            raise RuntimeError(
+                "LockedArgAlphaBetaReparameterisation must act on ['psi', "
+                f"'phase']; got {self.parameters}"
+            )
+        if isinstance(
+            getattr(type(self), "parameters", None), property
+        ):
+            self.input_parameters = ["psi", "phase"]
+        else:
+            self.parameters = ["psi", "phase"]
+
+        if ellipse is None:
+            if plane_normal is None or reference_time is None or fiducial is None:
+                raise ValueError(
+                    "LockedArgAlphaBetaReparameterisation requires either "
+                    "`ellipse` or all of `plane_normal`, `reference_time` and "
+                    "`fiducial`."
+                )
+            ellipse = PolarisationEllipse(
+                plane_normal, reference_time, fiducial,
+                azimuth_offset=azimuth_offset,
+            )
+        self.ellipse = ellipse
+
+        self.prime_parameters = ["arg_alpha_lock", "arg_beta_lock"]
+        if hasattr(self, "output_parameters"):
+            self.output_parameters = list(self.prime_parameters)
+        self.requires = ["ra", "dec"]
+        if hasattr(self, "inverse_input_parameters"):
+            self.inverse_input_parameters = list(
+                dict.fromkeys(
+                    list(self.inverse_input_parameters or []) + ["ra", "dec"]
+                )
+            )
+        # 2 / pi**2, identical to ArgAlphaBetaReparameterisation: locking only
+        # shifts the centre, not the map's Jacobian.
+        self._log_j = float(np.log(2.0) - 2.0 * np.log(np.pi))
+
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        psi, phase = x["psi"], x["phase"]
+        ra, dec = x["ra"], x["dec"]
+        raw_alpha = np.mod(phase - psi, _TWO_PI)
+        raw_beta = np.mod(phase + psi, _TWO_PI)
+        lock_alpha = self.ellipse.arg_alpha(ra, dec)
+        lock_beta = self.ellipse.arg_beta(ra, dec)
+        x_prime[self.prime_parameters[0]] = _wrap_pi(raw_alpha - lock_alpha) / np.pi
+        x_prime[self.prime_parameters[1]] = _wrap_pi(raw_beta - lock_beta) / np.pi
+        return x, x_prime, log_j + self._log_j
+
+    def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
+        ra, dec = x["ra"], x["dec"]
+        lock_alpha = self.ellipse.arg_alpha(ra, dec)
+        lock_beta = self.ellipse.arg_beta(ra, dec)
+        raw_alpha = np.mod(
+            x_prime[self.prime_parameters[0]] * np.pi + lock_alpha, _TWO_PI
+        )
+        raw_beta = np.mod(
+            x_prime[self.prime_parameters[1]] * np.pi + lock_beta, _TWO_PI
+        )
+        psi = np.mod(0.5 * (raw_beta - raw_alpha), np.pi)
+        phase = np.mod(0.5 * (raw_beta + raw_alpha), np.pi)
+        e0 = np.cos(np.mod(phase - psi, _TWO_PI) - raw_alpha)
+        e1 = np.cos(np.mod(phase + np.pi - psi, _TWO_PI) - raw_alpha)
+        x["phase"] = np.where(e1 > e0, np.mod(phase + np.pi, _TWO_PI), phase)
+        x["psi"] = psi
         return x, x_prime, log_j - self._log_j

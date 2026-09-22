@@ -205,6 +205,43 @@ class PolarisationEllipse:
 
     __call__ = cos_iota
 
+    def rss(self, ra, dec):
+        """``sqrt|alpha(n)| + sqrt|beta(n)|`` -- ``1/sqrt(d_L)`` up to the
+        fiducial's overall (irrelevant) amplitude scale."""
+        alpha, beta = self.coefficients(ra, dec)
+        return np.sqrt(np.abs(alpha)) + np.sqrt(np.abs(beta))
+
+    def distance_scale(self, ra, dec):
+        """``d_L*(n) / d_L*(n_0)``, ``n_0`` the fiducial sky position -- the
+        dimensionless ratio :func:`xg_inference.nessai_config
+        ._diagonal_split_from_injection`'s ``dstar`` also computes, exposed here
+        so a distance lock does not need its own copy. Multiply by a known
+        ``d_L*(n_0)`` (e.g. the injection's own distance) for the absolute
+        locked distance."""
+        rss0 = self.rss(
+            np.array([self.fiducial["ra"]]), np.array([self.fiducial["dec"]])
+        )[0]
+        return (rss0 / self.rss(ra, dec)) ** 2
+
+    def arg_alpha(self, ra, dec):
+        """``arg_alpha*(n) = 0.5 arg(alpha(n))``, wrapped to ``[0, 2 pi)``.
+
+        Half of ``arg(alpha)`` only pins ``(phase - psi)`` modulo ``pi``, not
+        the full ``2 pi`` period of the ``arg_alpha`` flow coordinate
+        (:class:`nessai_gw.reparameterisations.phase.ArgAlphaBetaReparameterisation`)
+        -- the remaining ``pi/2``-scale ambiguity is exactly the
+        polarisation-quarter degeneracy that stays a weight-learned factor of
+        the group mixture, not something this lock resolves.
+        """
+        alpha, _ = self.coefficients(ra, dec)
+        return np.mod(0.5 * np.angle(alpha), 2.0 * np.pi)
+
+    def arg_beta(self, ra, dec):
+        """``arg_beta*(n) = 0.5 arg(beta(n))``, wrapped to ``[0, 2 pi)``; see
+        :meth:`arg_alpha`."""
+        _, beta = self.coefficients(ra, dec)
+        return np.mod(0.5 * np.angle(beta), 2.0 * np.pi)
+
     # ------------------------------------------------------------------
     # Heteroskedastic residual width.
     #
@@ -268,11 +305,13 @@ class PolarisationEllipse:
         return s0 + t * (s1 - s0)
 
     # ------------------------------------------------------------------
-    def cos_iota_torch(self, ra, sin_dec):
-        """:meth:`cos_iota` for torch tensors, from ``ra`` and ``sin(dec)``.
-
-        Used by :class:`nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction`
-        to recover ``sign(cos theta_jn)`` from the residual prime coordinate.
+    def _alpha_beta_torch(self, ra, sin_dec):
+        """``(alpha_re, alpha_im, beta_re, beta_im)`` as torch tensors, from
+        ``ra`` and ``sin(dec)``.  Shared real-arithmetic core of every torch
+        lock (:meth:`cos_iota_torch`, :meth:`arg_alpha_beta_torch`,
+        :meth:`distance_scale_torch`); complex arithmetic is written out in
+        real pairs since ``torch.complex`` support is patchy under autograd in
+        older builds -- nothing here needs gradients.
         """
         import torch
 
@@ -295,8 +334,6 @@ class PolarisationEllipse:
         fp = torch.einsum('dij,...ij->...d', tensors, ep)
         fc = torch.einsum('dij,...ij->...d', tensors, ec)
 
-        # complex arithmetic written out in real pairs (torch.complex support in
-        # older builds is patchy under autograd; nothing here needs gradients).
         zr, zi = fp, fc
         ar, ai = pattern[0], pattern[1]
         g11 = torch.sum(zr * zr + zi * zi, dim=-1)
@@ -314,6 +351,51 @@ class PolarisationEllipse:
         ali = (g11 * p1i - (g12r * p2i + g12i * p2r)) / det
         ber = (-(g12r * p1r + g12i * p1i) + g11 * p2r) / det
         bei = (-(g12r * p1i - g12i * p1r) + g11 * p2i) / det
+        return alr, ali, ber, bei
+
+    def cos_iota_torch(self, ra, sin_dec):
+        """:meth:`cos_iota` for torch tensors, from ``ra`` and ``sin(dec)``.
+
+        Used by :class:`nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction`
+        to recover ``sign(cos theta_jn)`` from the residual prime coordinate.
+        """
+        import torch
+
+        alr, ali, ber, bei = self._alpha_beta_torch(ra, sin_dec)
         ma = torch.sqrt(torch.sqrt(alr * alr + ali * ali))
         mb = torch.sqrt(torch.sqrt(ber * ber + bei * bei))
         return (ma - mb) / (ma + mb)
+
+    def arg_alpha_beta_torch(self, ra, sin_dec):
+        """:meth:`arg_alpha` / :meth:`arg_beta` for torch tensors, from ``ra``
+        and ``sin(dec)``; each wrapped to ``[0, 2 pi)``.  Used by
+        :class:`nessai_gw.group_mixture.PrimeSpaceTriangularGroupAction` to
+        recover the raw ``arg_alpha`` / ``arg_beta`` from a locked residual.
+        """
+        import torch
+
+        alr, ali, ber, bei = self._alpha_beta_torch(ra, sin_dec)
+        two_pi = 2.0 * np.pi
+        arg_alpha = torch.remainder(0.5 * torch.atan2(ali, alr), two_pi)
+        arg_beta = torch.remainder(0.5 * torch.atan2(bei, ber), two_pi)
+        return arg_alpha, arg_beta
+
+    def distance_scale_torch(self, ra, sin_dec):
+        """:meth:`distance_scale` for torch tensors."""
+        import torch
+
+        alr, ali, ber, bei = self._alpha_beta_torch(ra, sin_dec)
+        rss = torch.sqrt(torch.sqrt(alr * alr + ali * ali)) + torch.sqrt(
+            torch.sqrt(ber * ber + bei * bei)
+        )
+        ra0 = torch.as_tensor(
+            [self.fiducial["ra"]], dtype=ra.dtype, device=ra.device
+        )
+        sd0 = torch.as_tensor(
+            [np.sin(self.fiducial["dec"])], dtype=ra.dtype, device=ra.device
+        )
+        alr0, ali0, ber0, bei0 = self._alpha_beta_torch(ra0, sd0)
+        rss0 = torch.sqrt(torch.sqrt(alr0 * alr0 + ali0 * ali0)) + torch.sqrt(
+            torch.sqrt(ber0 * ber0 + bei0 * bei0)
+        )
+        return (rss0[0] / rss) ** 2
