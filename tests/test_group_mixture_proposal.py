@@ -1367,6 +1367,102 @@ def test_make_et_group_flow_proposal_clustered():
     assert fm.group_size == 32
 
 
+@requires_group_mixture
+def test_reset_model_weights_realigns_prime_parameter_order(tmp_path):
+    """Regression test for the ``--reset-flow`` prime-dimension mixup.
+
+    ``TriangularGroupFlowProposal._FlowModelClass.param_names`` starts as
+    ``_prime_parameter_names``'s throwaway-probe *prediction* of the real
+    proposal's prime-parameter order (the probe uses a plain
+    ``GWFlowProposal``, not ``TriangularGroupFlowProposal``, and so cannot
+    see this proposal's own ``add_default_reparameterisations`` overrides,
+    e.g. ``EqualAreaSky``/``RotatedAnglePair``/``SingleAngleReparameterisation``).
+    ``initialise()`` corrects this once, binding the model (and the shared
+    prime-space ``action``) to the real ``self.prime_parameters`` order.
+
+    ``FlowModel.reset_model()`` (triggered on every ``--reset-flow`` round)
+    rebuilds the model via ``get_model()``, which falls back to the
+    *uncorrected* class-attribute order -- unless
+    ``reset_model_weights`` re-applies the same correction. This builds a
+    real, fully-initialised proposal, deliberately corrupts the predicted
+    class-attribute order (simulating a probe/proposal mismatch), resets
+    the flow, and asserts the model and action stay correctly bound to the
+    live ``prime_parameters`` order rather than reverting to the corrupted
+    one.
+    """
+    from nessai.model import Model
+
+    bounds = {
+        name: np.asarray(
+            {
+                "chirp_mass": (1.0, 2.0),
+                "mass_ratio": (0.125, 1.0),
+                "chi_1": (-0.99, 0.99),
+                "chi_2": (-0.99, 0.99),
+                "luminosity_distance": (10.0, 5000.0),
+                "theta_jn": (0.0, np.pi),
+                "psi": (0.0, np.pi),
+                "phase": (0.0, 2 * np.pi),
+                "ra": (0.0, 2 * np.pi),
+                "dec": (-np.pi / 2, np.pi / 2),
+                "geocent_time": (
+                    REFERENCE_TIME - 0.1,
+                    REFERENCE_TIME + 0.1,
+                ),
+            }[name],
+            dtype=float,
+        )
+        for name in BNS_PARAMETERS
+        if name not in ("lambda_1", "lambda_2")
+    }
+    names = list(bounds)
+
+    class _StubModel(Model):
+        def __init__(self):
+            self.names = names
+            self.bounds = bounds
+
+        def log_prior(self, x):
+            return np.zeros(len(np.atleast_1d(x)))
+
+        def log_likelihood(self, x):
+            return np.zeros(len(np.atleast_1d(x)))
+
+    cls = make_et_group_flow_proposal(
+        names, REFERENCE_TIME, prime_space=True, n_clusters_max=1,
+    )
+    from nessai_gw.group_mixture import triangular_group_reparameterisations
+
+    proposal = cls(
+        _StubModel(),
+        output=str(tmp_path),
+        poolsize=100,
+        reparameterisations=triangular_group_reparameterisations(
+            names, REFERENCE_TIME
+        ),
+        flow_config={"n_blocks": 1, "n_neurons": 4, "n_layers": 1},
+    )
+    proposal.initialise()
+
+    model = proposal.flow.model
+    prime = list(proposal.prime_parameters)
+    assert model.param_names == prime
+
+    # Simulate a probe/proposal order mismatch: corrupt the *predicted*
+    # class-attribute order that get_model() falls back to on a reset.
+    flow_model_cls = type(model)
+    corrupted = list(reversed(prime))
+    flow_model_cls.param_names = corrupted
+    assert model.param_names == prime  # instance override unaffected yet
+
+    proposal.reset_model_weights(weights=True, permutations=True)
+
+    new_model = proposal.flow.model
+    assert new_model is not model  # a fresh instance was built
+    assert new_model.param_names == prime
+    assert new_model.param_names != corrupted
+
+
 # ---------------------------------------------------------------------------
 # polarisation-ellipse inclination coordinate
 # ---------------------------------------------------------------------------

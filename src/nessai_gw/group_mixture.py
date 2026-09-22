@@ -221,10 +221,22 @@ _MIN_CANON_STD = 1e-6
 #: std is clamped to within this factor of the cross-branch average rather
 #: than to a fixed absolute floor -- see the ``canon_std_ratio_cap``
 #: docstring in ``nessai.flowmodel.group_mixture.make_group_mixture_flow``.
-#: Tightened to 2 (from an initial 5) for the ET-Delta v43 run; revisit if
-#: the one-off "canonical std capped" warning fires persistently for a
-#: genuinely (not just transiently) asymmetric mode.
-_CANON_STD_RATIO_CAP = 2.0
+#: Set to 1 (from 2, itself tightened from an initial 5) for the ET-Delta
+#: v51 run, alongside ``_CANON_MEAN_OFFSET_CAP = 0`` below: together these
+#: force every branch's canonical mean *and* std to exactly the honest
+#: cross-branch average, with zero per-branch personal deviation allowed at
+#: all. Motivated by the ``--reset-flow`` branch-collapse investigation: a
+#: branch with too few live points in a given round has no per-branch
+#: estimate to fall back on regardless of this cap (it already uses the bare
+#: average), but *populated* branches' own noisy single-round std estimates
+#: were still free to drift up to 2x apart under the old cap -- removing
+#: that freedom entirely removes one more way an ordinary statistical
+#: fluctuation could get mistaken for real per-branch asymmetry. Revisit if
+#: the "canonical std capped" warning fires persistently for a genuinely
+#: asymmetric mode -- with cap=1 it will fire on essentially every round by
+#: construction, so it is silenced by the same once-per-instance
+#: ``_warned_canon_clamp`` flag as the mean cap.
+_CANON_STD_RATIO_CAP = 1.0
 
 #: Analogous cap on the canonical *mean*: each branch's mean is clamped to
 #: within this many cross-branch-average standard deviations of the
@@ -2435,12 +2447,22 @@ def make_triangular_group_flow_proposal(
                     )
             super().add_default_reparameterisations()
 
-        def initialise(self, *args, **kwargs):
-            super().initialise(*args, **kwargs)
+        def _realign_prime_space_action(self):
+            """Realign the prime-space action and model to nessai's actual
+            prime parameter order (do not assume the reparameterisation-dict
+            order, nor the throwaway-probe order ``_prime_parameter_names``
+            predicted when ``flow_model_cls`` was built -- see that
+            function's docstring). ``get_model()`` (called both by
+            ``initialise()`` and, on every ``--reset-flow`` trigger, by
+            ``FlowModel.reset_model()``) falls back to that predicted order
+            via the ``param_names`` *class* attribute, so this must be
+            re-applied after a reset too, not just once at startup -- a
+            reset that skipped it silently reverted every model to the
+            (possibly wrong) predicted order, scrambling which physical
+            quantity landed in which prime-vector column.
+            """
             if action is None:
                 return
-            # Realign the prime-space action to nessai's actual prime parameter
-            # order (do not assume the reparameterisation-dict order).
             model = getattr(self.flow, "model", None)
             prime = list(getattr(self, "prime_parameters", []) or [])
             if model is not None and prime:
@@ -2449,6 +2471,14 @@ def make_triangular_group_flow_proposal(
                     model.set_param_names(prime)
                 else:
                     model.param_names = prime
+
+        def initialise(self, *args, **kwargs):
+            super().initialise(*args, **kwargs)
+            self._realign_prime_space_action()
+
+        def reset_model_weights(self, **kwargs):
+            super().reset_model_weights(**kwargs)
+            self._realign_prime_space_action()
 
         def train(self, x, **kwargs):
             out = super().train(x, **kwargs)
