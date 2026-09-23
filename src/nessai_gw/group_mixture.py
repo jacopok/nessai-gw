@@ -292,7 +292,9 @@ def _detector_frame_basis(
     equivariant under this in-plane rotation (it only shifts ``lambda`` and
     ``psi`` by a constant), but the *fundamental domain* -- detector-frame
     azimuth in ``[0, pi/2)`` -- is not: ``azimuth_offset`` moves the Z4 seams
-    off the sky-posterior peak (see :func:`recommended_sky_azimuth_offset`).
+    by a fixed amount.  Prefer the data-driven, per-expert seams of
+    :class:`AdaptiveFundamentalDomain`; a non-zero offset is kept for
+    reproducing older runs.
     """
     e3 = np.asarray(plane_normal, dtype=float)
     e3 = e3 / np.linalg.norm(e3)
@@ -358,19 +360,17 @@ class TriangularDetectorGroupAction:
         Only used with ``polarisation_quarter``.  The canonical-point test in
         :meth:`in_fundamental_domain` picks the image with
         ``psi mod pi < pi/2`` -- an arbitrary seam, exactly like the sky's Z4
-        wedge boundary that :func:`recommended_sky_azimuth_offset` /
-        ``azimuth_offset`` exist to move.  If a run's actual ``psi`` posterior
+        wedge boundary that ``azimuth_offset`` moves.  If a run's actual ``psi`` posterior
         straddles that seam (its bulk sits near ``0`` or ``pi/2``), points on
         either side fold to *different* ``phase_step`` images even though
         they are the same continuous population -- an apparent bimodal
         ``(psi, phase)`` split that is really just the arbitrary zero-point
         cutting through the peak, not a second solution.  This shifts the
         seam: the test becomes
-        ``(psi - polarisation_offset) mod pi < pi/2``.  Use
-        :func:`recommended_polarisation_offset` on a localised run's ``psi``
-        to pick it, then retrain from scratch (like ``azimuth_offset``, this
-        only changes which orbit representative is canonical -- the group
-        action on the physical parameters is unchanged).  Default ``0.0``.
+        ``(psi - polarisation_offset) mod pi < pi/2`` (this only changes
+        which orbit representative is canonical -- the group action on the
+        physical parameters is unchanged).  Prefer the data-driven, per-expert
+        seams of :class:`AdaptiveFundamentalDomain`.  Default ``0.0``.
     """
 
     parameters = TRIANGULAR_DETECTOR_PARAMETERS
@@ -1316,6 +1316,438 @@ class SkyOctantProbit:
         return canon, log_j
 
 
+class PhaseQuarterRecanonicaliser(torch.nn.Module):
+    """Per-expert choice of fundamental domain for the polarisation/phase
+    quarter-turn ``Z4`` -- a ``base_reparam`` for
+    :class:`nessai.flowmodel.group_mixture.DiscreteGroupMixtureFlowWrapper`.
+
+    The prime-space group folds the quarter turn ``(psi, phase) -> (psi +
+    pi/2, phase - pi/2)`` on ``psi`` (``psi in [0, pi/2)``, ``delta_phase =
+    phase + s psi in [0, pi)``, ``s = sign(cos theta_jn)``).  That is the
+    right domain when the likelihood pins ``delta_phase`` and leaves ``psi``
+    free.  Where it instead pins the raw ``phase`` (``psi`` still free -- the
+    plateau regime of a co-sited triangle) the same fold cuts the single
+    ``phase mod pi/2`` band into two parallel ``delta_phase``-vs-``psi``
+    ridges half a period apart, one wrapping.  The other fundamental domain,
+    ``D' = {psi in [0, pi), (phase - c) mod pi in [0, pi/2)}``, turns that
+    into one axis-aligned band.  This module maps canonical points of ``D``
+    onto ``D'`` (a quarter turn where needed plus the shear ``delta -> phase``:
+    unit Jacobian), in the prime coordinates
+
+        psi~' = psi' + k   in [-1, 1)
+        p'    = ((delta' + 1) - s (psi~' + 1) / 2 - c) mod 1   in [0, 1/2)
+
+    and is switched on per expert, each round, when the wrapped-angle spread
+    of ``phase mod pi/2`` is well below that of ``delta_phase`` (each measured
+    as a fraction of its own period), with hysteresis.  ``c`` centres the band
+    in ``[0, 1/2)`` and is only moved when the band drifts ``recentre_tol``
+    off centre, so the frame the base flow sees stays fixed between rounds.
+
+    Out-of-``D'`` inputs to :meth:`inverse` get ``delta' = +1/2`` (``delta =
+    3 pi / 2``), outside ``D``, so the wrapper's truncation rejects them.
+    """
+
+    #: Switch on when spread(phase mod pi/2) / spread(delta_phase) < this.
+    on_ratio = 0.5
+    #: Switch off when the ratio rises above this.
+    off_ratio = 0.8
+    #: Recentre ``c`` when the band centre is further than this from 1/4.
+    recentre_tol = 0.1
+    #: Fewer points than this: keep the current state.
+    min_points = 50
+
+    def __init__(self, param_names=None):
+        super().__init__()
+        self.register_buffer("_enabled", torch.zeros((), dtype=torch.bool))
+        self.register_buffer("_cbar", torch.zeros((), dtype=torch.float64))
+        self._idx = None
+        if param_names is not None:
+            self.bind(param_names)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        need = ("psi_prime", "delta_phase", "theta_jn_prime")
+        missing = [n for n in need if n not in names]
+        if missing:
+            raise RuntimeError(
+                f"PhaseQuarterRecanonicaliser needs {missing} in the prime "
+                f"parameters; got {names}."
+            )
+        self._idx = tuple(names.index(n) for n in need)
+
+    @property
+    def enabled(self):
+        return bool(self._enabled)
+
+    def _parts(self, t):
+        i_psi, i_dp, i_th = self._idx
+        s = torch.where(t[:, i_th] > 0, -1.0, 1.0).to(t.dtype)
+        return t[:, i_psi], t[:, i_dp], s, self._cbar.to(t.dtype)
+
+    def forward(self, t):
+        if not self.enabled:
+            return t
+        a, b, s, cbar = self._parts(t)
+        k = (
+            torch.remainder((b + 1) - s * (a + 1) / 2 - cbar, 1.0) >= 0.5
+        ).to(t.dtype)
+        psi_t = a + k
+        p = torch.remainder((b + 1) - s * (psi_t + 1) / 2 - cbar, 1.0)
+        out = t.clone()
+        out[:, self._idx[0]] = psi_t
+        out[:, self._idx[1]] = p
+        return out
+
+    def inverse(self, t):
+        if not self.enabled:
+            return t
+        psi_t, p, s, cbar = self._parts(t)
+        valid = (psi_t >= -1) & (psi_t < 1) & (p >= 0) & (p < 0.5)
+        a = psi_t - (psi_t >= 0).to(t.dtype)
+        b = torch.remainder(p + cbar + s * (psi_t + 1) / 2, 1.0) - 1
+        b = torch.where(valid, b, torch.full_like(b, 0.5))
+        out = t.clone()
+        out[:, self._idx[0]] = a
+        out[:, self._idx[1]] = b
+        return out
+
+    @staticmethod
+    def _circ(y, period):
+        """(wrapped-angle spread in radians, circular mean in ``y`` units)."""
+        z = np.mean(np.exp(2j * np.pi * y / period))
+        r = max(abs(z), 1e-12)
+        return float(np.sqrt(-2.0 * np.log(r))), float(
+            np.mod(np.angle(z) * period / (2 * np.pi), period)
+        )
+
+    @torch.no_grad()
+    def update(self, t):
+        """Refit on this round's claimed base-frame points ``t`` (in ``D``);
+        return ``True`` if the frame changed."""
+        if t.shape[0] < self.min_points:
+            return False
+        i_psi, i_dp, i_th = self._idx
+        tn = t.detach().cpu().double().numpy()
+        a, b = tn[:, i_psi], tn[:, i_dp]
+        s = np.where(tn[:, i_th] > 0, -1.0, 1.0)
+        p0 = np.mod((b + 1) - s * (a + 1) / 2, 0.5)
+        sp_phase, centre = self._circ(p0, 0.5)
+        sp_delta, _ = self._circ(b + 1, 1.0)
+        ratio = sp_phase / max(sp_delta, 1e-12)
+        was = self.enabled
+        changed = False
+        if not was and ratio < self.on_ratio:
+            self._enabled.fill_(True)
+            self._cbar.fill_(float(np.mod(centre - 0.25, 0.5)))
+            changed = True
+        elif was and ratio > self.off_ratio:
+            self._enabled.fill_(False)
+            changed = True
+        elif was:
+            off = float(np.mod(centre - float(self._cbar), 0.5))
+            if abs(off - 0.25) > self.recentre_tol:
+                self._cbar.fill_(float(np.mod(centre - 0.25, 0.5)))
+                changed = True
+        logger.info(
+            "Phase-quarter recanon: spread(phase mod pi/2)/spread(delta_phase)"
+            " = %.3f/%.3f = %.3f (on < %.2f, off > %.2f), n=%d, %s%s",
+            sp_phase, sp_delta, ratio, self.on_ratio, self.off_ratio,
+            t.shape[0], "ON" if self.enabled else "off",
+            (" [switched]" if was != self.enabled
+             else " [recentred]" if changed else ""),
+        )
+        return changed
+
+
+class AdaptiveFundamentalDomain(torch.nn.Module):
+    """Per-expert, data-driven choice of fundamental domain -- a
+    ``base_reparam`` for
+    :class:`nessai.flowmodel.group_mixture.DiscreteGroupMixtureFlowWrapper`.
+
+    The group mixture folds every point into one fixed fundamental domain
+    ``D0`` (prime coordinates ``sky_u in [0, 1/4)``, ``sky_v <= 1/2``,
+    ``psi_prime in [-1, 0)``, ``delta_phase in [-1, 0)``).  Its periodic cuts
+    are arbitrary: a posterior peak sitting on one is cut in two and the base
+    flow has to model both halves glued to opposite walls.  This module maps
+    each canonical point to its image in a *shifted* domain whose seams sit
+    where the expert's folded posterior has the least mass, and expresses it
+    in seam-relative coordinates, so the base flow sees the peak whole:
+
+    * sky: ``(sky_u - c_u) mod 1 in [0, 1/4)`` (the Z4 rotation);
+    * polarisation/phase sector, one of two domain families:
+
+      - ``"delta"`` (``delta_phase`` pinned, ``psi`` free):
+        ``(psi' + 1 - c_psi) mod 2 in [0, 1)`` and
+        ``(delta' + 1 - c_delta) mod 2 in [0, 1)``;
+      - ``"phase"`` (raw phase pinned -- the co-sited-triangle plateau
+        regime, see :class:`PhaseQuarterRecanonicaliser`): the quarter turn is
+        folded on the phase instead, ``(phase/pi - c_phase) mod 2 in [0, 1/2)``,
+        ``psi`` kept over its full period (``(psi' + 1 - c_psi) mod 2``),
+        and the ``delta_phase`` slot carries ``(phase/pi - c_phase) mod 2``.
+
+    Any seam positions give a valid fundamental domain (each clause fixes one
+    commuting factor of the group), so the map ``D0 -> D`` is "apply the
+    unique group element taking the point into ``D``" followed by per-
+    coordinate translations (and, for ``"phase"``, a unit shear): unit
+    Jacobian, exact.  The group element is found with the real prime-space
+    action: the sky rotation from ``sky_u`` in closed form, then the four
+    polarisation/phase-sector candidates (brute force over the whole group
+    as a fall-back).  ``inverse`` maps inputs outside the target box to
+    ``delta_phase = +1/2`` (outside ``D0``) so truncation rejects them.
+
+    :meth:`update` (each training round, on the expert's own canonical
+    points) picks the family from the wrapped spreads of ``phase mod pi/2``
+    vs ``delta_phase mod pi`` (``on_ratio`` / ``off_ratio`` hysteresis, only
+    when ``allow_phase_mode``), then each seam at the minimum of a smoothed
+    circular histogram of the corresponding folded coordinate, in the order
+    sky -> polarisation/phase (the latter measured on points already moved to
+    the chosen sky domain).  A seam only moves when the density at its current
+    position exceeds ``move_density`` (relative to uniform) *and*
+    ``move_factor`` times the minimum -- a seam in an empty or flat region is
+    left alone, so the base-flow frame stays fixed between rounds.
+    """
+
+    on_ratio = 0.5
+    off_ratio = 0.8
+    n_bins = 64
+    smooth_bins = 2.0
+    move_density = 0.25
+    move_factor = 2.0
+    min_points = 50
+
+    def __init__(self, action, param_names=None, allow_phase_mode=False):
+        super().__init__()
+        self._action = action
+        self.allow_phase_mode = bool(allow_phase_mode)
+        # (c_u, c_psi, c_delta, c_phase) in prime units
+        self.register_buffer("_seams", torch.zeros(4, dtype=torch.float64))
+        self.register_buffer("_phase_mode", torch.zeros((), dtype=torch.bool))
+        self.register_buffer("_seen", torch.zeros((), dtype=torch.bool))
+        self._names = None
+        if param_names is not None:
+            self.bind(param_names)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        need = ("sky_u", "sky_v", "psi_prime", "delta_phase", "theta_jn_prime")
+        missing = [n for n in need if n not in names]
+        if missing:
+            raise RuntimeError(
+                f"AdaptiveFundamentalDomain needs {missing} in the prime "
+                f"parameters; got {names}."
+            )
+        self._names = names
+        self._iu, self._iv, self._ipsi, self._idp, self._ith = (
+            names.index(n) for n in need
+        )
+
+    # -- state -------------------------------------------------------------
+    def _state(self):
+        return tuple(float(c) for c in self._seams), bool(self._phase_mode)
+
+    def _identity(self):
+        seams, phase = self._state()
+        return not phase and not any(seams)
+
+    # -- geometry ------------------------------------------------------------
+    def _s(self, z):
+        return torch.where(z[:, self._ith] > 0, -1.0, 1.0).to(z.dtype)
+
+    def _phi_n(self, z):
+        """``phase / pi mod 2`` from the prime ``(psi', delta', theta')``."""
+        return torch.remainder(
+            (z[:, self._idp] + 1) - self._s(z) * (z[:, self._ipsi] + 1) / 2, 2.0
+        )
+
+    def _in_target(self, z, seams, phase_mode):
+        cu, cpsi, cdel, cphi = seams
+        ok = torch.remainder(z[:, self._iu] - cu, 1.0) < 0.25
+        ok = ok & (z[:, self._iv] <= 0.5)
+        if phase_mode:
+            ok = ok & (torch.remainder(self._phi_n(z) - cphi, 2.0) < 0.5)
+        else:
+            ok = ok & (torch.remainder(z[:, self._ipsi] + 1 - cpsi, 2.0) < 1.0)
+            ok = ok & (torch.remainder(z[:, self._idp] + 1 - cdel, 2.0) < 1.0)
+        return ok
+
+    def _act(self, z, modes):
+        d = {n: z[:, i] for i, n in enumerate(self._names)}
+        out = self._action(d, modes, inverse=False)
+        return torch.stack([out[n] for n in self._names], dim=1)
+
+    def _map_to(self, z, seams, phase_mode):
+        """Image of each row of ``z`` in the target domain, and a found mask."""
+        out = z.clone()
+        found = torch.zeros(z.shape[0], dtype=torch.bool, device=z.device)
+        if z.shape[0] == 0:
+            return out, found
+        cu = seams[0]
+        k = torch.remainder(
+            -torch.floor(4.0 * torch.remainder(z[:, self._iu] - cu, 1.0)), 4
+        ).long()
+        for j in range(4):
+            cand = self._act(z, k + 8 * j)
+            m = self._in_target(cand, seams, phase_mode) & ~found
+            out[m] = cand[m]
+            found |= m
+        if not bool(found.all()):
+            rest = (~found).nonzero(as_tuple=True)[0]
+            zr = z[rest]
+            fr = torch.zeros(len(rest), dtype=torch.bool, device=z.device)
+            for g in range(self._action._action.group_size):
+                cand = self._act(zr, torch.full_like(rest, g))
+                m = self._in_target(cand, seams, phase_mode) & ~fr
+                out[rest[m]] = cand[m]
+                fr |= m
+            found[rest] = fr
+        return out, found
+
+    def _to_box(self, z, seams, phase_mode):
+        cu, cpsi, cdel, cphi = seams
+        y = z.clone()
+        y[:, self._iu] = torch.clamp(
+            torch.remainder(z[:, self._iu] - cu, 1.0), max=0.25 * (1 - 1e-7)
+        )
+        y[:, self._ipsi] = torch.remainder(z[:, self._ipsi] + 1 - cpsi, 2.0) - 1
+        if phase_mode:
+            y[:, self._idp] = torch.remainder(self._phi_n(z) - cphi, 2.0)
+        else:
+            y[:, self._idp] = torch.remainder(z[:, self._idp] + 1 - cdel, 2.0) - 1
+        return y
+
+    def _box_valid(self, y, phase_mode):
+        u, v = y[:, self._iu], y[:, self._iv]
+        a, b = y[:, self._ipsi], y[:, self._idp]
+        ok = (u >= 0) & (u < 0.25) & (v >= 0) & (v <= 0.5)
+        if phase_mode:
+            return ok & (a >= -1) & (a < 1) & (b >= 0) & (b < 0.5)
+        return ok & (a >= -1) & (a < 0) & (b >= -1) & (b < 0)
+
+    def _from_box(self, y, seams, phase_mode):
+        cu, cpsi, cdel, cphi = seams
+        z = y.clone()
+        z[:, self._iu] = torch.remainder(y[:, self._iu] + cu, 1.0)
+        psi = torch.remainder(y[:, self._ipsi] + 1 + cpsi, 2.0) - 1
+        z[:, self._ipsi] = psi
+        if phase_mode:
+            z[:, self._idp] = torch.remainder(
+                y[:, self._idp] + cphi + self._s(y) * (psi + 1) / 2, 2.0
+            ) - 1
+        else:
+            z[:, self._idp] = torch.remainder(y[:, self._idp] + 1 + cdel, 2.0) - 1
+        return z
+
+    # -- base_reparam interface ---------------------------------------------
+    def forward(self, canon):
+        if self._identity():
+            return canon
+        seams, phase = self._state()
+        z, _ = self._map_to(canon, seams, phase)
+        return self._to_box(z, seams, phase)
+
+    def inverse(self, y):
+        if self._identity():
+            return y
+        seams, phase = self._state()
+        valid = self._box_valid(y, phase)
+        z = self._from_box(y, seams, phase)
+        canon, found = self._map_to(z, (0.0, 0.0, 0.0, 0.0), False)
+        bad = ~(valid & found)
+        if bool(bad.any()):
+            canon[bad, self._idp] = 0.5
+        return canon
+
+    # -- seam / family choice ------------------------------------------------
+    @staticmethod
+    def _circ_spread(y, period):
+        z = np.mean(np.exp(2j * np.pi * y / period))
+        return float(np.sqrt(-2.0 * np.log(max(abs(z), 1e-12))))
+
+    def _density(self, vals, period):
+        """Smoothed circular histogram (mean 1) on ``n_bins`` bin centres."""
+        n = self.n_bins
+        h, _ = np.histogram(np.mod(vals, period), bins=n, range=(0.0, period))
+        k = np.arange(n) - n // 2
+        ker = np.exp(-0.5 * (k / self.smooth_bins) ** 2)
+        ker = np.roll(ker / ker.sum(), -(n // 2))
+        dens = np.real(np.fft.ifft(np.fft.fft(h) * np.fft.fft(ker)))
+        return dens / max(dens.mean(), 1e-300)
+
+    def _choose_seam(self, vals, period, current, force=False):
+        dens = self._density(vals, period)
+        n = self.n_bins
+        i_min = int(np.argmin(dens))
+        best = (i_min + 0.5) * period / n
+        i_cur = int(np.floor(np.mod(current, period) / period * n)) % n
+        d_cur = float(dens[i_cur])
+        if force or (
+            d_cur > self.move_density
+            and d_cur > self.move_factor * float(dens[i_min])
+        ):
+            return best, d_cur, float(dens[i_min])
+        return float(current), d_cur, float(dens[i_min])
+
+    @torch.no_grad()
+    def update(self, canon):
+        if canon.shape[0] < self.min_points:
+            return False
+        before = self._state()
+        (cu, cpsi, cdel, cphi), phase = before
+        was_seen = bool(self._seen)
+
+        u = canon[:, self._iu].double().cpu().numpy()
+        cu, du, _ = self._choose_seam(4.0 * u, 1.0, 4.0 * cu)
+        cu = cu / 4.0
+
+        z1, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
+        phi_n = self._phi_n(z1).double().cpu().numpy()
+        dn = (z1[:, self._idp] + 1).double().cpu().numpy()
+        sp_phase = self._circ_spread(phi_n, 0.5)
+        sp_delta = self._circ_spread(dn, 1.0)
+        ratio = sp_phase / max(sp_delta, 1e-12)
+        new_phase = phase
+        if self.allow_phase_mode:
+            if not phase and ratio < self.on_ratio:
+                new_phase = True
+            elif phase and ratio > self.off_ratio:
+                new_phase = False
+        switched = new_phase != phase
+
+        if new_phase:
+            cphi, dphi, _ = self._choose_seam(
+                phi_n, 0.5, cphi, force=switched or not was_seen
+            )
+            z2, _ = self._map_to(canon, (cu, 0.0, 0.0, cphi), True)
+            psi = (z2[:, self._ipsi] + 1).double().cpu().numpy()
+            cpsi, dpsi, _ = self._choose_seam(psi, 2.0, 0.0 if switched else cpsi)
+            cdel, ddel = 0.0, float("nan")
+        else:
+            psi = (z1[:, self._ipsi] + 1).double().cpu().numpy()
+            cpsi, dpsi, _ = self._choose_seam(psi, 1.0, 0.0 if switched else cpsi)
+            z2, _ = self._map_to(canon, (cu, cpsi, 0.0, 0.0), False)
+            dl = (z2[:, self._idp] + 1).double().cpu().numpy()
+            cdel, ddel, _ = self._choose_seam(dl, 1.0, 0.0 if switched else cdel)
+            cphi, dphi = 0.0, float("nan")
+
+        self._seams.copy_(torch.tensor([cu, cpsi, cdel, cphi], dtype=torch.float64))
+        self._phase_mode.fill_(bool(new_phase))
+        self._seen.fill_(True)
+        after = self._state()
+        changed = (
+            after[1] != before[1]
+            or any(abs(a - b) > 1e-12 for a, b in zip(after[0], before[0]))
+        )
+        logger.info(
+            "Adaptive domain: %s-folded (phase/delta spread ratio %.3f), seams "
+            "sky_u %.4f psi %.4f delta %.4f phase %.4f; density at old seams "
+            "sky %.2f psi %.2f delta %.2f phase %.2f (x uniform), n=%d%s",
+            "phase" if new_phase else "delta", ratio, cu, cpsi, cdel, cphi,
+            du, dpsi, ddel, dphi, canon.shape[0],
+            " [changed]" if changed else "",
+        )
+        return changed
+
+
 def _lerp_cdf(x, edges, cdf):
     """Piecewise-linear CDF value at ``x`` (``edges``/``cdf`` 1-D, monotone)."""
     n = edges.numel() - 1
@@ -1837,63 +2269,10 @@ def _swap_sky_triple_for_pair(prime):
     return prime
 
 
-def recommended_sky_azimuth_offset(action, ra, dec):
-    """Fold ``(ra, dec)`` to the fundamental domain and report its azimuth.
-
-    Returns a dict with
-
-    * ``concentration`` -- 0 (folded azimuth uniform on ``[0, pi/2)``) to 1
-      (delta).  A recentre is only worth triggering once this is well above
-      ~0.5 (the canonical sky posterior is genuinely localised).
-    * ``circ_mean_lambda`` -- circular mean of the folded detector-frame
-      azimuth, in ``[0, pi/2)``.
-    * ``recommended_azimuth_offset`` -- the extra ``azimuth_offset`` (rad,
-      taken mod ``pi/2``) that would move ``circ_mean_lambda`` to ``pi/4``,
-      the centre of the fundamental wedge, so the Z4 seams sit furthest from
-      the peak.  Pass it to :func:`make_et_group_flow_proposal` (added to any
-      current offset) and retrain the flow from scratch.
-    * ``fraction_near_seam`` -- fraction of points within 0.15 rad of a Z4
-      seam under the current frame.
-
-    ``action`` is any :class:`TriangularDetectorGroupAction`; only its
-    ``sky_frame_rotation`` is used.
-    """
-    ra = np.asarray(ra, dtype=float)
-    dec = np.asarray(dec, dtype=float)
-    R = np.asarray(action.sky_frame_rotation, dtype=float)
-    w_eq = np.stack(
-        [np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)],
-        axis=-1,
-    )
-    wf = w_eq @ R.T
-    # fold to the canonical +++ octant: reflect z, bring azimuth to [0, pi/2)
-    x, y, z = wf[:, 0].copy(), wf[:, 1].copy(), np.abs(wf[:, 2])
-    lam = np.mod(np.arctan2(y, x), 2 * np.pi)
-    k = np.floor(lam / (0.5 * np.pi))
-    ang = -k * (0.5 * np.pi)
-    xr = np.cos(ang) * x - np.sin(ang) * y
-    yr = np.sin(ang) * x + np.cos(ang) * y
-    lam_f = np.mod(np.arctan2(yr, xr), 0.5 * np.pi)
-    z4 = np.mean(np.exp(4j * lam_f))
-    circ_mean = np.mod(np.angle(z4) / 4.0, 0.5 * np.pi)
-    return {
-        "concentration": float(np.abs(z4)),
-        "circ_mean_lambda": float(circ_mean),
-        "recommended_azimuth_offset": float(
-            np.mod(circ_mean - 0.25 * np.pi, 0.5 * np.pi)
-        ),
-        "fraction_near_seam": float(
-            np.mean((lam_f < 0.15) | (lam_f > 0.5 * np.pi - 0.15))
-        ),
-        "n": int(ra.size),
-    }
-
-
 def recommended_polarisation_offset(psi):
     """Fold ``psi`` to its canonical half and report where it sits.
 
-    The mirror of :func:`recommended_sky_azimuth_offset`, for the
-    ``polarisation_offset`` seam (see
+    For the ``polarisation_offset`` seam (see
     :class:`TriangularDetectorGroupAction`'s docstring) instead of the sky's
     Z4 wedge: with ``polarisation_quarter``, the two candidate ``psi``
     images of any physical point are always exactly ``pi/2`` apart (mod
@@ -1903,12 +2282,9 @@ def recommended_polarisation_offset(psi):
     the same ``pi/2``, so the formulas match with ``4 psi_f`` in place of
     ``4 lam_f``).
 
-    Returns a dict with the same four keys as
-    :func:`recommended_sky_azimuth_offset` (``concentration``,
-    ``circ_mean_lambda`` -- here the folded ``psi``'s circular mean --,
-    ``recommended_azimuth_offset`` -- here the recommended
-    ``polarisation_offset`` --, ``fraction_near_seam``, ``n``), so the two can
-    be inspected/reported the same way.
+    Returns a dict with ``concentration``, ``circ_mean_lambda`` (the folded
+    ``psi``'s circular mean), ``recommended_azimuth_offset`` (the recommended
+    ``polarisation_offset``), ``fraction_near_seam`` and ``n``.
 
     Parameters
     ----------
@@ -1966,6 +2342,8 @@ def make_triangular_group_flow_proposal(
     polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
+    phase_recanon=False,
+    adaptive_domain=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -2009,9 +2387,9 @@ def make_triangular_group_flow_proposal(
         (16-element group).  See :class:`TriangularDetectorGroupAction`.
     azimuth_offset : float, optional
         In-plane rotation (rad) of the detector frame about the plane normal,
-        moving the Z4 fundamental-domain seams off the sky-posterior peak.
-        Use :func:`recommended_sky_azimuth_offset` on a localised run to pick
-        it, then retrain from scratch.  Default ``0.0``.
+        shifting the Z4 fundamental-domain seams by a fixed amount (kept for
+        reproducing older runs; ``adaptive_domain`` moves the seams per
+        expert from the data instead).  Default ``0.0``.
     boundary_reflection : bool, optional
         Only on the prime-space path.  Symmetrise the base flow across the
         ``ra_dec_{x,y,z} = 0`` octant faces so it need not model the wall
@@ -2074,9 +2452,7 @@ def make_triangular_group_flow_proposal(
         ``azimuth_offset`` exists to move; if the run's actual ``psi``
         posterior straddles it, points fold to different ``phase_step``
         images and the ``(psi, phase)`` corner looks like two offset ridges
-        rather than one.  Use :func:`recommended_polarisation_offset` on a
-        localised run's ``psi`` (per branch, if splitting) to pick it, then
-        retrain from scratch.  Default ``0.0``.
+        rather than one.  Prefer ``adaptive_domain``.  Default ``0.0``.
     phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "independent"}, optional
         ``"polarisation-phase"`` (default): ``delta_phase = phase + sign(cos
         theta_jn) psi`` + a separate ``psi`` coordinate.  ``"arg-alpha-beta"``:
@@ -2145,6 +2521,23 @@ def make_triangular_group_flow_proposal(
         reparameterisation: the residual is divided by a fitted sky-dependent
         width so the flow coordinate is homoskedastic (the plain residual fans
         out towards the face-on points).  Default ``False``.
+    phase_recanon : bool, optional
+        Give every group-mixture expert a :class:`PhaseQuarterRecanonicaliser`
+        ``base_reparam``: each expert independently switches the polarisation
+        quarter-turn fundamental domain from ``psi in [0, pi/2)`` to
+        ``phase mod pi/2`` when its points pin the raw phase rather than
+        ``delta_phase``.  Needs the prime-space path, ``psi_single``,
+        ``polarisation_quarter``, ``phase_coordinates='polarisation-phase'``,
+        no ``polarisation_ellipse`` and no boundary reflection.  Default
+        ``False``.  With ``adaptive_domain`` this instead allows the
+        ``"phase"`` family of :class:`AdaptiveFundamentalDomain`.
+    adaptive_domain : bool, optional
+        Give every group-mixture expert an :class:`AdaptiveFundamentalDomain`
+        ``base_reparam``: each expert moves the sky, ``psi`` and
+        ``delta_phase`` fold seams off its own posterior mass every round
+        (and, with ``phase_recanon``, may fold the quarter turn on the phase).
+        Same requirements as ``phase_recanon``, plus ``sky_2d``.  Default
+        ``False``.
     """
     try:
         from nessai.proposal import FlowProposal
@@ -2313,6 +2706,42 @@ def make_triangular_group_flow_proposal(
                 for p in ("ra_dec_x", "ra_dec_y", "ra_dec_z")
                 if p in prime_names
             ]
+        if phase_recanon or adaptive_domain:
+            bad = []
+            if adaptive_domain and not sky_2d:
+                bad.append("sky_2d=False")
+            if not psi_single:
+                bad.append("psi_single=False")
+            if not polarisation_quarter:
+                bad.append("polarisation_quarter=False")
+            if phase_coordinates != "polarisation-phase":
+                bad.append(f"phase_coordinates={phase_coordinates!r}")
+            if polarisation_ellipse is not None:
+                bad.append("polarisation_ellipse")
+            if boundary_reflection:
+                bad.append("boundary_reflection")
+            if bad:
+                raise RuntimeError(
+                    "phase_recanon/adaptive_domain is incompatible with "
+                    f"{', '.join(bad)}."
+                )
+            if "base_reparam_factory" not in _gm_params:
+                raise RuntimeError(
+                    "phase_recanon/adaptive_domain requires a version of "
+                    "nessai whose make_group_mixture_flow accepts "
+                    "`base_reparam_factory`."
+                )
+            import functools as _functools
+
+            if adaptive_domain:
+                gm_kwargs["base_reparam_factory"] = _functools.partial(
+                    AdaptiveFundamentalDomain, action, list(prime_names),
+                    allow_phase_mode=bool(phase_recanon),
+                )
+            else:
+                gm_kwargs["base_reparam_factory"] = _functools.partial(
+                    PhaseQuarterRecanonicaliser, list(prime_names)
+                )
         flow_model_cls = _make_flow_model(
             group_action_fn=action,  # ignored on the prime-space path
             group_size=base_action.group_size,
@@ -2323,6 +2752,10 @@ def make_triangular_group_flow_proposal(
             **gm_kwargs,
         )
     else:
+        if phase_recanon or adaptive_domain:
+            raise RuntimeError(
+                "phase_recanon/adaptive_domain needs the prime-space path."
+            )
         action = None
         import inspect as _inspect
 
@@ -2439,60 +2872,6 @@ def make_triangular_group_flow_proposal(
         def reset_model_weights(self, **kwargs):
             super().reset_model_weights(**kwargs)
             self._realign_prime_space_action()
-
-        def train(self, x, **kwargs):
-            out = super().train(x, **kwargs)
-            try:
-                names = getattr(getattr(x, "dtype", None), "names", None) or ()
-                if "ra" in names and "dec" in names:
-                    d = recommended_sky_azimuth_offset(
-                        base_action, x["ra"], x["dec"]
-                    )
-                    logger.debug(
-                        "[sky] folded-azimuth concentration %.3f, circ-mean "
-                        "%.3f rad; current azimuth_offset %.4f, recommended "
-                        "extra offset %.4f rad (%.1f deg); %.1f%% of points "
-                        "near a Z4 seam. %s",
-                        d["concentration"],
-                        d["circ_mean_lambda"],
-                        base_action.azimuth_offset,
-                        d["recommended_azimuth_offset"],
-                        np.degrees(d["recommended_azimuth_offset"]),
-                        100 * d["fraction_near_seam"],
-                        (
-                            "Well localised -- a recentre + full retrain is "
-                            "worthwhile."
-                            if d["concentration"] > 0.5
-                            else "Not localised enough to recentre yet."
-                        ),
-                    )
-            except Exception as exc:  # pragma: no cover - diagnostic only
-                logger.debug("sky azimuth diagnostic failed: %s", exc)
-            try:
-                names = getattr(getattr(x, "dtype", None), "names", None) or ()
-                if base_action.polarisation_quarter and "psi" in names:
-                    d = recommended_polarisation_offset(x["psi"])
-                    logger.debug(
-                        "[polarisation] folded-psi concentration %.3f, "
-                        "circ-mean %.3f rad; current polarisation_offset "
-                        "%.4f, recommended extra offset %.4f rad (%.1f deg); "
-                        "%.1f%% of points near the psi seam. %s",
-                        d["concentration"],
-                        d["circ_mean_lambda"],
-                        base_action.polarisation_offset,
-                        d["recommended_azimuth_offset"],
-                        np.degrees(d["recommended_azimuth_offset"]),
-                        100 * d["fraction_near_seam"],
-                        (
-                            "Well localised -- a recentre + full retrain is "
-                            "worthwhile."
-                            if d["concentration"] > 0.5
-                            else "Not localised enough to recentre yet."
-                        ),
-                    )
-            except Exception as exc:  # pragma: no cover - diagnostic only
-                logger.debug("polarisation offset diagnostic failed: %s", exc)
-            return out
 
     # nessai checkpoints the sampler (hence the proposal *instance*) with
     # ``pickle``, which resolves an instance's class by ``module.__qualname__``.
@@ -2612,6 +2991,8 @@ def make_et_group_flow_proposal(
     polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
+    phase_recanon=False,
+    adaptive_domain=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -2645,4 +3026,6 @@ def make_et_group_flow_proposal(
         polarisation_ellipse_scale=polarisation_ellipse_scale,
         polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
         polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
+        phase_recanon=phase_recanon,
+        adaptive_domain=adaptive_domain,
     )

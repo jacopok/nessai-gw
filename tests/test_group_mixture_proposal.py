@@ -17,7 +17,6 @@ from nessai_gw.group_mixture import (  # noqa: E402
     TriangularDetectorGroupAction,
     _prime_parameter_names,
     recommended_polarisation_offset,
-    recommended_sky_azimuth_offset,
     triangular_group_reparameterisations,
     make_et_group_flow_proposal,
 )
@@ -683,24 +682,6 @@ def test_azimuth_offset_rotates_frame_and_moves_seam():
     np.testing.assert_allclose(
         a1.sky_frame_rotation @ a1.sky_frame_rotation.T, np.eye(3), atol=1e-10
     )
-
-
-def test_recommended_sky_azimuth_offset_centres_the_wedge():
-    """A localised sky blob: the recommended offset moves its folded azimuth
-    circular mean to pi/4, and re-measuring with that offset confirms it."""
-    rng = np.random.default_rng(0)
-    ra = rng.normal(0.9694, 0.05, 4000)
-    dec = rng.normal(-1.1491, 0.05, 4000)
-    a0 = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
-    d0 = recommended_sky_azimuth_offset(a0, ra, dec)
-    assert d0["concentration"] > 0.8  # tight blob -> well localised
-    a1 = ETTriangleGroupAction(
-        reference_time=REFERENCE_TIME,
-        azimuth_offset=d0["recommended_azimuth_offset"],
-    )
-    d1 = recommended_sky_azimuth_offset(a1, ra, dec)
-    assert d1["circ_mean_lambda"] == pytest.approx(np.pi / 4, abs=0.02)
-    assert d1["recommended_azimuth_offset"] == pytest.approx(0.0, abs=0.02)
 
 
 def test_recommended_polarisation_offset_centres_the_seam():
