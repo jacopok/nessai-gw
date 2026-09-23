@@ -205,46 +205,10 @@ _DELTA_PHASE_SCALE = 1.0
 #: Tuned for an ET-scale site; a very different geometry may want it revisited.
 _GEOCENT_SCALE = 5e-3
 
-#: Pure numerical-safety floor on a single branch's *raw* measured
-#: canonical std (nessai's ``DiscreteGroupMixtureFlowWrapper`` clamps to
-#: this before anything else, purely to avoid a literal std of 0). The real
-#: defence against an over-narrow canonicalisation -- e.g. a genuinely
-#: narrow prime dimension like ``geocent_time`` -- is
-#: ``_CANON_STD_RATIO_CAP`` below, which is relative rather than absolute,
-#: so this no longer needs per-site tuning; it should stay far below any
-#: real posterior width.
+#: Numerical-safety floor on the measured canonical std (nessai's
+#: ``DiscreteGroupMixtureFlowWrapper`` clamps to this, purely to avoid a
+#: literal std of 0); it should stay far below any real posterior width.
 _MIN_CANON_STD = 1e-6
-
-#: Every group element (branch) of the flow's canonical mixture is a
-#: symmetric copy of the same mode, so its canonical std should agree with
-#: every other element's up to real per-branch heterogeneity. Each branch's
-#: std is clamped to within this factor of the cross-branch average rather
-#: than to a fixed absolute floor -- see the ``canon_std_ratio_cap``
-#: docstring in ``nessai.flowmodel.group_mixture.make_group_mixture_flow``.
-#: Set to 1 (from 2, itself tightened from an initial 5) for the ET-Delta
-#: v51 run, alongside ``_CANON_MEAN_OFFSET_CAP = 0`` below: together these
-#: force every branch's canonical mean *and* std to exactly the honest
-#: cross-branch average, with zero per-branch personal deviation allowed at
-#: all. Motivated by the ``--reset-flow`` branch-collapse investigation: a
-#: branch with too few live points in a given round has no per-branch
-#: estimate to fall back on regardless of this cap (it already uses the bare
-#: average), but *populated* branches' own noisy single-round std estimates
-#: were still free to drift up to 2x apart under the old cap -- removing
-#: that freedom entirely removes one more way an ordinary statistical
-#: fluctuation could get mistaken for real per-branch asymmetry. Revisit if
-#: the "canonical std capped" warning fires persistently for a genuinely
-#: asymmetric mode -- with cap=1 it will fire on essentially every round by
-#: construction, so it is silenced by the same once-per-instance
-#: ``_warned_canon_clamp`` flag as the mean cap.
-_CANON_STD_RATIO_CAP = 1.0
-
-#: Analogous cap on the canonical *mean*: each branch's mean is clamped to
-#: within this many cross-branch-average standard deviations of the
-#: cross-branch average mean -- see the ``canon_mean_offset_cap`` docstring
-#: in ``nessai.flowmodel.group_mixture.make_group_mixture_flow``. Set to 0
-#: for the ET-Delta v44 run to test forcing every branch to exactly share
-#: the cross-branch average mean (no per-branch mean offset at all).
-_CANON_MEAN_OFFSET_CAP = 0.0
 
 
 def detector_plane_normal(interferometers) -> np.ndarray:
@@ -2356,8 +2320,6 @@ def make_triangular_group_flow_proposal(
             prime_space_action=action,
             prime_space_in_domain=action.in_fundamental_domain,
             min_canon_std=_MIN_CANON_STD,
-            canon_std_ratio_cap=_CANON_STD_RATIO_CAP,
-            canon_mean_offset_cap=_CANON_MEAN_OFFSET_CAP,
             **gm_kwargs,
         )
     else:
@@ -2376,8 +2338,6 @@ def make_triangular_group_flow_proposal(
             param_names=base_action.parameters,
             in_fundamental_domain=base_action.in_fundamental_domain,
             min_canon_std=_MIN_CANON_STD,
-            canon_std_ratio_cap=_CANON_STD_RATIO_CAP,
-            canon_mean_offset_cap=_CANON_MEAN_OFFSET_CAP,
             **_extra,
         )
 
