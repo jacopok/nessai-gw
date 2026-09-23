@@ -12,6 +12,8 @@ from .. import nessai_logger
 logger = nessai_logger.getChild(__name__)
 
 _LOG_2PI = np.log(2.0 * np.pi)
+#: Newton steps polishing the tabulated inverse CDF
+_N_NEWTON = 3
 
 
 class AlignedSpinReparameterisation(Reparameterisation):
@@ -66,10 +68,15 @@ class AlignedSpinReparameterisation(Reparameterisation):
         rng=None,
         **kwargs,
     ):
-        parent_params = inspect.signature(Reparameterisation.__init__).parameters
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
         call = dict(parameters=parameters, prior_bounds=prior_bounds, rng=rng)
         # ``input_parameters`` / other kwargs are only accepted by newer nessai
-        if input_parameters is not None and "input_parameters" in parent_params:
+        if (
+            input_parameters is not None
+            and "input_parameters" in parent_params
+        ):
             call["input_parameters"] = input_parameters
         for key, value in kwargs.items():
             if key in parent_params:
@@ -134,11 +141,28 @@ class AlignedSpinReparameterisation(Reparameterisation):
         )
 
     def _inverse_cdf(self, p):
-        """Invert the aligned-spin CDF using the lookup table."""
+        """Invert the aligned-spin CDF: the lookup table, polished with Newton
+        steps on the analytic CDF.
+
+        The table alone is accurate to ~1e-7 in ``chi``, which leaves a ~1e-6
+        mismatch between the forward and inverse log-Jacobians; nessai's
+        ``verify_rescaling`` rejects that wherever the total log-Jacobian is
+        close to zero. A step is kept only where it reduces the residual.
+        """
         p = np.clip(p, self._p_min, self._p_max)
         chi = self._inverse_interp(p)
         bound = self.a_max * (1.0 - self._eps)
-        return np.clip(chi, -bound, bound)
+        chi = np.clip(chi, -bound, bound)
+        res = self._cdf(chi) - p
+        for _ in range(_N_NEWTON):
+            new = np.clip(
+                chi - res * np.exp(-self._log_pdf(chi)), -bound, bound
+            )
+            new_res = self._cdf(new) - p
+            better = np.abs(new_res) < np.abs(res)
+            chi = np.where(better, new, chi)
+            res = np.where(better, new_res, res)
+        return chi
 
     def reparameterise(self, x, x_prime, log_j, **kwargs):
         """Convert from x-space to x'-space (chi -> standard normal)."""

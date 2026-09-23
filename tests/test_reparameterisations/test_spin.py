@@ -75,15 +75,22 @@ def test_prime_prior_is_standard_normal():
 
 
 @pytest.mark.integration_test
-def test_aligned_spin_invertible():
-    """Assert the reparameterisation round-trips."""
+@pytest.mark.parametrize("a_max", [0.99, 0.05])
+def test_aligned_spin_invertible(a_max):
+    """Assert the reparameterisation round-trips to well within nessai's
+    verify_rescaling tolerance (np.allclose, atol=1e-8), for uniform and
+    prior-distributed spins (clustered at zero)."""
     n = 1000
-    a_max = 0.99
     reparam = AlignedSpinReparameterisation(
         parameters="chi_1", prior_bounds={"chi_1": [-a_max, a_max]}
     )
     rng = np.random.default_rng(0)
-    chi = rng.uniform(-a_max, a_max, n)
+    chi = np.concatenate(
+        [
+            rng.uniform(-a_max, a_max, n // 2),
+            rng.uniform(0, a_max, n // 2) * rng.uniform(-1, 1, n // 2),
+        ]
+    )
     x = dict_to_live_points({"chi_1": chi})
     x_prime = empty_structured_array(n, names=["chi_1_prime"])
     log_j = np.zeros(n)
@@ -94,8 +101,8 @@ def test_aligned_spin_invertible():
     x_i, _, log_j_i = reparam.inverse_reparameterise(
         x_in, x_prime_f.copy(), np.zeros(n)
     )
-    np.testing.assert_allclose(x_i["chi_1"], chi, atol=1e-5)
-    np.testing.assert_allclose(log_j_i, -log_j_f, atol=1e-5)
+    np.testing.assert_allclose(x_i["chi_1"], chi, rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(log_j_i, -log_j_f, rtol=0, atol=1e-9)
 
 
 @pytest.mark.integration_test
