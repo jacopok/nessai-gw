@@ -123,16 +123,15 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         )
 
     def reparameterise(self, x, x_prime, log_j, **kwargs):
-        t_det = x["geocent_time"] + self._delay(x)
-        x_prime[self.prime_parameters[0]] = (
-            t_det - self._reference_time
-        ) / self.scale
+        # Subtract the GPS epoch *before* adding the delay: at ~1e9 s a float64
+        # only resolves ~0.24 us, so ``geocent_time + delay`` would round
+        # ``t_det`` onto that grid -- a comb of only ~20 teeth across the
+        # timing posterior of an SNR ~ 700 signal.
+        t_det = (x["geocent_time"] - self._reference_time) + self._delay(x)
+        x_prime[self.prime_parameters[0]] = t_det / self.scale
         return x, x_prime, log_j + self._log_j
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
-        t_det = (
-            x_prime[self.prime_parameters[0]] * self.scale
-            + self._reference_time
-        )
-        x["geocent_time"] = t_det - self._delay(x)
+        t_det = x_prime[self.prime_parameters[0]] * self.scale
+        x["geocent_time"] = self._reference_time + (t_det - self._delay(x))
         return x, x_prime, log_j - self._log_j

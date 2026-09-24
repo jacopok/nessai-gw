@@ -67,7 +67,9 @@ class TestDetectorCenterTime:
 
         gmst = greenwich_mean_sidereal_time(REFERENCE_TIME)
         delay = geocenter_time_delay(ET_EMR_VERTEX, gmst, ra, dec)
-        want = (gt + delay - REFERENCE_TIME) / SCALE
+        # epoch subtracted first: gt + delay would round onto the ~0.24 us
+        # float64 grid of GPS times
+        want = ((gt - REFERENCE_TIME) + delay) / SCALE
         np.testing.assert_allclose(x_prime["t_det"], want, atol=1e-9)
         np.testing.assert_allclose(log_j, -np.log(SCALE), atol=1e-12)
 
