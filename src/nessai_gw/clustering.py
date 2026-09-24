@@ -215,7 +215,9 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     :func:`gaussian_split_gain`.  The split activates once the gain reaches
     :attr:`gain_on` with at least :attr:`activate_fraction` of the points on
     each side, and collapses once the gain drops below :attr:`gain_off` or a
-    side falls below :attr:`min_branch_fraction_floor`; the base class's
+    side falls below :attr:`min_branch_fraction_floor` -- unless the wrapper's
+    ``freeze_min_size`` is set: then a side below it keeps its frozen expert
+    and the current line until it has no points left; the base class's
     ``k_grow_patience``/``k_shrink_patience`` add the round-to-round
     persistence.  While inactive the line simply tracks the best fit; while
     active it is only replaced when a new fit beats the current line's gain
@@ -331,7 +333,8 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         )
         for j in range(k):
             n_j = float(counts[j])
-            if n_j <= 0:
+            if n_j <= 0 or self.is_frozen(j):
+                # never rebuild a flow from the few points of a dying mode
                 continue
             if ref[j] <= 0:
                 ref[j] = n_j
@@ -399,9 +402,19 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
             min_fraction=self.activate_fraction,
         )
         cur_gain = -np.inf
+        dying = False
         if bool(self._split_fitted):
-            cur_gain = gaussian_split_gain(t, self._split_labels(c, v))
-        if fit is not None and (
+            cur_lab = self._split_labels(c, v)
+            cur_gain = gaussian_split_gain(t, cur_lab)
+            n_cur = int(min(cur_lab.sum(), len(cur_lab) - cur_lab.sum()))
+            dying = (
+                active
+                and self.freeze_min_size is not None
+                and n_cur < self.freeze_min_size
+            )
+        # keep the line fixed while a side is dying, so its frozen expert
+        # keeps owning the region it was trained on
+        if fit is not None and not dying and (
             not active or fit["gain"] > cur_gain + self.refit_margin
         ):
             self._store_split(fit)
@@ -426,6 +439,18 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
             "active" if active else "inactive",
         )
         f_min = min(frac, 1.0 - frac)
+        n_small = int(round(f_min * len(c)))
+        if active and self.freeze_min_size is not None and (
+            n_small < self.freeze_min_size
+        ):
+            # A side sinking below the likelihood threshold: its (frozen)
+            # expert keeps proposing until the last of its points is gone,
+            # so the peak of that mode is sampled to the end.  The gain test
+            # is meaningless on a handful of points.
+            if n_small == 0:
+                self._k_now = True
+                return 1
+            return 2
         if active:
             keep = (
                 cur_gain >= self.gain_off

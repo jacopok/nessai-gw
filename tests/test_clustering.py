@@ -91,9 +91,11 @@ class _FakeWrapper(DiagonalSplitClusterWrapper):
     """Only the state ``_k_want`` reads; ``_split_coords`` reads (c, v) off
     the first two columns of ``t``."""
 
-    def __init__(self, active=False):
+    def __init__(self, active=False, freeze_min_size=None):
         torch.nn.Module.__init__(self)
         self.n_experts = 2
+        self.freeze_min_size = freeze_min_size
+        self._k_now = False
         self._n_active = torch.tensor(2 if active else 1)
         self._clustering_seen = torch.tensor(True)
         self._split_normal = torch.zeros(2, dtype=torch.float64)
@@ -213,3 +215,83 @@ def test_make_diagonal_split_cluster_flow_sets_attributes():
         w.activate_fraction,
         w.activate_min_round,
     ) == (0.7, 0.1, 0.08, 5)
+
+
+def test_dying_side_keeps_split_until_empty():
+    """With ``freeze_min_size`` set, a side below it keeps k=2 (and the line)
+    whatever the gain or fraction floor say, and collapses at once when its
+    last point is gone."""
+    _, _, t, _ = _two_populations()
+    w = _FakeWrapper(active=True, freeze_min_size=200)
+    assert w._k_want(t, None, None, None) == 2
+    stored = w._split_normal.clone(), float(w._split_offset)
+    lab = w._split_labels(t[:, 0], t[:, 1])
+    small = int(lab.sum() < len(lab) / 2)
+    idx_small = np.flatnonzero(lab == small)
+    keep = np.concatenate([np.flatnonzero(lab != small), idx_small[:30]])
+    t_dying = t[keep]
+    # 30 points: below freeze_min_size, and below the 1 % fraction floor
+    assert 30 / len(t_dying) < w.min_branch_fraction_floor
+    assert w._k_want(t_dying, None, None, None) == 2
+    assert not w._k_now
+    assert torch.equal(w._split_normal, stored[0])
+    assert float(w._split_offset) == stored[1]
+    t_gone = t[np.flatnonzero(lab != small)]
+    assert w._k_want(t_gone, None, None, None) == 1
+    assert w._k_now
+
+
+def test_without_freeze_small_side_collapses_by_fraction_floor():
+    _, _, t, _ = _two_populations()
+    w = _FakeWrapper(active=True)
+    assert w._k_want(t, None, None, None) == 2
+    lab = w._split_labels(t[:, 0], t[:, 1])
+    small = int(lab.sum() < len(lab) / 2)
+    keep = np.concatenate(
+        [np.flatnonzero(lab != small), np.flatnonzero(lab == small)[:10]]
+    )
+    assert w._k_want(t[keep], None, None, None) == 1
+    assert not w._k_now
+
+
+class _ResettableStub(torch.nn.Module):
+    group_size = 8
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("_canon_seen", torch.ones(3, dtype=torch.bool))
+        self._domain_mass_seen = True
+
+    def _carry_over_group_state(self, old):
+        pass
+
+
+def test_shrink_reset_skips_frozen_experts():
+    cls = type("W", (DiagonalSplitClusterWrapper,), {})
+    w = cls([_ResettableStub(), _ResettableStub()], 4, freeze_min_size=50)
+    w._n_active.fill_(2)
+    w._expert_ref_size = np.array([400.0, 400.0])
+    w._frozen[0] = True
+    labels = torch.as_tensor(np.r_[np.zeros(20), np.ones(100)].astype(int))
+    w._maybe_reset_shrunk_experts(labels)
+    assert bool(w.experts[0]._canon_seen.all())       # frozen: untouched
+    assert not bool(w.experts[1]._canon_seen.any())   # 400 -> 100: reset
+
+
+def test_make_diagonal_split_cluster_flow_forwards_freeze_options():
+    from nessai_gw.group_mixture import ETTriangleGroupAction
+
+    action = ETTriangleGroupAction(
+        reference_time=1187008882.4, polarisation_quarter=True
+    )
+    cls = make_diagonal_split_cluster_flow(
+        freeze_min_size=150,
+        importance_weights=True,
+        group_action_fn=action,
+        group_size=action.group_size,
+        param_names=["sky_u", "sky_v", "psi_prime", "delta_phase",
+                     "theta_jn_prime", "t_det"],
+        in_fundamental_domain=action.in_fundamental_domain,
+    )
+    assert cls.freeze_min_size == 150
+    assert cls.importance_weights is True
