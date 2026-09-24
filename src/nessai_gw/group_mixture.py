@@ -1267,10 +1267,18 @@ class SkyOctantProbit:
     Jacobian (sky block only)::
 
         log|d(a, b)/d(sky_u, sky_v)| = log 8 - log phi(a) - log phi(b)
+
+    ``u_scale`` / ``v_scale`` (default ``4`` / ``2``, the triangular fold) are
+    the reciprocal widths of the sub-square; a sky that no group folds (e.g.
+    the baseline-aligned sky of :mod:`nessai_gw.network_group`) uses ``1`` /
+    ``1``, the probit of the whole unit square.
     """
 
-    def __init__(self, param_names=None):
+    def __init__(self, param_names=None, u_scale=4.0, v_scale=2.0):
         self._iu = self._iv = None
+        self.u_scale = float(u_scale)
+        self.v_scale = float(v_scale)
+        self._log_scale = float(np.log(self.u_scale * self.v_scale))
         if param_names is not None:
             self.bind(param_names)
 
@@ -1287,15 +1295,19 @@ class SkyOctantProbit:
     def forward(self, canon):
         """``canon -> (t, log|det dt/dcanon|)`` (sky block probit-mapped)."""
         iu, iv = self._iu, self._iv
-        u = torch.clamp(4.0 * canon[:, iu], _SKY_PROBIT_EPS, 1.0 - _SKY_PROBIT_EPS)
-        v = torch.clamp(2.0 * canon[:, iv], _SKY_PROBIT_EPS, 1.0 - _SKY_PROBIT_EPS)
+        u = torch.clamp(
+            self.u_scale * canon[:, iu], _SKY_PROBIT_EPS, 1.0 - _SKY_PROBIT_EPS
+        )
+        v = torch.clamp(
+            self.v_scale * canon[:, iv], _SKY_PROBIT_EPS, 1.0 - _SKY_PROBIT_EPS
+        )
         a = torch.special.ndtri(u)
         b = torch.special.ndtri(v)
         t = canon.clone()
         t[:, iu] = a
         t[:, iv] = b
         log_j = (
-            np.log(8.0)
+            self._log_scale
             - _log_std_normal_pdf(a)
             - _log_std_normal_pdf(b)
         )
@@ -1306,10 +1318,10 @@ class SkyOctantProbit:
         iu, iv = self._iu, self._iv
         a, b = t[:, iu], t[:, iv]
         canon = t.clone()
-        canon[:, iu] = 0.25 * torch.special.ndtr(a)
-        canon[:, iv] = 0.5 * torch.special.ndtr(b)
+        canon[:, iu] = torch.special.ndtr(a) / self.u_scale
+        canon[:, iv] = torch.special.ndtr(b) / self.v_scale
         log_j = (
-            -np.log(8.0)
+            -self._log_scale
             + _log_std_normal_pdf(a)
             + _log_std_normal_pdf(b)
         )
@@ -2313,6 +2325,195 @@ def recommended_polarisation_offset(psi):
     }
 
 
+def _select_flow_model_factory(
+    n_clusters_max,
+    flow_model_factory=None,
+    cluster_method="gmm",
+    cluster_max_overlap=0.05,
+    cluster_min_size=200,
+    cluster_bg_weight=0.0,
+    cluster_k_grow_patience=2,
+    cluster_centroid_ema=None,
+):
+    """The ``make_*_group_mixture_flow`` callable a group proposal factory uses:
+    nessai's single-flow factory, its clustered one (``n_clusters_max > 1``), or
+    a user ``flow_model_factory`` (only with ``n_clusters_max > 1``)."""
+    from nessai.flowmodel.group_mixture import make_group_mixture_flow
+
+    if int(n_clusters_max) > 1 and flow_model_factory is not None:
+        _make_flow_model = flow_model_factory
+    elif int(n_clusters_max) > 1:
+        try:
+            from nessai.flowmodel.group_mixture import (
+                make_clustered_group_mixture_flow,
+            )
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "n_clusters_max > 1 requires a version of nessai whose "
+                "nessai.flowmodel.group_mixture ships "
+                "make_clustered_group_mixture_flow."
+            ) from exc
+
+        def _make_flow_model(**gm):
+            extra = {}
+            _sig = inspect.signature(make_clustered_group_mixture_flow)
+            if "k_grow_patience" in _sig.parameters:
+                extra["k_grow_patience"] = int(cluster_k_grow_patience)
+            if "centroid_ema" in _sig.parameters:
+                extra["centroid_ema"] = (
+                    None if cluster_centroid_ema is None
+                    else float(cluster_centroid_ema)
+                )
+            return make_clustered_group_mixture_flow(
+                n_clusters_max=int(n_clusters_max),
+                cluster_method=cluster_method,
+                max_cluster_overlap=float(cluster_max_overlap),
+                min_cluster_size=int(cluster_min_size),
+                bg_weight=float(cluster_bg_weight),
+                **extra,
+                **gm,
+            )
+    else:
+        _make_flow_model = make_group_mixture_flow
+    return _make_flow_model
+
+
+def _make_group_proposal_class(
+    class_name,
+    flow_model_cls,
+    action,
+    sky_rotation,
+    sky_2d,
+    psi_single,
+    phase_coordinates,
+    sky_radial_sigma=0.15,
+):
+    """``FlowProposal`` subclass for a nessai-gw group-mixture flow.
+
+    Shared by :func:`make_triangular_group_flow_proposal` and
+    :func:`nessai_gw.network_group.make_network_group_flow_proposal`: the sky
+    is carried in the frame ``sky_rotation`` (equatorial -> flow frame, GMST
+    folded in) by :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky`
+    (``sky_2d``) or :class:`~nessai_gw.reparameterisations.sky.RotatedAnglePair`,
+    ``psi`` optionally by a single ``psi_prime`` coordinate, and a prime-space
+    ``action`` (``None`` on the physical-space path) is re-bound to nessai's
+    actual prime-parameter order after every (re-)initialisation.  The class is
+    published at module scope as ``class_name`` so checkpoints unpickle.
+    """
+    from nessai.flowmodel.group_mixture import GroupFlowProposalMixin
+    from nessai.proposal import FlowProposal
+
+    from .proposals import GWReparamMixin
+
+    class _GroupFlowProposal(
+        GWReparamMixin, GroupFlowProposalMixin, FlowProposal
+    ):
+        """``FlowProposal`` wired for a nessai-gw group-mixture flow with the
+        nessai-gw GW reparameterisations."""
+
+        _FlowModelClass = flow_model_cls
+
+        def add_default_reparameterisations(self):
+            # Sky: carried in the ``sky_rotation`` frame (for a triangle, the
+            # detector frame, so the group's fundamental domain is
+            # axis-aligned rather than an oblique equatorial wedge).
+            rep = self._reparameterisation
+            model_names = set(self.model.names)
+            if (
+                phase_coordinates != "arg-alpha-beta"
+                and psi_single
+                and "psi" in model_names
+                and "psi" not in set(rep.parameters)
+            ):
+                # Single ``psi_prime`` coordinate instead of the angle-pi
+                # Cartesian pair + chi(2) radius (the bare psi is only weakly
+                # constrained; the pair's free radius gives an origin cusp).
+                from .reparameterisations.phase import (
+                    SingleAngleReparameterisation,
+                )
+
+                rep.add_reparameterisation(
+                    SingleAngleReparameterisation(
+                        parameters=["psi"],
+                        prior_bounds={"psi": self.model.bounds["psi"]},
+                        scale=2.0,
+                    )
+                )
+            if {"ra", "dec"} <= model_names and not (
+                {"ra", "dec"} & set(rep.parameters)
+            ):
+                sky_bounds = {
+                    k: self.model.bounds[k] for k in ("ra", "dec")
+                }
+                if sky_2d:
+                    from .reparameterisations.sky import EqualAreaSky
+
+                    rep.add_reparameterisation(
+                        EqualAreaSky(
+                            parameters=["ra", "dec"],
+                            prior_bounds=sky_bounds,
+                            rotation=sky_rotation,
+                            rng=self.rng,
+                        )
+                    )
+                else:
+                    from .reparameterisations.sky import RotatedAnglePair
+
+                    rep.add_reparameterisation(
+                        RotatedAnglePair(
+                            parameters=["ra", "dec"],
+                            prior_bounds=sky_bounds,
+                            convention="ra-dec",
+                            rotation=sky_rotation,
+                            radial_sigma=sky_radial_sigma,
+                            rng=self.rng,
+                        )
+                    )
+            super().add_default_reparameterisations()
+
+        def _realign_prime_space_action(self):
+            """Realign the prime-space action and model to nessai's actual
+            prime parameter order (do not assume the reparameterisation-dict
+            order, nor the throwaway-probe order ``_prime_parameter_names``
+            predicted when ``flow_model_cls`` was built -- see that
+            function's docstring). ``get_model()`` (called both by
+            ``initialise()`` and, on every ``--reset-flow`` trigger, by
+            ``FlowModel.reset_model()``) falls back to that predicted order
+            via the ``param_names`` *class* attribute, so this must be
+            re-applied after a reset too, not just once at startup -- a
+            reset that skipped it silently reverted every model to the
+            (possibly wrong) predicted order, scrambling which physical
+            quantity landed in which prime-vector column.
+            """
+            if action is None:
+                return
+            model = getattr(self.flow, "model", None)
+            prime = list(getattr(self, "prime_parameters", []) or [])
+            if model is not None and prime:
+                action.bind(prime)
+                if hasattr(model, "set_param_names"):
+                    model.set_param_names(prime)
+                else:
+                    model.param_names = prime
+
+        def initialise(self, *args, **kwargs):
+            super().initialise(*args, **kwargs)
+            self._realign_prime_space_action()
+
+        def reset_model_weights(self, **kwargs):
+            super().reset_model_weights(**kwargs)
+            self._realign_prime_space_action()
+
+    # nessai checkpoints the sampler (hence the proposal *instance*) with
+    # ``pickle``, which resolves an instance's class by ``module.__qualname__``.
+    # Publish this otherwise-local class at module scope under a stable name.
+    _GroupFlowProposal.__name__ = class_name
+    _GroupFlowProposal.__module__ = __name__
+    _GroupFlowProposal.__qualname__ = class_name
+    globals()[class_name] = _GroupFlowProposal
+    return _GroupFlowProposal
+
+
 def make_triangular_group_flow_proposal(
     sampling_parameters,
     reference_time,
@@ -2540,11 +2741,7 @@ def make_triangular_group_flow_proposal(
         ``False``.
     """
     try:
-        from nessai.proposal import FlowProposal
-        from nessai.flowmodel.group_mixture import (
-            GroupFlowProposalMixin,
-            make_group_mixture_flow,
-        )
+        from nessai.flowmodel.group_mixture import make_group_mixture_flow
     except ImportError as exc:  # pragma: no cover - depends on nessai version
         raise RuntimeError(
             "make_triangular_group_flow_proposal requires a version of nessai "
@@ -2552,43 +2749,16 @@ def make_triangular_group_flow_proposal(
             "make_group_mixture_flow)."
         ) from exc
 
-    if int(n_clusters_max) > 1 and flow_model_factory is not None:
-        _make_flow_model = flow_model_factory
-    elif int(n_clusters_max) > 1:
-        try:
-            from nessai.flowmodel.group_mixture import (
-                make_clustered_group_mixture_flow,
-            )
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError(
-                "n_clusters_max > 1 requires a version of nessai whose "
-                "nessai.flowmodel.group_mixture ships "
-                "make_clustered_group_mixture_flow."
-            ) from exc
-
-        def _make_flow_model(**gm):
-            extra = {}
-            _sig = inspect.signature(make_clustered_group_mixture_flow)
-            if "k_grow_patience" in _sig.parameters:
-                extra["k_grow_patience"] = int(cluster_k_grow_patience)
-            if "centroid_ema" in _sig.parameters:
-                extra["centroid_ema"] = (
-                    None if cluster_centroid_ema is None
-                    else float(cluster_centroid_ema)
-                )
-            return make_clustered_group_mixture_flow(
-                n_clusters_max=int(n_clusters_max),
-                cluster_method=cluster_method,
-                max_cluster_overlap=float(cluster_max_overlap),
-                min_cluster_size=int(cluster_min_size),
-                bg_weight=float(cluster_bg_weight),
-                **extra,
-                **gm,
-            )
-    else:
-        _make_flow_model = make_group_mixture_flow
-
-    from .proposals import GWReparamMixin
+    _make_flow_model = _select_flow_model_factory(
+        n_clusters_max,
+        flow_model_factory,
+        cluster_method=cluster_method,
+        cluster_max_overlap=cluster_max_overlap,
+        cluster_min_size=cluster_min_size,
+        cluster_bg_weight=cluster_bg_weight,
+        cluster_k_grow_patience=cluster_k_grow_patience,
+        cluster_centroid_ema=cluster_centroid_ema,
+    )
 
     if gaussianise_sky == "auto":
         gaussianise_sky = bool(prime_space)
@@ -2774,112 +2944,16 @@ def make_triangular_group_flow_proposal(
             **_extra,
         )
 
-    class TriangularGroupFlowProposal(
-        GWReparamMixin, GroupFlowProposalMixin, FlowProposal
-    ):
-        """``FlowProposal`` wired for the triangular-detector group-mixture flow
-        with the nessai-gw GW reparameterisations."""
-
-        _FlowModelClass = flow_model_cls
-
-        def add_default_reparameterisations(self):
-            # Sky: use the detector-frame-rotated AnglePair so the group's
-            # fundamental domain is the axis-aligned octant x, y, z >= 0
-            # rather than an oblique equatorial wedge (see RotatedAnglePair).
-            rep = self._reparameterisation
-            model_names = set(self.model.names)
-            if (
-                phase_coordinates != "arg-alpha-beta"
-                and psi_single
-                and "psi" in model_names
-                and "psi" not in set(rep.parameters)
-            ):
-                # Single ``psi_prime`` coordinate instead of the angle-pi
-                # Cartesian pair + chi(2) radius (the bare psi is only weakly
-                # constrained; the pair's free radius gives an origin cusp).
-                from .reparameterisations.phase import (
-                    SingleAngleReparameterisation,
-                )
-
-                rep.add_reparameterisation(
-                    SingleAngleReparameterisation(
-                        parameters=["psi"],
-                        prior_bounds={"psi": self.model.bounds["psi"]},
-                        scale=2.0,
-                    )
-                )
-            if {"ra", "dec"} <= model_names and not (
-                {"ra", "dec"} & set(rep.parameters)
-            ):
-                sky_bounds = {
-                    k: self.model.bounds[k] for k in ("ra", "dec")
-                }
-                if sky_2d:
-                    from .reparameterisations.sky import EqualAreaSky
-
-                    rep.add_reparameterisation(
-                        EqualAreaSky(
-                            parameters=["ra", "dec"],
-                            prior_bounds=sky_bounds,
-                            rotation=base_action.sky_frame_rotation,
-                            rng=self.rng,
-                        )
-                    )
-                else:
-                    from .reparameterisations.sky import RotatedAnglePair
-
-                    rep.add_reparameterisation(
-                        RotatedAnglePair(
-                            parameters=["ra", "dec"],
-                            prior_bounds=sky_bounds,
-                            convention="ra-dec",
-                            rotation=base_action.sky_frame_rotation,
-                            radial_sigma=sky_radial_sigma,
-                            rng=self.rng,
-                        )
-                    )
-            super().add_default_reparameterisations()
-
-        def _realign_prime_space_action(self):
-            """Realign the prime-space action and model to nessai's actual
-            prime parameter order (do not assume the reparameterisation-dict
-            order, nor the throwaway-probe order ``_prime_parameter_names``
-            predicted when ``flow_model_cls`` was built -- see that
-            function's docstring). ``get_model()`` (called both by
-            ``initialise()`` and, on every ``--reset-flow`` trigger, by
-            ``FlowModel.reset_model()``) falls back to that predicted order
-            via the ``param_names`` *class* attribute, so this must be
-            re-applied after a reset too, not just once at startup -- a
-            reset that skipped it silently reverted every model to the
-            (possibly wrong) predicted order, scrambling which physical
-            quantity landed in which prime-vector column.
-            """
-            if action is None:
-                return
-            model = getattr(self.flow, "model", None)
-            prime = list(getattr(self, "prime_parameters", []) or [])
-            if model is not None and prime:
-                action.bind(prime)
-                if hasattr(model, "set_param_names"):
-                    model.set_param_names(prime)
-                else:
-                    model.param_names = prime
-
-        def initialise(self, *args, **kwargs):
-            super().initialise(*args, **kwargs)
-            self._realign_prime_space_action()
-
-        def reset_model_weights(self, **kwargs):
-            super().reset_model_weights(**kwargs)
-            self._realign_prime_space_action()
-
-    # nessai checkpoints the sampler (hence the proposal *instance*) with
-    # ``pickle``, which resolves an instance's class by ``module.__qualname__``.
-    # Publish this otherwise-local class at module scope under a stable name.
-    TriangularGroupFlowProposal.__module__ = __name__
-    TriangularGroupFlowProposal.__qualname__ = "TriangularGroupFlowProposal"
-    globals()["TriangularGroupFlowProposal"] = TriangularGroupFlowProposal
-    return TriangularGroupFlowProposal
+    return _make_group_proposal_class(
+        "TriangularGroupFlowProposal",
+        flow_model_cls,
+        action,
+        sky_rotation=base_action.sky_frame_rotation,
+        sky_2d=sky_2d,
+        psi_single=psi_single,
+        phase_coordinates=phase_coordinates,
+        sky_radial_sigma=sky_radial_sigma,
+    )
 
 
 # ---------------------------------------------------------------------------
