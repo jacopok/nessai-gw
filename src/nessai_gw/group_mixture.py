@@ -1978,6 +1978,7 @@ def triangular_group_reparameterisations(
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
     effective_spin=False,
+    log_mass_ratio=True,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2031,6 +2032,10 @@ def triangular_group_reparameterisations(
       ``N(0, 1)`` under the prior; see
       :class:`~nessai_gw.reparameterisations.EffectiveSpinReparameterisation`.
       ``mass_ratio`` is a prerequisite, so this is ranked ahead as well.
+    * ``mass_ratio`` -> ``log-mass-ratio`` (unless ``log_mass_ratio`` is
+      unset): ``ln q`` rescaled to its bounds, as Roulet et al. sample it, with
+      the ``mass_ratio`` edge detection / boundary inversion (the ``q = 1``
+      edge) done in log space.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
@@ -2097,6 +2102,10 @@ def triangular_group_reparameterisations(
         ``(chi_eff_prime, chi_diff_prime)`` (``effective-spin``) instead of
         one ``aligned-spin`` coordinate each.  Needs ``mass_ratio`` to be
         sampled; does nothing without both spins.  Default ``False``.
+    log_mass_ratio : bool, optional
+        Sample ``mass_ratio`` as ``ln q`` (``log-mass-ratio``) rather than
+        ``q`` (``mass_ratio``).  The prime name stays ``mass_ratio_prime``.
+        Default ``True``.
 
     Returns
     -------
@@ -2191,6 +2200,8 @@ def triangular_group_reparameterisations(
             continue  # covered by the joint ``effective-spin`` entry
         elif name in ("chi_1", "chi_2"):
             reps[name] = {"reparameterisation": "aligned-spin"}
+        elif name == "mass_ratio" and log_mass_ratio:
+            reps[name] = {"reparameterisation": "log-mass-ratio"}
         elif name in ("lambda_1", "lambda_2"):
             reps[name] = {
                 "reparameterisation": "logit",
@@ -2294,6 +2305,7 @@ def _prime_parameter_names(
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
     effective_spin=False,
+    log_mass_ratio=True,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2354,6 +2366,7 @@ def _prime_parameter_names(
                 ),
                 chirp_distance_fiducial=chirp_distance_fiducial,
                 effective_spin=effective_spin,
+                log_mass_ratio=log_mass_ratio,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -2709,6 +2722,7 @@ def make_triangular_group_flow_proposal(
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
     effective_spin=False,
+    log_mass_ratio=True,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -2915,6 +2929,9 @@ def make_triangular_group_flow_proposal(
         Must match :func:`triangular_group_reparameterisations`: the flow sees
         ``chi_eff_prime`` / ``chi_diff_prime`` in place of ``chi_1_prime`` /
         ``chi_2_prime``.  Default ``False``.
+    log_mass_ratio : bool, optional
+        Must match :func:`triangular_group_reparameterisations` (only the
+        probe's prime order depends on it).  Default ``True``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -3012,6 +3029,7 @@ def make_triangular_group_flow_proposal(
             chirp_distance_k0=chirp_distance_k0,
             chirp_distance_fiducial=chirp_distance_fiducial,
             effective_spin=effective_spin,
+            log_mass_ratio=log_mass_ratio,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3271,6 +3289,7 @@ def make_et_group_flow_proposal(
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
     effective_spin=False,
+    log_mass_ratio=True,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3309,6 +3328,7 @@ def make_et_group_flow_proposal(
         chirp_distance_k0=chirp_distance_k0,
         chirp_distance_fiducial=chirp_distance_fiducial,
         effective_spin=effective_spin,
+        log_mass_ratio=log_mass_ratio,
         phase_recanon=phase_recanon,
         adaptive_domain=adaptive_domain,
     )

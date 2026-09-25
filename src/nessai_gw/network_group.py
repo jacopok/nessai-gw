@@ -553,7 +553,11 @@ def _chirp_distance_kwargs(geometry, chirp_distance):
 
 
 def network_group_reparameterisations(
-    sampling_parameters, geometry, chirp_distance=True, effective_spin=True
+    sampling_parameters,
+    geometry,
+    chirp_distance=True,
+    effective_spin=True,
+    log_mass_ratio=True,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -562,7 +566,8 @@ def network_group_reparameterisations(
     with the ``detector-center-time`` vertex at the network's SNR-weighted
     barycentre: ``delta_phase`` (``polarisation-phase``) for ``phase``,
     fixed-bounds ``angle-sine`` for ``theta_jn``, ``aligned-spin`` for aligned
-    spins, ``logit`` for tides and, by default, the ``chirp-distance`` at the
+    spins, ``logit`` for tides, ``log-mass-ratio`` (``ln q``) for
+    ``mass_ratio`` and, by default, the ``chirp-distance`` at the
     loudest detector (``geometry.reference_detector``) for
     ``luminosity_distance`` and the joint ``effective-spin``
     ``(chi_eff_prime, chi_diff_prime)`` for aligned ``chi_1``, ``chi_2``.  ``psi`` and the sky are added by the proposal
@@ -585,6 +590,9 @@ def network_group_reparameterisations(
         Carry aligned ``chi_1``, ``chi_2`` as the effective-spin pair (needs
         ``mass_ratio``).  Ignored without both spins.  Must match
         :func:`make_network_group_flow_proposal`.  Default ``True``.
+    log_mass_ratio : bool, optional
+        Sample ``mass_ratio`` as ``ln q`` (``log-mass-ratio``).  Must match
+        :func:`make_network_group_flow_proposal`.  Default ``True``.
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
@@ -592,6 +600,7 @@ def network_group_reparameterisations(
         vertex=geometry.timing_vertex,
         phase_coordinates="polarisation-phase",
         effective_spin=effective_spin,
+        log_mass_ratio=log_mass_ratio,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
@@ -616,6 +625,7 @@ def make_network_group_flow_proposal(
     flow_model_factory=None,
     chirp_distance=True,
     effective_spin=True,
+    log_mass_ratio=True,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -659,6 +669,9 @@ def make_network_group_flow_proposal(
         Whether aligned spins are carried as ``(chi_eff_prime,
         chi_diff_prime)``; must match :func:`network_group_reparameterisations`.
         Default ``True``.
+    log_mass_ratio : bool, optional
+        Whether ``mass_ratio`` is sampled as ``ln q``; must match
+        :func:`network_group_reparameterisations`.  Default ``True``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -689,6 +702,7 @@ def make_network_group_flow_proposal(
     prime_names = _prime_parameter_names(
         names, geometry.reference_time, vertex=geometry.timing_vertex,
         sky_2d=True, psi_single=True, effective_spin=effective_spin,
+        log_mass_ratio=log_mass_ratio,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),

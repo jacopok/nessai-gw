@@ -59,6 +59,20 @@ known_reparameterisations.add_reparameterisation(
         "update_bounds": True,
     },
 )
+# ``mass_ratio`` sampled as ``ln q`` (Roulet et al. 2022, arXiv:2207.03508):
+# the same bounded rescaling, edge detection and boundary inversion as
+# ``mass_ratio``, applied after the log (bounds are mapped too).
+known_reparameterisations.add_reparameterisation(
+    "log-mass-ratio",
+    RescaleToBounds,
+    {
+        "pre_rescaling": "log",
+        "detect_edges": True,
+        "boundary_inversion": True,
+        "inversion_type": "duplicate",
+        "update_bounds": True,
+    },
+)
 known_reparameterisations.add_reparameterisation(
     "mass",
     RescaleToBounds,

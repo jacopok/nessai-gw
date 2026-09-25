@@ -512,6 +512,11 @@ def test_network_proposal_initialise_train_and_draw(geometry, tmp_path):
         "luminosity_distance_prime", "chi_1_prime", "chi_2_prime"
     } & set(prime)
     assert proposal.flow.model.param_names == prime
+    (q_reparam,) = [
+        r for r in proposal._reparameterisation.values()
+        if "mass_ratio" in r.parameters and len(r.parameters) == 1
+    ]
+    assert q_reparam.has_pre_rescaling  # sampled as ln q
 
     rng = np.random.default_rng(7)
     from nessai.livepoint import numpy_array_to_live_points
