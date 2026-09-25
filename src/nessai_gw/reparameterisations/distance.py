@@ -103,6 +103,14 @@ class DistanceReparameterisation(RescaleToBounds):
 
         self.detect_edges_kwargs["allowed_bounds"] = allowed_bounds
         self.detect_edges_kwargs["allow_both"] = allow_both
-        self.detect_edges_kwargs["x_range"] = self.prior_bounds[
-            self.parameters[0]
-        ]
+        # Use the local `prior_bounds`/`parameters` rather than
+        # `self.prior_bounds`/`self.parameters`: the latter are only
+        # populated as a side effect of `super().__init__` above, which
+        # relies on `self.parameters` being backed by the real
+        # `Reparameterisation.parameters` property. That property is not
+        # reconstructed on a mocked/autospecced instance (it becomes an
+        # independent, disconnected attribute), so indexing through `self`
+        # silently reads a stale Mock there instead of raising -- the local
+        # variables are exactly what was just passed to `super().__init__`
+        # and are correct in both cases.
+        self.detect_edges_kwargs["x_range"] = prior_bounds[parameters[0]]

@@ -593,20 +593,24 @@ def test_rotated_anglepair_matches_anglepair_rotated():
         rng=np.random.default_rng(1),
     )
     n = 500
-    x = np.zeros(n, dtype=[(p, "f8") for p in plain.parameters])
+    x = np.zeros(
+        n, dtype=[(p, "f8") for p in plain.parameters + plain.auxiliary_parameters]
+    )
     x["ra"] = rng.uniform(0, 2 * np.pi, n)
     x["dec"] = np.arcsin(rng.uniform(-1, 1, n))
-    x[plain.parameters[2]] = rng.uniform(0.5, 1.5, n)
-    dt = [(p, "f8") for p in plain.prime_parameters]
+    x[plain.auxiliary_parameters[0]] = rng.uniform(0.5, 1.5, n)
+    dt = [(p, "f8") for p in plain.output_parameters]
     xp_a = np.zeros(n, dtype=dt)
     xp_b = np.zeros(n, dtype=dt)
     _, xp_a, _ = plain.reparameterise(x.copy(), xp_a, np.zeros(n))
     _, xp_b, _ = rot.reparameterise(x.copy(), xp_b, np.zeros(n))
-    va = np.stack([xp_a[p] for p in plain.prime_parameters], axis=-1)
-    vb = np.stack([xp_b[p] for p in rot.prime_parameters], axis=-1)
+    va = np.stack([xp_a[p] for p in plain.output_parameters], axis=-1)
+    vb = np.stack([xp_b[p] for p in rot.output_parameters], axis=-1)
     np.testing.assert_allclose(vb, va @ R.T, atol=1e-9)
 
-    back = np.zeros(n, dtype=[(p, "f8") for p in rot.parameters])
+    back = np.zeros(
+        n, dtype=[(p, "f8") for p in rot.parameters + rot.auxiliary_parameters]
+    )
     back, _, _ = rot.inverse_reparameterise(back, xp_b, np.zeros(n))
     np.testing.assert_allclose(np.cos(back["ra"]), np.cos(x["ra"]), atol=1e-6)
     np.testing.assert_allclose(np.sin(back["ra"]), np.sin(x["ra"]), atol=1e-6)
@@ -636,9 +640,9 @@ def test_rotated_anglepair_radial_shell():
             convention="ra-dec", rotation=R, radial_sigma=radial_sigma,
             rng=np.random.default_rng(1),
         )
-        xp = np.zeros(n, dtype=[(p, "f8") for p in rep.prime_parameters])
+        xp = np.zeros(n, dtype=[(p, "f8") for p in rep.output_parameters])
         _, xp, _ = rep.reparameterise(x.copy(), xp, np.zeros(n))
-        v = np.stack([xp[p] for p in rep.prime_parameters], axis=-1)
+        v = np.stack([xp[p] for p in rep.output_parameters], axis=-1)
         return np.linalg.norm(v, axis=1)
 
     shell = radii(0.15)

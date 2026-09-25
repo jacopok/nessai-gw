@@ -7,6 +7,7 @@ from nessai.reparameterisations import (
     default_reparameterisations as base_reparameterisations,
 )
 
+from .chirp_distance import ChirpDistanceReparameterisation
 from .distance import DistanceReparameterisation
 from .inclination import PolarisationEllipseReparameterisation
 from .phase import (
@@ -94,6 +95,12 @@ known_reparameterisations.add_reparameterisation(
     "fitted-phase-rotation",
     FittedPhaseRotation,
     {"angle": 0.0, "psi0": 0.0, "phase0": 0.0},
+)
+
+known_reparameterisations.add_reparameterisation(
+    "chirp-distance",
+    ChirpDistanceReparameterisation,
+    {},
 )
 
 known_reparameterisations.add_reparameterisation(
