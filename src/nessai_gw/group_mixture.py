@@ -236,6 +236,33 @@ def detector_plane_normal(interferometers) -> np.ndarray:
     return n / np.linalg.norm(n)
 
 
+def detector_tensors(interferometers) -> np.ndarray:
+    """Earth-fixed detector tensors, shape ``(n_det, 3, 3)``.
+
+    Parameters
+    ----------
+    interferometers : iterable
+        Iterable of bilby / bilby_xG ``Interferometer`` objects, each exposing
+        ``detector_tensor`` (or ``geometry.detector_tensor``).
+
+    Returns
+    -------
+    numpy.ndarray
+        The stacked tensors, in interferometer order.  Used by the
+        ``chirp-distance`` reparameterisation
+        (:class:`~nessai_gw.reparameterisations.ChirpDistanceReparameterisation`).
+    """
+    return np.array([
+        np.asarray(
+            getattr(ifo, "detector_tensor", None)
+            if getattr(ifo, "detector_tensor", None) is not None
+            else ifo.geometry.detector_tensor,
+            dtype=float,
+        )
+        for ifo in interferometers
+    ])
+
+
 def detector_vertex(interferometers) -> np.ndarray:
     """Mean geocentric vertex position (metres) of a triangular interferometer.
 
@@ -1932,6 +1959,11 @@ class SkyOctantPullback:
         return canon, log_j
 
 
+#: Parameters the ``chirp-distance`` coordinate is a function of, besides
+#: ``luminosity_distance`` itself.
+CHIRP_DISTANCE_REQUIRES = ("chirp_mass", "theta_jn", "ra", "dec", "psi")
+
+
 def triangular_group_reparameterisations(
     sampling_parameters,
     reference_time,
@@ -1942,8 +1974,7 @@ def triangular_group_reparameterisations(
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
     chirp_distance=False,
-    chirp_distance_plane_normal=None,
-    chirp_distance_azimuth_offset=0.0,
+    chirp_distance_tensors=None,
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
 ):
@@ -1986,7 +2017,11 @@ def triangular_group_reparameterisations(
       detector's posterior (``corr = 0.998`` on the unreparameterised
       ET-Delta coordinate).  ``chirp_mass`` (``mass``), ``theta_jn`` and
       ``ra``/``dec``/``psi`` are prerequisites, so this is ranked ahead of
-      everything else in the returned dict.
+      everything else in the returned dict.  ``|R_k0|`` is invariant under
+      the group (see :mod:`nessai_gw._effective_distance`), so the prime-space
+      action passes ``chirp_distance`` through untouched.  With no
+      ``luminosity_distance`` in ``sampling_parameters`` (e.g. a
+      distance-marginalised run) the switch does nothing.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
@@ -2034,18 +2069,16 @@ def triangular_group_reparameterisations(
         Reparameterise ``luminosity_distance`` as the Roulet et al. chirp
         distance instead of the default ``distance`` reparameterisation.
         Default ``False``.
-    chirp_distance_plane_normal : array_like, optional
-        Detector-plane normal for the antenna response used to pick the
-        reference detector and evaluate ``R_k0``.  Defaults to
-        :data:`ET_EMR_PLANE_NORMAL`.
-    chirp_distance_azimuth_offset : float, optional
-        In-plane rotation (rad), matching the group action's
-        ``azimuth_offset``.  ``cos iota*``-type quantities built from ``R_k``
-        do not depend on it in the way the group action itself does, but it
-        is accepted so the two can be configured identically.  Default 0.
+    chirp_distance_tensors : array_like, optional
+        ``(n_det, 3, 3)`` Earth-fixed detector tensors the reference detector
+        is chosen from and ``R_k0`` is evaluated on (:func:`detector_tensors`).
+        Defaults to :data:`ET_EMR_DETECTOR_TENSORS`, like ``vertex``.  Must be
+        the real tensors, not the idealised triangle's (see
+        :mod:`nessai_gw._effective_distance`).
     chirp_distance_k0 : int, optional
-        The reference detector index directly. Exactly one of ``chirp_distance_k0``
-        / ``chirp_distance_fiducial`` must be given when ``chirp_distance`` is set.
+        The reference detector index (into ``chirp_distance_tensors``)
+        directly.  One of ``chirp_distance_k0`` / ``chirp_distance_fiducial``
+        must be given when ``chirp_distance`` is set; ``k0`` wins if both are.
     chirp_distance_fiducial : mapping, optional
         ``ra``, ``dec``, ``psi``, ``theta_jn`` of a reference signal (typically
         the injection or the maximum-likelihood point), used to pick
@@ -2058,11 +2091,22 @@ def triangular_group_reparameterisations(
     """
     if vertex is None:
         vertex = ET_EMR_VERTEX
-    if chirp_distance and chirp_distance_k0 is None and chirp_distance_fiducial is None:
-        raise ValueError(
-            "chirp_distance requires either chirp_distance_k0 or "
-            "chirp_distance_fiducial."
-        )
+    chirp_distance = bool(chirp_distance) and (
+        "luminosity_distance" in sampling_parameters
+    )
+    if chirp_distance:
+        if chirp_distance_k0 is None and chirp_distance_fiducial is None:
+            raise ValueError(
+                "chirp_distance requires either chirp_distance_k0 or "
+                "chirp_distance_fiducial."
+            )
+        missing = sorted(set(CHIRP_DISTANCE_REQUIRES) - set(sampling_parameters))
+        if missing:
+            raise ValueError(
+                f"chirp_distance needs {missing} in the sampling parameters "
+                "(the chirp distance is d_L / (chirp_mass^{5/6} |R_k0|)); "
+                "pass chirp_distance=False."
+            )
     if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
         raise ValueError(
             "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
@@ -2103,12 +2147,11 @@ def triangular_group_reparameterisations(
         if name == "luminosity_distance" and chirp_distance:
             reps[name] = {
                 "reparameterisation": "chirp-distance",
-                "plane_normal": (
-                    ET_EMR_PLANE_NORMAL if chirp_distance_plane_normal is None
-                    else chirp_distance_plane_normal
+                "tensors": (
+                    ET_EMR_DETECTOR_TENSORS if chirp_distance_tensors is None
+                    else np.asarray(chirp_distance_tensors, dtype=float)
                 ),
                 "reference_time": float(reference_time),
-                "azimuth_offset": float(chirp_distance_azimuth_offset),
                 "k0": chirp_distance_k0,
                 "fiducial": chirp_distance_fiducial,
             }
@@ -2213,8 +2256,7 @@ def _prime_parameter_names(
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
     chirp_distance=False,
-    chirp_distance_plane_normal=None,
-    chirp_distance_azimuth_offset=0.0,
+    chirp_distance_tensors=None,
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
 ):
@@ -2267,9 +2309,14 @@ def _prime_parameter_names(
                 polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
                 polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
                 chirp_distance=chirp_distance,
-                chirp_distance_plane_normal=chirp_distance_plane_normal,
-                chirp_distance_azimuth_offset=chirp_distance_azimuth_offset,
-                chirp_distance_k0=chirp_distance_k0,
+                chirp_distance_tensors=chirp_distance_tensors,
+                # Only the prime *name* is read back, so any reference
+                # detector will do when the caller has not picked one.
+                chirp_distance_k0=(
+                    0 if chirp_distance_k0 is None
+                    and chirp_distance_fiducial is None
+                    else chirp_distance_k0
+                ),
                 chirp_distance_fiducial=chirp_distance_fiducial,
             ),
             fallback_reparameterisation="zscore",
@@ -2616,6 +2663,7 @@ def make_triangular_group_flow_proposal(
     phase_recanon=False,
     adaptive_domain=False,
     chirp_distance=False,
+    chirp_distance_tensors=None,
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
 ):
@@ -2812,6 +2860,14 @@ def make_triangular_group_flow_proposal(
         (and, with ``phase_recanon``, may fold the quarter turn on the phase).
         Same requirements as ``phase_recanon``, plus ``sky_2d``.  Default
         ``False``.
+    chirp_distance, chirp_distance_tensors, chirp_distance_k0, chirp_distance_fiducial : optional
+        Must match the ``reparameterisations`` built by
+        :func:`triangular_group_reparameterisations`: with ``chirp_distance``
+        the flow sees ``chirp_distance`` in place of
+        ``luminosity_distance_prime``.  Only that prime name depends on them
+        here -- the coordinate is group-invariant, so
+        :class:`PrimeSpaceTriangularGroupAction` passes it through -- and
+        ``k0`` / ``fiducial`` may be omitted.  Default ``False``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -2905,8 +2961,7 @@ def make_triangular_group_flow_proposal(
             polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
             polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
             chirp_distance=chirp_distance,
-            chirp_distance_plane_normal=plane_normal,
-            chirp_distance_azimuth_offset=azimuth_offset,
+            chirp_distance_tensors=chirp_distance_tensors,
             chirp_distance_k0=chirp_distance_k0,
             chirp_distance_fiducial=chirp_distance_fiducial,
         )
@@ -3059,6 +3114,24 @@ ET_EMR_PLANE_NORMAL = np.array(
     [0.6290179004039584, 0.06512521686797399, 0.7746581091603363]
 )
 
+#: Earth-fixed detector tensors ``(3, 3, 3)`` of the three nested
+#: interferometers ``ET-EMR1..3`` shipped with ``bilby_xG`` (x-arm azimuth
+#: 250.5674 deg).  Unlike the plane normal these fix the arms' in-plane
+#: orientation, which the ``chirp-distance`` reparameterisation's single-detector
+#: ``|R_k0|`` depends on.  Recompute with :func:`detector_tensors` for a
+#: different geometry.
+ET_EMR_DETECTOR_TENSORS = np.array([
+    [[0.1550537013173032, -0.2803757297943773, -0.10247763064532582],
+     [-0.2803757297943773, -0.21762641016388046, 0.24643185887154406],
+     [-0.10247763064532582, 0.24643185887154406, 0.0625727088465773]],
+    [[0.1055114366196189, 0.2999736879519376, -0.11062494779939845],
+     [0.2999736879519376, -0.2140899336935718, -0.2256095764019069],
+     [-0.11062494779939845, -0.2256095764019069, 0.10857849707395303]],
+    [[-0.26029681605292326, -0.02000525512278097, 0.21278157183973018],
+     [-0.02000525512278097, 0.43114530844097015, -0.0202196453548952],
+     [0.21278157183973018, -0.0202196453548952, -0.1708484923880469]],
+])
+
 
 class ETTriangleGroupAction(TriangularDetectorGroupAction):
     """:class:`TriangularDetectorGroupAction` with the ET-EMR geometry.
@@ -3146,6 +3219,7 @@ def make_et_group_flow_proposal(
     phase_recanon=False,
     adaptive_domain=False,
     chirp_distance=False,
+    chirp_distance_tensors=None,
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
 ):
@@ -3182,6 +3256,7 @@ def make_et_group_flow_proposal(
         polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
         polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
         chirp_distance=chirp_distance,
+        chirp_distance_tensors=chirp_distance_tensors,
         chirp_distance_k0=chirp_distance_k0,
         chirp_distance_fiducial=chirp_distance_fiducial,
         phase_recanon=phase_recanon,

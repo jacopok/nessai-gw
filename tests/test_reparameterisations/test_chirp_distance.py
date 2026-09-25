@@ -8,10 +8,19 @@ from nessai_gw._effective_distance import (
     chirp_distance,
     dominant_detector,
     luminosity_distance_from_chirp_distance,
+    response_R,
 )
 from nessai_gw._ellipse import ideal_triangle_tensors
 from nessai_gw._geometry import greenwich_mean_sidereal_time
-from nessai_gw.group_mixture import ET_EMR_PLANE_NORMAL
+from nessai_gw.group_mixture import (
+    CHIRP_DISTANCE_REQUIRES,
+    ET_EMR_DETECTOR_TENSORS,
+    ET_EMR_PLANE_NORMAL,
+    ET_EMR_VERTEX,
+    TriangularDetectorGroupAction,
+    detector_tensors,
+    triangular_group_reparameterisations,
+)
 from nessai_gw.reparameterisations import (
     ChirpDistanceReparameterisation,
     known_reparameterisations,
@@ -24,7 +33,7 @@ NAMES = ("luminosity_distance", "chirp_mass", "theta_jn", "ra", "dec", "psi")
 
 @pytest.fixture
 def tensors():
-    return ideal_triangle_tensors(ET_EMR_PLANE_NORMAL)
+    return ET_EMR_DETECTOR_TENSORS
 
 
 @pytest.fixture
@@ -80,10 +89,44 @@ def test_requires_k0_or_fiducial(tensors, gmst):
         )
 
 
-def test_requires_tensors_or_geometry():
-    with pytest.raises(ValueError, match="tensors.*gmst.*plane_normal"):
+def test_requires_tensors():
+    with pytest.raises(ValueError, match="tensors"):
         ChirpDistanceReparameterisation(
             parameters="luminosity_distance", fiducial=FIDUCIAL,
+            reference_time=REFERENCE_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    "time_kwargs",
+    [{}, {"gmst": 1.0, "reference_time": REFERENCE_TIME}],
+)
+def test_requires_exactly_one_of_gmst_and_reference_time(tensors, time_kwargs):
+    with pytest.raises(ValueError, match="exactly one of `gmst`"):
+        ChirpDistanceReparameterisation(
+            parameters="luminosity_distance", tensors=tensors,
+            fiducial=FIDUCIAL, **time_kwargs,
+        )
+
+
+def test_reference_time_matches_gmst(tensors, gmst, reparam):
+    r = ChirpDistanceReparameterisation(
+        parameters="luminosity_distance", tensors=tensors,
+        reference_time=REFERENCE_TIME, fiducial=FIDUCIAL,
+    )
+    assert r.gmst == pytest.approx(gmst)
+    assert r.k0 == reparam.k0
+
+
+def test_single_tensor_and_k0_range(tensors, gmst):
+    r = ChirpDistanceReparameterisation(
+        parameters="luminosity_distance", tensors=tensors[1], gmst=gmst, k0=0,
+    )
+    assert r.tensors.shape == (1, 3, 3)
+    with pytest.raises(ValueError, match="out of range"):
+        ChirpDistanceReparameterisation(
+            parameters="luminosity_distance", tensors=tensors, gmst=gmst,
+            k0=3,
         )
 
 
@@ -204,3 +247,138 @@ def test_reduces_inclination_correlation(reparam):
     assert np.abs(corr_before) > 0.5
     assert x_prime["chirp_distance"].std() < 1e-6
     assert np.abs(corr_after) < np.abs(corr_before)
+
+
+# ---------------------------------------------------------------------------
+# geometry
+# ---------------------------------------------------------------------------
+def test_et_emr_tensors_match_the_plane_normal():
+    """The stored tensors are traceless, lie in the ET-EMR plane and (nearly)
+    sum to zero, as three nested interferometers of a triangle must."""
+    for d in ET_EMR_DETECTOR_TENSORS:
+        np.testing.assert_allclose(d, d.T)
+        assert abs(np.trace(d)) < 1e-12
+        assert np.linalg.norm(d @ ET_EMR_PLANE_NORMAL) < 5e-3
+    assert np.abs(ET_EMR_DETECTOR_TENSORS.sum(0)).max() < 1e-3
+
+
+def test_detector_tensors_reads_interferometers():
+    class _Geom:
+        def __init__(self, d):
+            self.detector_tensor = d
+
+    class _Ifo:
+        def __init__(self, d):
+            self.geometry = _Geom(d)
+
+    class _IfoDirect:
+        def __init__(self, d):
+            self.detector_tensor = d
+
+    ifos = [_Ifo(ET_EMR_DETECTOR_TENSORS[0]), _IfoDirect(ET_EMR_DETECTOR_TENSORS[1])]
+    np.testing.assert_array_equal(
+        detector_tensors(ifos), ET_EMR_DETECTOR_TENSORS[:2]
+    )
+
+
+def test_ideal_triangle_misses_the_real_arm_orientation(gmst):
+    """Why the reparameterisation must be built on the real tensors: the
+    idealised triangle only fixes the plane, and a single sub-detector's
+    ``|R_k|`` depends on the in-plane arm orientation."""
+    _, _, theta_jn, ra, dec, psi = random_points(2000, seed=11)
+    real = np.abs(response_R(ET_EMR_DETECTOR_TENSORS, ra, dec, psi, theta_jn, gmst))
+    ideal = np.abs(response_R(
+        ideal_triangle_tensors(ET_EMR_PLANE_NORMAL), ra, dec, psi, theta_jn, gmst
+    ))
+    best = min(
+        np.abs(ideal[:, k] - real[:, j]).max()
+        for k in range(3) for j in range(3)
+    )
+    assert best > 0.05
+
+
+@pytest.mark.parametrize(
+    "tensors, tol",
+    [
+        (ideal_triangle_tensors(ET_EMR_PLANE_NORMAL, 0.3), 1e-10),
+        (ET_EMR_DETECTOR_TENSORS, 1e-2),
+    ],
+)
+def test_group_invariant(tensors, tol):
+    """``|R_k|`` -- hence ``chirp_distance`` -- is invariant under every
+    element of the 32-element triangular group: exactly for a planar
+    triangle, to ~1e-3 for the real ET-EMR tensors.  This is what lets the
+    prime-space action pass the coordinate through untouched."""
+    torch = pytest.importorskip("torch")
+    action = TriangularDetectorGroupAction(
+        REFERENCE_TIME, ET_EMR_PLANE_NORMAL, ET_EMR_VERTEX,
+        polarisation_quarter=True, azimuth_offset=0.3,
+    )
+    rng = np.random.default_rng(12)
+    n = 500
+    pts = {
+        "ra": rng.uniform(0, 2 * np.pi, n),
+        "sin_dec": rng.uniform(-1, 1, n),
+        "cos_theta_jn": rng.uniform(-1, 1, n),
+        "psi": rng.uniform(0, np.pi, n),
+        "phase": rng.uniform(0, 2 * np.pi, n),
+        "geocent_time": np.full(n, REFERENCE_TIME),
+    }
+
+    def abs_r(p):
+        return np.abs(response_R(
+            tensors, p["ra"], np.arcsin(p["sin_dec"]), p["psi"],
+            np.arccos(p["cos_theta_jn"]), action.gmst,
+        ))
+
+    r0 = abs_r(pts)
+    pts_t = {k: torch.as_tensor(v, dtype=torch.float64) for k, v in pts.items()}
+    for mode in range(action.group_size):
+        out = action(pts_t, torch.full((n,), mode))
+        r = abs_r({k: v.numpy() for k, v in out.items()})
+        assert np.median(np.abs(np.log(r / r0))) < tol
+
+
+# ---------------------------------------------------------------------------
+# wiring
+# ---------------------------------------------------------------------------
+WIRING_PARAMETERS = [
+    "chirp_mass", "mass_ratio", "luminosity_distance", "theta_jn", "psi",
+    "phase", "ra", "dec", "geocent_time",
+]
+
+
+def test_triangular_wiring_defaults_to_et_emr_tensors():
+    reps = triangular_group_reparameterisations(
+        WIRING_PARAMETERS, REFERENCE_TIME, chirp_distance=True,
+        chirp_distance_fiducial=FIDUCIAL,
+    )
+    spec = reps["luminosity_distance"]
+    assert spec["reparameterisation"] == "chirp-distance"
+    np.testing.assert_array_equal(spec["tensors"], ET_EMR_DETECTOR_TENSORS)
+    assert spec["reference_time"] == REFERENCE_TIME
+    assert "plane_normal" not in spec and "azimuth_offset" not in spec
+    assert next(iter(reps)) == "luminosity_distance"
+
+
+def test_triangular_wiring_needs_k0_or_fiducial():
+    with pytest.raises(ValueError, match="chirp_distance_k0"):
+        triangular_group_reparameterisations(
+            WIRING_PARAMETERS, REFERENCE_TIME, chirp_distance=True,
+        )
+
+
+@pytest.mark.parametrize("drop", CHIRP_DISTANCE_REQUIRES)
+def test_triangular_wiring_needs_the_inputs(drop):
+    names = [n for n in WIRING_PARAMETERS if n != drop]
+    with pytest.raises(ValueError, match=drop):
+        triangular_group_reparameterisations(
+            names, REFERENCE_TIME, chirp_distance=True, chirp_distance_k0=0,
+        )
+
+
+def test_triangular_wiring_without_distance_is_a_no_op():
+    names = [n for n in WIRING_PARAMETERS if n != "luminosity_distance"]
+    assert triangular_group_reparameterisations(
+        names, REFERENCE_TIME, chirp_distance=True,
+    ) == triangular_group_reparameterisations(names, REFERENCE_TIME)

@@ -22,9 +22,28 @@ from nessai_gw.reparameterisations.sky import EqualAreaSky
 
 REFERENCE_TIME = 1187008882.4
 
+
+def _l_tensor(lat, lon, xarm_azimuth):
+    """Tensor of a 90-degree L on the local horizontal plane (azimuth from
+    North towards East), as bilby builds it from its geodetic parameters."""
+    east = np.array([-np.sin(lon), np.cos(lon), 0.0])
+    north = np.array(
+        [-np.sin(lat) * np.cos(lon), -np.sin(lat) * np.sin(lon), np.cos(lat)]
+    )
+    x = np.cos(xarm_azimuth) * north + np.sin(xarm_azimuth) * east
+    y = -np.sin(xarm_azimuth) * north + np.cos(xarm_azimuth) * east
+    return 0.5 * (np.outer(x, x) - np.outer(y, y))
+
+
 # ET 2L: Sardinia and Lusatia (ET_1L_IT / ET_1L_DE)
-IT = detector_vertex_from_geodetic(np.radians(40 + 31 / 60), np.radians(9 + 25 / 60))
-DE = detector_vertex_from_geodetic(np.radians(51.275), np.radians(14.100))
+_IT_LATLON = (np.radians(40 + 31 / 60), np.radians(9 + 25 / 60))
+_DE_LATLON = (np.radians(51.275), np.radians(14.100))
+IT = detector_vertex_from_geodetic(*_IT_LATLON)
+DE = detector_vertex_from_geodetic(*_DE_LATLON)
+TENSORS = np.array([
+    _l_tensor(*_IT_LATLON, np.radians(70.0)),
+    _l_tensor(*_DE_LATLON, np.radians(115.0)),
+])
 
 PARAMETERS = [
     "chirp_mass", "mass_ratio", "chi_1", "chi_2", "luminosity_distance",
@@ -51,7 +70,7 @@ requires_group_mixture = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def geometry():
     return DetectorNetworkGeometry([IT, DE], [30.0, 40.0], REFERENCE_TIME,
-                                   names=["IT", "DE"])
+                                   names=["IT", "DE"], tensors=TENSORS)
 
 
 def _sky(n, seed=0):
@@ -178,9 +197,23 @@ def test_from_interferometers():
                 [IT, DE], [30.0, 40.0], REFERENCE_TIME
             ).sky_frame_rotation,
         )
+    # the stubs carry no detector tensors
+    assert a.tensors is None
+    for ifo, d in zip(ifos, TENSORS):
+        ifo.detector_tensor = d
+    c = DetectorNetworkGeometry.from_interferometers(ifos, REFERENCE_TIME)
+    np.testing.assert_array_equal(c.tensors, TENSORS)
+    assert c.reference_detector == 1  # DE is louder
     del ifos[0].meta_data["optimal_SNR"]
     with pytest.raises(ValueError, match="optimal_SNR"):
         DetectorNetworkGeometry.from_interferometers(ifos, REFERENCE_TIME)
+
+
+def test_tensor_shape_is_checked():
+    with pytest.raises(ValueError, match=r"\(2, 3, 3\) detector tensors"):
+        DetectorNetworkGeometry(
+            [IT, DE], [30.0, 40.0], REFERENCE_TIME, tensors=TENSORS[:1]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +386,51 @@ def test_reparameterisations_use_the_barycentre(geometry):
     assert reps["theta_jn"]["update_bounds"] is False
 
 
+def test_reparameterisations_default_to_chirp_distance(geometry):
+    """The chirp distance is the default, at the loudest detector."""
+    spec = network_group_reparameterisations(PARAMETERS, geometry)[
+        "luminosity_distance"
+    ]
+    assert spec["reparameterisation"] == "chirp-distance"
+    np.testing.assert_array_equal(spec["tensors"], TENSORS)
+    assert spec["k0"] == geometry.reference_detector == 1
+    assert "luminosity_distance" not in network_group_reparameterisations(
+        PARAMETERS, geometry, chirp_distance=False
+    )
+
+
+def test_chirp_distance_needs_tensors():
+    geo = DetectorNetworkGeometry([IT, DE], [30.0, 40.0], REFERENCE_TIME)
+    with pytest.raises(ValueError, match="detector tensors"):
+        network_group_reparameterisations(PARAMETERS, geo)
+    # fine without it, and without a distance to reparameterise
+    network_group_reparameterisations(PARAMETERS, geo, chirp_distance=False)
+    network_group_reparameterisations(
+        [p for p in PARAMETERS if p != "luminosity_distance"], geo
+    )
+
+
+@pytest.mark.parametrize("k", range(4))
+def test_chirp_distance_is_invariant_under_the_action(geometry, k):
+    """``|R_k0|`` is unchanged by ``g`` whatever the detector geometry, so the
+    prime-space action may pass ``chirp_distance`` through."""
+    from nessai_gw._effective_distance import response_R
+
+    pts = _physical_points(300)
+    out = PolarisationPhaseGroupAction()(pts, torch.full((300,), k))
+    ra, dec = _sky(300, seed=4)
+    theta_jn = np.arccos(pts["cos_theta_jn"].numpy())
+
+    def abs_r(psi):
+        return np.abs(response_R(
+            geometry.tensors, ra, dec, psi, theta_jn, geometry.gmst
+        ))
+
+    np.testing.assert_allclose(
+        abs_r(out["psi"].numpy()), abs_r(pts["psi"].numpy()), rtol=1e-12
+    )
+
+
 @requires_group_mixture
 def test_make_network_group_flow_proposal_class(geometry):
     cls = make_network_group_flow_proposal(PARAMETERS, geometry)
@@ -413,7 +491,10 @@ def test_network_proposal_initialise_train_and_draw(geometry, tmp_path):
     )
     proposal.initialise()
     prime = list(proposal.prime_parameters)
-    assert {"sky_u", "sky_v", "psi_prime", "delta_phase", "t_det"} <= set(prime)
+    assert {
+        "sky_u", "sky_v", "psi_prime", "delta_phase", "t_det", "chirp_distance"
+    } <= set(prime)
+    assert "luminosity_distance_prime" not in prime
     assert proposal.flow.model.param_names == prime
 
     rng = np.random.default_rng(7)
@@ -426,6 +507,16 @@ def test_network_proposal_initialise_train_and_draw(geometry, tmp_path):
     live = numpy_array_to_live_points(theta, PARAMETERS)
     live["logL"] = 0.0
     live["logP"] = model.log_prior(live)
+    # chirp_distance round-trips (rescale may append boundary-inverted
+    # duplicates after the originals)
+    x_prime, log_j = proposal.rescale(live)
+    back, log_j_inv = proposal.inverse_rescale(x_prime)
+    n = len(live)
+    np.testing.assert_allclose(
+        back["luminosity_distance"][:n], live["luminosity_distance"],
+        rtol=1e-9,
+    )
+    np.testing.assert_allclose(log_j[:n], -log_j_inv[:n], atol=1e-8)
     proposal.train(live)
     worst = live[:1].copy()
     worst["logL"] = -np.inf

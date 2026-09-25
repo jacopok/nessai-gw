@@ -30,6 +30,14 @@ together with the two frame choices a separated network wants:
   :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky` with the baseline
   as the frame's ``z`` axis, ``sky_v = (1 - cos alpha) / 2`` and
   ``sky_u = beta / (2 pi)``.
+* **chirp distance** at the loudest detector (Roulet et al. 2022,
+  arXiv:2207.03508, Eq. 18; the ``chirp-distance`` reparameterisation):
+  ``luminosity_distance / (chirp_mass^{5/6} |R_k0|)``, which divides out the
+  antenna-pattern amplitude the reference detector sees and with it the
+  ``luminosity_distance`` <-> ``theta_jn`` correlation.  ``|R_k0|`` is
+  invariant under ``g`` (``F_+, F_x -> -F_+, -F_x``), so the group action
+  passes the coordinate through untouched.  It needs the detector tensors
+  (read by :meth:`DetectorNetworkGeometry.from_interferometers`).
 
 Co-located interferometers (the three of a triangular ET) are merged into one
 *site* first, so the baseline always joins two distinct locations.  With a
@@ -62,6 +70,7 @@ from .group_mixture import (
     _make_group_proposal_class,
     _prime_parameter_names,
     _select_flow_model_factory,
+    detector_tensors,
     triangular_group_reparameterisations,
 )
 
@@ -104,6 +113,10 @@ class DetectorNetworkGeometry:
         direction perpendicular to the baseline at its midpoint, where
         ground-based antenna patterns are weakest; ``beta = pi/2`` is the local
         vertical.
+    tensors : array_like, optional
+        ``(n, 3, 3)`` Earth-fixed detector tensors, needed for the
+        ``chirp-distance`` reparameterisation (see
+        :func:`network_group_reparameterisations`).
 
     Attributes
     ----------
@@ -118,6 +131,11 @@ class DetectorNetworkGeometry:
     sky_frame_rotation : numpy.ndarray
         ``(3, 3)`` equatorial -> sky-frame rotation (GMST folded in) for
         :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky`.
+    reference_detector : int
+        Index of the loudest detector, the chirp distance's reference ``k0``
+        (Roulet et al. sort the detectors by SNR).
+    tensors : numpy.ndarray or None
+        The ``(n, 3, 3)`` detector tensors, if given.
     """
 
     def __init__(
@@ -128,6 +146,7 @@ class DetectorNetworkGeometry:
         names=None,
         site_tolerance=DEFAULT_SITE_TOLERANCE,
         azimuth_offset=0.0,
+        tensors=None,
     ):
         vertices = np.atleast_2d(np.asarray(vertices, dtype=float))
         snrs = np.atleast_1d(np.asarray(snrs, dtype=float))
@@ -138,6 +157,15 @@ class DetectorNetworkGeometry:
             )
         if np.any(snrs < 0) or not np.all(np.isfinite(snrs)):
             raise ValueError(f"SNRs must be finite and non-negative; got {snrs}")
+        if tensors is not None:
+            tensors = np.asarray(tensors, dtype=float)
+            if tensors.shape != (len(snrs), 3, 3):
+                raise ValueError(
+                    f"need ({len(snrs)}, 3, 3) detector tensors; got "
+                    f"{tensors.shape}"
+                )
+        self.tensors = tensors
+        self.reference_detector = int(np.argmax(snrs))
         self.vertices = vertices
         self.snrs = snrs
         self.names = (
@@ -173,7 +201,9 @@ class DetectorNetworkGeometry:
 
         ``snrs`` may be a sequence (in interferometer order), a dict keyed by
         interferometer name, or ``None`` to read each interferometer's
-        ``meta_data["optimal_SNR"]`` (set by bilby on injection).
+        ``meta_data["optimal_SNR"]`` (set by bilby on injection).  The detector
+        tensors are read too (for the chirp distance) unless ``tensors`` is
+        passed.
         """
         ifos = list(interferometers)
         names = [ifo.name for ifo in ifos]
@@ -183,6 +213,11 @@ class DetectorNetworkGeometry:
             )
             for ifo in ifos
         ]
+        if kwargs.get("tensors") is None:
+            try:
+                kwargs["tensors"] = detector_tensors(ifos)
+            except AttributeError:
+                kwargs["tensors"] = None
         if snrs is None:
             try:
                 snrs = [float(ifo.meta_data["optimal_SNR"]) for ifo in ifos]
@@ -494,7 +529,26 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
 # ---------------------------------------------------------------------------
 # reparameterisations + proposal
 # ---------------------------------------------------------------------------
-def network_group_reparameterisations(sampling_parameters, geometry):
+def _chirp_distance_kwargs(geometry, chirp_distance):
+    """``triangular_group_reparameterisations`` chirp-distance arguments."""
+    if not chirp_distance:
+        return {"chirp_distance": False}
+    if geometry.tensors is None:
+        raise ValueError(
+            "chirp_distance needs the detector tensors: build the geometry "
+            "with DetectorNetworkGeometry.from_interferometers (or pass "
+            "`tensors`), or pass chirp_distance=False."
+        )
+    return {
+        "chirp_distance": True,
+        "chirp_distance_tensors": geometry.tensors,
+        "chirp_distance_k0": geometry.reference_detector,
+    }
+
+
+def network_group_reparameterisations(
+    sampling_parameters, geometry, chirp_distance=True
+):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
     The triangular profile
@@ -502,15 +556,34 @@ def network_group_reparameterisations(sampling_parameters, geometry):
     with the ``detector-center-time`` vertex at the network's SNR-weighted
     barycentre: ``delta_phase`` (``polarisation-phase``) for ``phase``,
     fixed-bounds ``angle-sine`` for ``theta_jn``, ``aligned-spin`` for aligned
-    spins, ``logit`` for tides.  ``psi`` and the sky are added by the proposal
+    spins, ``logit`` for tides and, by default, the ``chirp-distance`` at the
+    loudest detector (``geometry.reference_detector``) for
+    ``luminosity_distance``.  ``psi`` and the sky are added by the proposal
     (single-angle ``psi_prime``; baseline-frame
     :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky`).
+
+    Parameters
+    ----------
+    sampling_parameters : list of str
+        Every parameter nessai samples.
+    geometry : DetectorNetworkGeometry
+        The network; must carry ``tensors`` when ``chirp_distance`` is set.
+    chirp_distance : bool, optional
+        Reparameterise ``luminosity_distance`` as the Roulet et al. chirp
+        distance (needs ``chirp_mass``, ``theta_jn``, ``ra``, ``dec`` and
+        ``psi`` to be sampled).  Ignored when ``luminosity_distance`` is not
+        sampled.  Must match :func:`make_network_group_flow_proposal`.
+        Default ``True``.
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
         geometry.reference_time,
         vertex=geometry.timing_vertex,
         phase_coordinates="polarisation-phase",
+        **_chirp_distance_kwargs(
+            geometry,
+            chirp_distance and "luminosity_distance" in sampling_parameters,
+        ),
     )
 
 
@@ -529,6 +602,7 @@ def make_network_group_flow_proposal(
     cluster_k_grow_patience=2,
     cluster_centroid_ema=None,
     flow_model_factory=None,
+    chirp_distance=True,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -537,8 +611,9 @@ def make_network_group_flow_proposal(
     ``reparameterisations=network_group_reparameterisations(names, geometry)``.
 
     The flow sees the barycentre time ``t_det``, the baseline-frame sky
-    ``(sky_u, sky_v)``, ``psi_prime`` and ``delta_phase``; the group mixture
-    folds the polarisation/phase ``Z4`` (4 elements) and learns its weights.
+    ``(sky_u, sky_v)``, ``psi_prime``, ``delta_phase`` and (by default)
+    ``chirp_distance``; the group mixture folds the polarisation/phase ``Z4``
+    (4 elements) and learns its weights.
 
     Parameters
     ----------
@@ -563,6 +638,9 @@ def make_network_group_flow_proposal(
     n_clusters_max, cluster_*, flow_model_factory
         Clustered base flow, as in
         :func:`~nessai_gw.group_mixture.make_triangular_group_flow_proposal`.
+    chirp_distance : bool, optional
+        Whether ``luminosity_distance`` is carried as the chirp distance; must
+        match :func:`network_group_reparameterisations`.  Default ``True``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -593,6 +671,9 @@ def make_network_group_flow_proposal(
     prime_names = _prime_parameter_names(
         names, geometry.reference_time, vertex=geometry.timing_vertex,
         sky_2d=True, psi_single=True,
+        **_chirp_distance_kwargs(
+            geometry, chirp_distance and "luminosity_distance" in names
+        ),
     )
     action = PrimeSpacePolarisationPhaseAction(
         prime_names, psi_offset=psi_offset, delta_offset=delta_offset

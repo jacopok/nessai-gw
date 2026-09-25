@@ -1,4 +1,4 @@
-"""Chirp/effective-distance reparameterisation for a single triangular detector.
+"""Chirp/effective-distance reparameterisation.
 
 Roulet et al. 2022 (arXiv:2207.03508, Eqs. 9 and 18) replace ``luminosity_distance``
 by ::
@@ -16,10 +16,10 @@ on the ET-Delta live points, reduced to ``0.085`` by this coordinate; see
 The geometry (``R_k``, choosing ``k0``) lives in :mod:`nessai_gw._effective_distance`
 and is reused here unchanged; this module only wraps it as a
 :class:`~nessai.reparameterisations.Reparameterisation`.  See that module's
-docstring for why ``k0 = argmax_k |R_k(fiducial)|`` is the right way to pick
-the reference detector for the co-located ET-EMR sub-interferometers (they
-share one PSD, so the SNR ratio the paper sorts by is exactly the ``|R_k|``
-ratio).
+docstring for why ``R_k0`` must be built on the *real* detector tensors (not
+the idealised triangle), why ``k0 = argmax_k |R_k(fiducial)|`` is the right way
+to pick the reference detector for the co-located ET-EMR sub-interferometers,
+and why the coordinate is invariant under the group actions.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ from nessai.reparameterisations import Reparameterisation
 
 from .. import nessai_logger
 from .._effective_distance import dominant_detector, response_R
-from .._ellipse import ideal_triangle_tensors
 from .._geometry import greenwich_mean_sidereal_time
 
 logger = nessai_logger.getChild(__name__)
@@ -50,15 +49,16 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         map like :class:`~nessai_gw.reparameterisations.PolarisationEllipseReparameterisation`,
         not a rescaling to a bounded prime range -- the group-mixture wrapper
         standardises the prime coordinate regardless).
-    plane_normal, reference_time, azimuth_offset : optional
-        Forwarded to :func:`nessai_gw._ellipse.ideal_triangle_tensors` /
-        :func:`nessai_gw._geometry.greenwich_mean_sidereal_time` to build the
-        idealised-triangle antenna response, unless ``tensors``/``gmst`` are
-        given directly.
-    tensors, gmst : optional
-        Precomputed detector tensors and Greenwich mean sidereal time, e.g.
-        shared with an existing :class:`nessai_gw._ellipse.PolarisationEllipse`
-        via its ``.tensors``/``.gmst`` attributes.
+    tensors : array_like
+        ``(n_det, 3, 3)`` (or a single ``(3, 3)``) Earth-fixed detector
+        tensors, e.g. :func:`nessai_gw.group_mixture.detector_tensors` or
+        :data:`nessai_gw.group_mixture.ET_EMR_DETECTOR_TENSORS`.  These must be
+        the real tensors: :func:`nessai_gw._ellipse.ideal_triangle_tensors`
+        does not know the arms' in-plane orientation, which ``|R_k0|`` of a
+        single sub-detector depends on.
+    gmst, reference_time : float, optional
+        Greenwich mean sidereal time (rad), or the geocentric GPS time it is
+        computed from.  Exactly one is needed.
     fiducial : mapping, optional
         ``ra``, ``dec``, ``psi``, ``theta_jn`` of a reference signal (typically
         the injection or the maximum-likelihood point), used once at
@@ -77,11 +77,9 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         self,
         parameters=None,
         prior_bounds=None,
-        plane_normal=None,
-        reference_time=None,
-        azimuth_offset=0.0,
         tensors=None,
         gmst=None,
+        reference_time=None,
         fiducial=None,
         k0=None,
         chirp_mass="chirp_mass",
@@ -110,16 +108,27 @@ class ChirpDistanceReparameterisation(Reparameterisation):
                 f"'luminosity_distance'; got {self.parameters}"
             )
 
-        if tensors is None or gmst is None:
-            if plane_normal is None or reference_time is None:
-                raise ValueError(
-                    "ChirpDistanceReparameterisation requires either "
-                    "`tensors` and `gmst`, or `plane_normal` and "
-                    "`reference_time`."
-                )
-            tensors = ideal_triangle_tensors(plane_normal, azimuth_offset)
+        if tensors is None:
+            raise ValueError(
+                "ChirpDistanceReparameterisation requires the detector "
+                "`tensors`."
+            )
+        tensors = np.asarray(tensors, dtype=float)
+        if tensors.ndim == 2:
+            tensors = tensors[None]
+        if tensors.ndim != 3 or tensors.shape[1:] != (3, 3):
+            raise ValueError(
+                "`tensors` must have shape (n_det, 3, 3) or (3, 3); got "
+                f"{tensors.shape}"
+            )
+        if (gmst is None) == (reference_time is None):
+            raise ValueError(
+                "ChirpDistanceReparameterisation requires exactly one of "
+                "`gmst` and `reference_time`."
+            )
+        if gmst is None:
             gmst = greenwich_mean_sidereal_time(reference_time)
-        self.tensors = np.asarray(tensors, dtype=float)
+        self.tensors = tensors
         self.gmst = float(gmst)
 
         if k0 is None:
@@ -141,6 +150,11 @@ class ChirpDistanceReparameterisation(Reparameterisation):
                 self.gmst,
             )
         self.k0 = int(k0)
+        if not 0 <= self.k0 < len(self.tensors):
+            raise ValueError(
+                f"k0={self.k0} is out of range for {len(self.tensors)} "
+                "detector tensors."
+            )
         logger.info(
             "ChirpDistanceReparameterisation: reference detector k0=%d",
             self.k0,

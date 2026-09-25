@@ -1,4 +1,4 @@
-"""The chirp/effective-distance coordinate for a single triangular detector.
+"""The chirp/effective-distance coordinate (Roulet et al. 2022).
 
 Roulet et al. 2022 (arXiv:2207.03508) replace the luminosity distance ``d_L``
 by the "chirp distance"
@@ -19,37 +19,52 @@ its dominant-(2,2)-mode response, ``k0`` the loudest ("reference") detector.
 which is the dominant visible ``distance`` <-> ``inclination`` correlation
 in a single-detector (or single-site) posterior.
 
-This module supplies exactly the antenna-pattern piece, reusing
-:mod:`nessai_gw._ellipse`'s idealised-triangle machinery (the same
-``Z_k = F_+,k + i F_x,k`` at ``psi = 0`` that :class:`PolarisationEllipse`
-already builds from ``ideal_triangle_tensors``/``_complex_response``, and
-which the group action's own prime coordinates are built against -- see
-:mod:`nessai_gw._ellipse`'s module docstring on the ~1e-3 accuracy of the
-idealised tensors against the real ET-EMR geometry). It does not depend on
-:mod:`nessai_gw._ellipse` at runtime beyond that shared geometry, and adds no
-new detector model.
+This module supplies exactly the antenna-pattern piece.  ``Z_k = F_+,k + i
+F_x,k`` at ``psi = 0`` is evaluated with :mod:`nessai_gw._ellipse`'s
+``_complex_response`` (bilby's convention, checked against
+``Interferometer.antenna_response`` to machine precision), but on the *real*
+detector tensors (``Interferometer.detector_tensor``;
+:func:`nessai_gw.group_mixture.detector_tensors`,
+:data:`nessai_gw.group_mixture.ET_EMR_DETECTOR_TENSORS`), not on
+:func:`nessai_gw._ellipse.ideal_triangle_tensors`.  The idealised triangle
+fixes the detector *plane* but not the arms' in-plane orientation (``e1`` is
+the projected Earth axis, and ``azimuth_offset`` -- a fundamental-domain
+seam knob -- rotates it further).  The polarisation ellipse only uses
+rotation-invariant sums over all three sub-detectors, so it does not care, but
+``|R_k0|`` singles out one sub-detector and does: for ET-EMR the idealised
+``|R_k|`` is off by up to ~0.15 (on a typical ``|R| ~ 0.3``) at
+``azimuth_offset = 0``.
+
+``|R_k|`` is invariant under every element of the triangular group
+(:class:`nessai_gw.group_mixture.TriangularDetectorGroupAction`: the quarter
+turn sends ``Z -> -Z``, the plane reflection ``Z -> conj Z`` together with
+``cos iota -> -cos iota``) -- exactly for a planar triangle of any in-plane
+orientation, to ~1e-3 on the real ET-EMR tensors -- and exactly under the
+network polarisation/phase ``Z4`` (``Z -> -Z``).  So the chirp distance is a
+group-invariant coordinate and both prime-space group actions pass it through
+untouched, as they do ``luminosity_distance``.
 
 Choosing the reference detector
 --------------------------------
-For a *network* of distinct sites (:mod:`nessai_gw.network_group`), the
-reference detector is chosen by passing per-detector SNRs
-(``DetectorNetworkGeometry.from_interferometers``, reading
-``meta_data["optimal_SNR"]``) and sorting.  The three ET-EMR sub-detectors
-are co-located and share one PSD (verified on the ET-Delta runs: the three
-``power_spectral_density_array``s are bit-identical), so by Eq. 11 their SNR
-ratio at any fixed ``(d_L, M)`` is exactly the ratio of their |R_k| -- the
-PSD- and mass/distance-dependent factors cancel.  :func:`dominant_detector`
-therefore picks ``k0 = argmax_k |R_k|`` at a single fiducial point (the
-injection, or the maximum-likelihood point) directly, which is equivalent to
-or `DetectorNetworkGeometry`'s: pass real SNRs and sort, without a costly
-per-candidate matched-filter integral.
+Roulet et al. sort the detectors by SNR.  For a *network*
+(:mod:`nessai_gw.network_group`) the per-detector SNRs are known
+(``DetectorNetworkGeometry.from_interferometers`` reads
+``meta_data["optimal_SNR"]``), so ``k0`` is simply the loudest detector.  The
+three ET-EMR sub-detectors are co-located and share one PSD (verified on the
+ET-Delta runs: the three ``power_spectral_density_array``s are
+bit-identical), so by Eq. 11 their SNR ratio at any fixed ``(d_L, M)`` is
+exactly the ratio of their ``|R_k|`` -- the PSD- and mass/distance-dependent
+factors cancel.  :func:`dominant_detector` therefore picks
+``k0 = argmax_k |R_k|`` at a single fiducial point (the injection, or the
+maximum-likelihood point), which is equivalent to sorting by SNR without a
+matched-filter integral.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from ._ellipse import _complex_response, ideal_triangle_tensors
+from ._ellipse import _complex_response
 
 __all__ = [
     "response_R",
@@ -69,8 +84,8 @@ def response_R(tensors, ra, dec, psi, theta_jn, gmst):
     Parameters
     ----------
     tensors : array_like
-        ``(n_det, 3, 3)`` detector tensors, e.g. from
-        :func:`nessai_gw._ellipse.ideal_triangle_tensors`.
+        ``(n_det, 3, 3)`` Earth-fixed detector tensors, e.g. from
+        :func:`nessai_gw.group_mixture.detector_tensors`.
     ra, dec, psi, theta_jn : array_like
         Broadcastable sky position, polarisation angle and inclination.
     gmst : float
