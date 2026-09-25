@@ -214,7 +214,10 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     training points with :func:`fit_live_diagonal_split` and scores it with
     :func:`gaussian_split_gain`.  The split activates once the gain reaches
     :attr:`gain_on` with at least :attr:`activate_fraction` of the points on
-    each side, and collapses once the gain drops below :attr:`gain_off` or a
+    each side -- and, when the wrapper's ``freeze_min_size`` is set, at least
+    :attr:`activate_min_size_factor` times that many unique live points on
+    the smaller side, so a split is never born with a side the freeze would
+    catch before its expert was ever trained -- and collapses once the gain drops below :attr:`gain_off` or a
     side falls below :attr:`min_branch_fraction_floor` -- unless the wrapper's
     ``freeze_min_size`` is set: then a side below it keeps its frozen expert
     and the current line until it has no points left; the base class's
@@ -230,7 +233,7 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     """
 
     #: Gain (nats per training point) needed to activate the split.
-    gain_on = 0.5
+    gain_on = 0.8
     #: Once active, the split collapses when the gain falls below this.
     gain_off = 0.2
     #: A new line replaces the active one only if it beats it by this much.
@@ -239,6 +242,12 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     activate_fraction = MIN_BRANCH_FRACTION
     #: Once active, the split collapses when either side falls below this.
     min_branch_fraction_floor = 0.01
+    #: With ``freeze_min_size`` set, the smaller side needs at least this
+    #: many times ``freeze_min_size`` unique live points to activate.  2
+    #: matches the thaw threshold of ``_update_frozen``, so a split cannot
+    #: turn on and freeze a side in quick succession.  Stated in points (not
+    #: ``-ln X`` or a fraction), so it holds for any ``nlive``.
+    activate_min_size_factor = 2.0
     #: Minimum number of clustering rounds before the split may activate
     #: (a coarse config-time guard; 0 disables it).
     activate_min_round = 0
@@ -346,6 +355,10 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
                 expert.apply(reset_permutations)
                 expert._canon_seen.zero_()
                 expert._domain_mass_seen = False
+                trained = getattr(self, "_trained", None)
+                if trained is not None:
+                    # a fresh flow: it must train before it may freeze
+                    trained[j] = False
                 logger.info(
                     "DiagonalSplitClusterWrapper: expert %d population "
                     "shrank %.0f -> %.0f (>%gx since its last reset) -- "
@@ -373,6 +386,17 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         return (
             c * normal[0] + v * normal[1] > float(self._split_offset)
         ).astype(int)
+
+    def _n_unique_small_side(self, c, v):
+        """Unique live points on the smaller side of the stored line -- the
+        count ``_update_frozen`` compares with ``freeze_min_size`` (the
+        leading ``n_unique_rows`` rows; the rest duplicate them)."""
+        lab = self._split_labels(c, v)
+        n_u = getattr(self, "n_unique_rows", None)
+        if n_u is not None and 0 < n_u < len(lab):
+            lab = lab[:n_u]
+        n1 = int(lab.sum())
+        return min(n1, len(lab) - n1)
 
     def _store_split(self, fit):
         with torch.no_grad():
@@ -459,11 +483,22 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
             return 2 if keep else 1
         if self._cluster_round_count < self.activate_min_round:
             return 1
-        return (
-            2
-            if (cur_gain >= self.gain_on and f_min >= self.activate_fraction)
-            else 1
-        )
+        if not (cur_gain >= self.gain_on and f_min >= self.activate_fraction):
+            return 1
+        if self.freeze_min_size is not None:
+            n_min = self.activate_min_size_factor * self.freeze_min_size
+            n_u = self._n_unique_small_side(c, v)
+            if n_u < n_min:
+                logger.info(
+                    "Diagonal split: not activating -- smaller side has %d "
+                    "unique live points (< %.0f = %g x freeze_min_size), its "
+                    "expert would be frozen before it was trained",
+                    n_u,
+                    n_min,
+                    self.activate_min_size_factor,
+                )
+                return 1
+        return 2
 
     def _labels_for_k(self, t, ts, mu, sd, k, k_cur, prev_raw):
         if k < 2:
@@ -508,7 +543,7 @@ def make_diagonal_split_cluster_flow(
     ----------
     gain_on, gain_off : float, optional
         Activation / collapse thresholds on :func:`gaussian_split_gain`
-        (nats per point).  ``None`` keeps the class defaults (0.5 / 0.2).
+        (nats per point).  ``None`` keeps the class defaults (0.8 / 0.2).
     activate_fraction : float, optional
         Minimum fraction of points on each side to activate (and to consider
         a candidate line).  ``None`` keeps :data:`MIN_BRANCH_FRACTION`.

@@ -241,6 +241,25 @@ def test_dying_side_keeps_split_until_empty():
     assert w._k_now
 
 
+def test_split_not_born_with_a_side_below_the_freeze_size():
+    """The split must not activate while its smaller side would be frozen
+    (or not yet thawed) at once: that expert would never be trained.  The
+    count is of unique rows, as in ``_update_frozen``."""
+    # 5 % clump side: 300 unique points, gain well above gain_on
+    _, _, t, _ = _two_populations(n_plateau=5700, n_clump=300)
+    assert _FakeWrapper(freeze_min_size=100)._k_want(t, None, None, None) == 2
+    assert _FakeWrapper(freeze_min_size=200)._k_want(t, None, None, None) == 1
+    assert _FakeWrapper(freeze_min_size=500)._k_want(t, None, None, None) == 1
+    # doubled training set (boundary inversion): 600 routed rows, but only
+    # the 300 unique ones count
+    w = _FakeWrapper(freeze_min_size=200)
+    w.n_unique_rows = len(t)
+    assert w._k_want(np.concatenate([t, t]), None, None, None) == 1
+    w = _FakeWrapper(freeze_min_size=100)
+    w.n_unique_rows = len(t)
+    assert w._k_want(np.concatenate([t, t]), None, None, None) == 2
+
+
 def test_without_freeze_small_side_collapses_by_fraction_floor():
     _, _, t, _ = _two_populations()
     w = _FakeWrapper(active=True)
@@ -272,10 +291,15 @@ def test_shrink_reset_skips_frozen_experts():
     w._n_active.fill_(2)
     w._expert_ref_size = np.array([400.0, 400.0])
     w._frozen[0] = True
+    if hasattr(w, "_trained"):
+        w._trained.fill_(True)
     labels = torch.as_tensor(np.r_[np.zeros(20), np.ones(100)].astype(int))
     w._maybe_reset_shrunk_experts(labels)
     assert bool(w.experts[0]._canon_seen.all())       # frozen: untouched
     assert not bool(w.experts[1]._canon_seen.any())   # 400 -> 100: reset
+    if hasattr(w, "_trained"):
+        # a reset expert must train again before it may be frozen
+        assert bool(w._trained[0]) and not bool(w._trained[1])
 
 
 def test_make_diagonal_split_cluster_flow_forwards_freeze_options():
