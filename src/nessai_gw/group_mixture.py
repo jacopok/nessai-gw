@@ -1941,6 +1941,11 @@ def triangular_group_reparameterisations(
     polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
+    chirp_distance=False,
+    chirp_distance_plane_normal=None,
+    chirp_distance_azimuth_offset=0.0,
+    chirp_distance_k0=None,
+    chirp_distance_fiducial=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -1972,6 +1977,16 @@ def triangular_group_reparameterisations(
       with a well-measured ridge left a leptokurtic origin cusp the base flow
       fit poorly.  ``psi`` (``angle-pi``) and ``theta_jn`` (``angle-sine``) are
       prerequisites of this coordinate.
+    * ``luminosity_distance`` -> ``chirp-distance`` (only if ``chirp_distance``
+      is set): the Roulet et al. 2022 (arXiv:2207.03508, Eqs. 9, 18) coordinate
+      ``chirp_distance = luminosity_distance / (chirp_mass^{5/6} |R_k0|)``,
+      which strips out the dominant-mode antenna-pattern amplitude at a fixed
+      reference detector ``k0`` -- removing the ``luminosity_distance`` <->
+      ``theta_jn`` degeneracy that otherwise dominates a single triangular
+      detector's posterior (``corr = 0.998`` on the unreparameterised
+      ET-Delta coordinate).  ``chirp_mass`` (``mass``), ``theta_jn`` and
+      ``ra``/``dec``/``psi`` are prerequisites, so this is ranked ahead of
+      everything else in the returned dict.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
@@ -2015,6 +2030,26 @@ def triangular_group_reparameterisations(
         fails loudly, "prime space is missing ... delta_phase", rather than
         silently doing the wrong thing).  Must match the ``phase_coordinates``
         passed to :func:`make_triangular_group_flow_proposal`.
+    chirp_distance : bool, optional
+        Reparameterise ``luminosity_distance`` as the Roulet et al. chirp
+        distance instead of the default ``distance`` reparameterisation.
+        Default ``False``.
+    chirp_distance_plane_normal : array_like, optional
+        Detector-plane normal for the antenna response used to pick the
+        reference detector and evaluate ``R_k0``.  Defaults to
+        :data:`ET_EMR_PLANE_NORMAL`.
+    chirp_distance_azimuth_offset : float, optional
+        In-plane rotation (rad), matching the group action's
+        ``azimuth_offset``.  ``cos iota*``-type quantities built from ``R_k``
+        do not depend on it in the way the group action itself does, but it
+        is accepted so the two can be configured identically.  Default 0.
+    chirp_distance_k0 : int, optional
+        The reference detector index directly. Exactly one of ``chirp_distance_k0``
+        / ``chirp_distance_fiducial`` must be given when ``chirp_distance`` is set.
+    chirp_distance_fiducial : mapping, optional
+        ``ra``, ``dec``, ``psi``, ``theta_jn`` of a reference signal (typically
+        the injection or the maximum-likelihood point), used to pick
+        ``k0 = argmax_k |R_k|`` once at construction.
 
     Returns
     -------
@@ -2023,6 +2058,11 @@ def triangular_group_reparameterisations(
     """
     if vertex is None:
         vertex = ET_EMR_VERTEX
+    if chirp_distance and chirp_distance_k0 is None and chirp_distance_fiducial is None:
+        raise ValueError(
+            "chirp_distance requires either chirp_distance_k0 or "
+            "chirp_distance_fiducial."
+        )
     if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
         raise ValueError(
             "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
@@ -2049,12 +2089,30 @@ def triangular_group_reparameterisations(
     if polarisation_ellipse is not None:
         _rank["geocent_time"] = 1
         _rank["theta_jn"] = 1
+    if chirp_distance:
+        # Depends on chirp_mass, theta_jn, ra, dec and psi on its inverse --
+        # all either default-added (after every explicit entry here) or, for
+        # theta_jn, itself explicit at rank <= 1 above -- so rank it ahead of
+        # everything, including phase/geocent_time (no dependency either way).
+        _rank["luminosity_distance"] = -1
     ordered_names = sorted(
         sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
     reps = {}
     for name in ordered_names:
-        if name in ("chi_1", "chi_2"):
+        if name == "luminosity_distance" and chirp_distance:
+            reps[name] = {
+                "reparameterisation": "chirp-distance",
+                "plane_normal": (
+                    ET_EMR_PLANE_NORMAL if chirp_distance_plane_normal is None
+                    else chirp_distance_plane_normal
+                ),
+                "reference_time": float(reference_time),
+                "azimuth_offset": float(chirp_distance_azimuth_offset),
+                "k0": chirp_distance_k0,
+                "fiducial": chirp_distance_fiducial,
+            }
+        elif name in ("chi_1", "chi_2"):
             reps[name] = {"reparameterisation": "aligned-spin"}
         elif name in ("lambda_1", "lambda_2"):
             reps[name] = {
@@ -2154,6 +2212,11 @@ def _prime_parameter_names(
     polarisation_ellipse=None, polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
     polarisation_ellipse_adaptive_width=False,
+    chirp_distance=False,
+    chirp_distance_plane_normal=None,
+    chirp_distance_azimuth_offset=0.0,
+    chirp_distance_k0=None,
+    chirp_distance_fiducial=None,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2203,6 +2266,11 @@ def _prime_parameter_names(
                 polarisation_ellipse_scale=polarisation_ellipse_scale,
                 polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
                 polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
+                chirp_distance=chirp_distance,
+                chirp_distance_plane_normal=chirp_distance_plane_normal,
+                chirp_distance_azimuth_offset=chirp_distance_azimuth_offset,
+                chirp_distance_k0=chirp_distance_k0,
+                chirp_distance_fiducial=chirp_distance_fiducial,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -2264,6 +2332,8 @@ def _prime_parameter_names(
                 if (psi_single and name == "psi")
                 else [f"{name}_x", f"{name}_y"]
             )
+        elif name == "luminosity_distance" and chirp_distance:
+            out.append("chirp_distance")
         else:
             out.append(f"{name}_prime")
     return out
@@ -2545,6 +2615,9 @@ def make_triangular_group_flow_proposal(
     polarisation_ellipse_adaptive_width=False,
     phase_recanon=False,
     adaptive_domain=False,
+    chirp_distance=False,
+    chirp_distance_k0=None,
+    chirp_distance_fiducial=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -2831,6 +2904,11 @@ def make_triangular_group_flow_proposal(
             polarisation_ellipse_scale=polarisation_ellipse_scale,
             polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
             polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
+            chirp_distance=chirp_distance,
+            chirp_distance_plane_normal=plane_normal,
+            chirp_distance_azimuth_offset=azimuth_offset,
+            chirp_distance_k0=chirp_distance_k0,
+            chirp_distance_fiducial=chirp_distance_fiducial,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3067,6 +3145,9 @@ def make_et_group_flow_proposal(
     polarisation_ellipse_adaptive_width=False,
     phase_recanon=False,
     adaptive_domain=False,
+    chirp_distance=False,
+    chirp_distance_k0=None,
+    chirp_distance_fiducial=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3100,6 +3181,9 @@ def make_et_group_flow_proposal(
         polarisation_ellipse_scale=polarisation_ellipse_scale,
         polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
         polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
+        chirp_distance=chirp_distance,
+        chirp_distance_k0=chirp_distance_k0,
+        chirp_distance_fiducial=chirp_distance_fiducial,
         phase_recanon=phase_recanon,
         adaptive_domain=adaptive_domain,
     )
