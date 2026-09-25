@@ -18,7 +18,10 @@ from .phase import (
     SingleAngleReparameterisation,
 )
 from .sky import EqualAreaSky, RotatedAnglePair
-from .spin import AlignedSpinReparameterisation
+from .spin import (
+    AlignedSpinReparameterisation,
+    EffectiveSpinReparameterisation,
+)
 from .time import DetectorCenterTimeReparameterisation
 
 known_reparameterisations = ReparameterisationDict()
@@ -64,6 +67,11 @@ known_reparameterisations.add_reparameterisation(
 known_reparameterisations.add_reparameterisation(
     "aligned-spin",
     AlignedSpinReparameterisation,
+    {},
+)
+known_reparameterisations.add_reparameterisation(
+    "effective-spin",
+    EffectiveSpinReparameterisation,
     {},
 )
 known_reparameterisations.add_reparameterisation(

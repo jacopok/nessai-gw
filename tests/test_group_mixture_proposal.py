@@ -1448,6 +1448,80 @@ def test_reset_model_weights_realigns_prime_parameter_order(tmp_path):
     assert new_model.param_names != corrupted
 
 
+@requires_group_mixture
+def test_et_proposal_with_chirp_distance_and_effective_spin(tmp_path):
+    """The triangular proposal wired with both Roulet et al. coordinates:
+    the flow sees ``chirp_distance`` and ``chi_eff_prime`` /
+    ``chi_diff_prime``, the prime-space action binds to them (passing them
+    through) and the rescaling round-trips."""
+    from nessai.livepoint import numpy_array_to_live_points
+    from nessai.model import Model
+
+    from nessai_gw.group_mixture import triangular_group_reparameterisations
+
+    bounds = {
+        "chirp_mass": (1.19, 1.21),
+        "mass_ratio": (0.5, 1.0),
+        "chi_1": (-0.05, 0.05),
+        "chi_2": (-0.05, 0.05),
+        "luminosity_distance": (10.0, 500.0),
+        "theta_jn": (0.0, np.pi),
+        "psi": (0.0, np.pi),
+        "phase": (0.0, 2 * np.pi),
+        "ra": (0.0, 2 * np.pi),
+        "dec": (-np.pi / 2, np.pi / 2),
+        "geocent_time": (REFERENCE_TIME - 0.1, REFERENCE_TIME + 0.1),
+    }
+    names = list(bounds)
+    fiducial = {"ra": 3.4462, "dec": -0.4081, "psi": 1.57, "theta_jn": 0.3491}
+
+    class _StubModel(Model):
+        def __init__(self):
+            self.names = names
+            self.bounds = {k: np.asarray(v) for k, v in bounds.items()}
+
+        def log_prior(self, x):
+            return np.log(self.in_bounds(x), dtype=float)
+
+        def log_likelihood(self, x):
+            return np.zeros(len(np.atleast_1d(x)))
+
+    kwargs = {"chirp_distance": True, "effective_spin": True}
+    cls = make_et_group_flow_proposal(
+        names, REFERENCE_TIME, prime_space=True, n_clusters_max=1, **kwargs
+    )
+    proposal = cls(
+        _StubModel(),
+        output=str(tmp_path),
+        poolsize=100,
+        reparameterisations=triangular_group_reparameterisations(
+            names, REFERENCE_TIME, chirp_distance_fiducial=fiducial, **kwargs
+        ),
+        flow_config={"n_blocks": 1, "n_neurons": 4, "n_layers": 1},
+    )
+    proposal.initialise()
+    prime = list(proposal.prime_parameters)
+    assert {"chirp_distance", "chi_eff_prime", "chi_diff_prime"} <= set(prime)
+    assert not {
+        "luminosity_distance_prime", "chi_1_prime", "chi_2_prime"
+    } & set(prime)
+    assert proposal.flow.model.param_names == prime
+
+    rng = np.random.default_rng(3)
+    n = 300
+    theta = np.column_stack([rng.uniform(*bounds[k], n) for k in names])
+    for k in ("chi_1", "chi_2"):
+        theta[:, names.index(k)] = (
+            0.05 * rng.uniform(0, 1, n) * rng.uniform(-1, 1, n)
+        )
+    live = numpy_array_to_live_points(theta, names)
+    x_prime, log_j = proposal.rescale(live)
+    back, log_j_inv = proposal.inverse_rescale(x_prime)
+    for k in ("luminosity_distance", "chi_1", "chi_2", "mass_ratio"):
+        np.testing.assert_allclose(back[k][:n], live[k], rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(log_j[:n], -log_j_inv[:n], atol=1e-7)
+
+
 # ---------------------------------------------------------------------------
 # polarisation-ellipse inclination coordinate
 # ---------------------------------------------------------------------------

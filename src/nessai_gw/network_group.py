@@ -38,6 +38,12 @@ together with the two frame choices a separated network wants:
   invariant under ``g`` (``F_+, F_x -> -F_+, -F_x``), so the group action
   passes the coordinate through untouched.  It needs the detector tensors
   (read by :meth:`DetectorNetworkGeometry.from_interferometers`).
+* **effective spins** (Roulet et al. Sec. IV; the ``effective-spin``
+  reparameterisation): aligned ``chi_1``, ``chi_2`` become
+  ``chi_eff_prime`` (a function of ``chi_eff`` at fixed mass ratio) and
+  ``chi_diff_prime`` (the prior-weighted ``cumchidiff``), both ``N(0, 1)``
+  under the ``AlignedSpin`` prior, so a well-measured ``chi_eff`` is one axis
+  instead of a curved ridge.  Spins are group-invariant.
 
 Co-located interferometers (the three of a triangular ET) are merged into one
 *site* first, so the baseline always joins two distinct locations.  With a
@@ -547,7 +553,7 @@ def _chirp_distance_kwargs(geometry, chirp_distance):
 
 
 def network_group_reparameterisations(
-    sampling_parameters, geometry, chirp_distance=True
+    sampling_parameters, geometry, chirp_distance=True, effective_spin=True
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -558,7 +564,8 @@ def network_group_reparameterisations(
     fixed-bounds ``angle-sine`` for ``theta_jn``, ``aligned-spin`` for aligned
     spins, ``logit`` for tides and, by default, the ``chirp-distance`` at the
     loudest detector (``geometry.reference_detector``) for
-    ``luminosity_distance``.  ``psi`` and the sky are added by the proposal
+    ``luminosity_distance`` and the joint ``effective-spin``
+    ``(chi_eff_prime, chi_diff_prime)`` for aligned ``chi_1``, ``chi_2``.  ``psi`` and the sky are added by the proposal
     (single-angle ``psi_prime``; baseline-frame
     :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky`).
 
@@ -574,12 +581,17 @@ def network_group_reparameterisations(
         ``psi`` to be sampled).  Ignored when ``luminosity_distance`` is not
         sampled.  Must match :func:`make_network_group_flow_proposal`.
         Default ``True``.
+    effective_spin : bool, optional
+        Carry aligned ``chi_1``, ``chi_2`` as the effective-spin pair (needs
+        ``mass_ratio``).  Ignored without both spins.  Must match
+        :func:`make_network_group_flow_proposal`.  Default ``True``.
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
         geometry.reference_time,
         vertex=geometry.timing_vertex,
         phase_coordinates="polarisation-phase",
+        effective_spin=effective_spin,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
@@ -603,6 +615,7 @@ def make_network_group_flow_proposal(
     cluster_centroid_ema=None,
     flow_model_factory=None,
     chirp_distance=True,
+    effective_spin=True,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -612,7 +625,8 @@ def make_network_group_flow_proposal(
 
     The flow sees the barycentre time ``t_det``, the baseline-frame sky
     ``(sky_u, sky_v)``, ``psi_prime``, ``delta_phase`` and (by default)
-    ``chirp_distance``; the group mixture folds the polarisation/phase ``Z4``
+    ``chirp_distance`` and ``chi_eff_prime`` / ``chi_diff_prime``; the group
+    mixture folds the polarisation/phase ``Z4``
     (4 elements) and learns its weights.
 
     Parameters
@@ -641,6 +655,10 @@ def make_network_group_flow_proposal(
     chirp_distance : bool, optional
         Whether ``luminosity_distance`` is carried as the chirp distance; must
         match :func:`network_group_reparameterisations`.  Default ``True``.
+    effective_spin : bool, optional
+        Whether aligned spins are carried as ``(chi_eff_prime,
+        chi_diff_prime)``; must match :func:`network_group_reparameterisations`.
+        Default ``True``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -670,7 +688,7 @@ def make_network_group_flow_proposal(
     )
     prime_names = _prime_parameter_names(
         names, geometry.reference_time, vertex=geometry.timing_vertex,
-        sky_2d=True, psi_single=True,
+        sky_2d=True, psi_single=True, effective_spin=effective_spin,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),

@@ -181,3 +181,122 @@ class AlignedSpinReparameterisation(Reparameterisation):
         # log|dchi/du| = log phi(u) - log p(chi)
         log_j = log_j - (self._log_pdf(chi) + 0.5 * u**2 + 0.5 * _LOG_2PI)
         return x, x_prime, log_j
+
+
+class EffectiveSpinReparameterisation(Reparameterisation):
+    r"""``(chi_1, chi_2) -> (chi_eff_prime, chi_diff_prime)`` for aligned spins.
+
+    The Roulet et al. 2022 (arXiv:2207.03508, Sec. IV) effective-spin
+    coordinates, built for bilby's ``AlignedSpin`` prior: at fixed mass ratio
+    :math:`q = m_2 / m_1`,
+
+    .. math::
+        \mathrm{chi\_eff\_prime} = \Phi^{-1}\left(F_S(\chi_1 + q\chi_2 \mid q)\right),
+        \qquad
+        \mathrm{chi\_diff\_prime} = \Phi^{-1}\left(F_1(\chi_1 \mid \chi_1 + q\chi_2, q)\right),
+
+    the Rosenblatt transform of the prior in (effective spin, position along
+    the line of constant effective spin) order, followed by a probit.  The
+    first is a monotonic function of
+    :math:`\chi_\mathrm{eff} = (\chi_1 + q\chi_2) / (1 + q)` alone, so a
+    well-measured effective spin becomes a single narrow axis rather than the
+    curved ridge it traces in the per-spin ``aligned-spin`` coordinates; the
+    second is the prior-weighted analogue of the paper's ``cumchidiff``, which
+    the data barely constrain.  The prior on both is exactly ``N(0, 1)`` (no
+    cusp, no hard edge), as with :class:`AlignedSpinReparameterisation`.  See
+    :mod:`nessai_gw._effective_spin` for the numerics.  The map has no
+    closed form: the forward pass costs a few quadratures per point
+    (~30 us) and the inverse a Newton iteration on them (~150 us), cheap next
+    to a waveform evaluation.
+
+    Both coordinates are functions of the spins *and* the mass ratio, which is
+    read from x-space on the inverse, so the mass-ratio reparameterisation
+    must be inverted first (nessai orders this from ``inverse_input_parameters``).
+    Both are invariant under every group action in nessai-gw, which leave the
+    intrinsic parameters alone.
+
+    Parameters
+    ----------
+    parameters : list of str
+        The primary and secondary aligned spins, in that order (default
+        ``["chi_1", "chi_2"]``).
+    prior_bounds : dict
+        Their prior bounds; each must be symmetric, ``[-a_max, a_max]``.
+    mass_ratio : str, optional
+        Name of the mass ratio ``m_2 / m_1 <= 1`` (default ``"mass_ratio"``).
+    """
+
+    one_to_one = False
+
+    def __init__(
+        self,
+        parameters=None,
+        prior_bounds=None,
+        mass_ratio="mass_ratio",
+        rng=None,
+        **kwargs,
+    ):
+        from .._effective_spin import EffectiveSpinTransform
+
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        if parameters is None and "input_parameters" in kwargs:
+            parameters = kwargs.pop("input_parameters")
+        if parameters is None:
+            parameters = ["chi_1", "chi_2"]
+        call = {"parameters": parameters, "prior_bounds": prior_bounds}
+        if "rng" in parent_params:
+            call["rng"] = rng
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
+
+        if len(self.parameters) != 2:
+            raise RuntimeError(
+                "EffectiveSpinReparameterisation needs exactly two aligned "
+                f"spins (primary, secondary); got {self.parameters}"
+            )
+        a_max = []
+        for name in self.parameters:
+            lower, upper = self.prior_bounds[name]
+            if not np.isclose(-lower, upper):
+                raise RuntimeError(
+                    f"{name} prior bounds {(lower, upper)} are not symmetric "
+                    "about zero, as the AlignedSpin prior requires."
+                )
+            a_max.append(float(upper))
+        self._transform = EffectiveSpinTransform(*a_max)
+        self._mass_ratio = mass_ratio
+        self.requires = [mass_ratio]
+
+        self.prime_parameters = ["chi_eff_prime", "chi_diff_prime"]
+        if hasattr(self, "output_parameters"):
+            self.output_parameters = list(self.prime_parameters)
+        if hasattr(self, "inverse_input_parameters"):
+            self.inverse_input_parameters = list(
+                dict.fromkeys(
+                    list(self.inverse_input_parameters or []) + [mass_ratio]
+                )
+            )
+
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        chi_1, chi_2 = self.parameters
+        u, w, lj = self._transform.forward(
+            x[chi_1], x[chi_2], x[self._mass_ratio]
+        )
+        x_prime[self.prime_parameters[0]] = u
+        x_prime[self.prime_parameters[1]] = w
+        return x, x_prime, log_j + lj
+
+    def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
+        chi_1, chi_2 = self.parameters
+        c1, c2, lj = self._transform.inverse(
+            x_prime[self.prime_parameters[0]],
+            x_prime[self.prime_parameters[1]],
+            x[self._mass_ratio],
+        )
+        x[chi_1] = c1
+        x[chi_2] = c2
+        return x, x_prime, log_j - lj

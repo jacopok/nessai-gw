@@ -399,6 +399,19 @@ def test_reparameterisations_default_to_chirp_distance(geometry):
     )
 
 
+def test_reparameterisations_default_to_effective_spin(geometry):
+    reps = network_group_reparameterisations(PARAMETERS, geometry)
+    assert reps["chi_1"] == {
+        "reparameterisation": "effective-spin",
+        "parameters": ["chi_1", "chi_2"],
+    }
+    assert "chi_2" not in reps
+    off = network_group_reparameterisations(
+        PARAMETERS, geometry, effective_spin=False
+    )
+    assert off["chi_1"] == off["chi_2"] == {"reparameterisation": "aligned-spin"}
+
+
 def test_chirp_distance_needs_tensors():
     geo = DetectorNetworkGeometry([IT, DE], [30.0, 40.0], REFERENCE_TIME)
     with pytest.raises(ValueError, match="detector tensors"):
@@ -492,9 +505,12 @@ def test_network_proposal_initialise_train_and_draw(geometry, tmp_path):
     proposal.initialise()
     prime = list(proposal.prime_parameters)
     assert {
-        "sky_u", "sky_v", "psi_prime", "delta_phase", "t_det", "chirp_distance"
+        "sky_u", "sky_v", "psi_prime", "delta_phase", "t_det",
+        "chirp_distance", "chi_eff_prime", "chi_diff_prime",
     } <= set(prime)
-    assert "luminosity_distance_prime" not in prime
+    assert not {
+        "luminosity_distance_prime", "chi_1_prime", "chi_2_prime"
+    } & set(prime)
     assert proposal.flow.model.param_names == prime
 
     rng = np.random.default_rng(7)
@@ -512,10 +528,10 @@ def test_network_proposal_initialise_train_and_draw(geometry, tmp_path):
     x_prime, log_j = proposal.rescale(live)
     back, log_j_inv = proposal.inverse_rescale(x_prime)
     n = len(live)
-    np.testing.assert_allclose(
-        back["luminosity_distance"][:n], live["luminosity_distance"],
-        rtol=1e-9,
-    )
+    for name in ("luminosity_distance", "chi_1", "chi_2"):
+        np.testing.assert_allclose(
+            back[name][:n], live[name], rtol=1e-9, atol=1e-12
+        )
     np.testing.assert_allclose(log_j[:n], -log_j_inv[:n], atol=1e-8)
     proposal.train(live)
     worst = live[:1].copy()

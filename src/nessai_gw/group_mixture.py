@@ -1977,6 +1977,7 @@ def triangular_group_reparameterisations(
     chirp_distance_tensors=None,
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
+    effective_spin=False,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2022,6 +2023,14 @@ def triangular_group_reparameterisations(
       action passes ``chirp_distance`` through untouched.  With no
       ``luminosity_distance`` in ``sampling_parameters`` (e.g. a
       distance-marginalised run) the switch does nothing.
+    * ``chi_1``, ``chi_2`` -> ``effective-spin`` (only if ``effective_spin`` is
+      set; replaces the per-spin ``aligned-spin`` below): the Roulet et al.
+      effective-spin coordinates for the ``AlignedSpin`` prior,
+      ``chi_eff_prime`` (a monotonic function of ``chi_eff`` at fixed ``q``)
+      and ``chi_diff_prime`` (the prior-weighted ``cumchidiff``), both
+      ``N(0, 1)`` under the prior; see
+      :class:`~nessai_gw.reparameterisations.EffectiveSpinReparameterisation`.
+      ``mass_ratio`` is a prerequisite, so this is ranked ahead as well.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
@@ -2083,6 +2092,11 @@ def triangular_group_reparameterisations(
         ``ra``, ``dec``, ``psi``, ``theta_jn`` of a reference signal (typically
         the injection or the maximum-likelihood point), used to pick
         ``k0 = argmax_k |R_k|`` once at construction.
+    effective_spin : bool, optional
+        Reparameterise the aligned spins ``chi_1``, ``chi_2`` jointly as
+        ``(chi_eff_prime, chi_diff_prime)`` (``effective-spin``) instead of
+        one ``aligned-spin`` coordinate each.  Needs ``mass_ratio`` to be
+        sampled; does nothing without both spins.  Default ``False``.
 
     Returns
     -------
@@ -2107,6 +2121,15 @@ def triangular_group_reparameterisations(
                 "(the chirp distance is d_L / (chirp_mass^{5/6} |R_k0|)); "
                 "pass chirp_distance=False."
             )
+    effective_spin = bool(effective_spin) and {"chi_1", "chi_2"} <= set(
+        sampling_parameters
+    )
+    if effective_spin and "mass_ratio" not in sampling_parameters:
+        raise ValueError(
+            "effective_spin needs 'mass_ratio' in the sampling parameters "
+            "(chi_eff = (chi_1 + q chi_2) / (1 + q)); pass "
+            "effective_spin=False."
+        )
     if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
         raise ValueError(
             "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
@@ -2139,6 +2162,10 @@ def triangular_group_reparameterisations(
         # theta_jn, itself explicit at rank <= 1 above -- so rank it ahead of
         # everything, including phase/geocent_time (no dependency either way).
         _rank["luminosity_distance"] = -1
+    if effective_spin:
+        # Reads mass_ratio (default-added, hence after every explicit entry)
+        # on its inverse.
+        _rank["chi_1"] = -1
     ordered_names = sorted(
         sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
@@ -2155,6 +2182,13 @@ def triangular_group_reparameterisations(
                 "k0": chirp_distance_k0,
                 "fiducial": chirp_distance_fiducial,
             }
+        elif name == "chi_1" and effective_spin:
+            reps[name] = {
+                "reparameterisation": "effective-spin",
+                "parameters": ["chi_1", "chi_2"],
+            }
+        elif name == "chi_2" and effective_spin:
+            continue  # covered by the joint ``effective-spin`` entry
         elif name in ("chi_1", "chi_2"):
             reps[name] = {"reparameterisation": "aligned-spin"}
         elif name in ("lambda_1", "lambda_2"):
@@ -2259,6 +2293,7 @@ def _prime_parameter_names(
     chirp_distance_tensors=None,
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
+    effective_spin=False,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2318,6 +2353,7 @@ def _prime_parameter_names(
                     else chirp_distance_k0
                 ),
                 chirp_distance_fiducial=chirp_distance_fiducial,
+                effective_spin=effective_spin,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -2381,6 +2417,12 @@ def _prime_parameter_names(
             )
         elif name == "luminosity_distance" and chirp_distance:
             out.append("chirp_distance")
+        elif name in ("chi_1", "chi_2") and effective_spin and {
+            "chi_1", "chi_2", "mass_ratio"
+        } <= set(names):
+            out.append(
+                "chi_eff_prime" if name == "chi_1" else "chi_diff_prime"
+            )
         else:
             out.append(f"{name}_prime")
     return out
@@ -2666,6 +2708,7 @@ def make_triangular_group_flow_proposal(
     chirp_distance_tensors=None,
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
+    effective_spin=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -2868,6 +2911,10 @@ def make_triangular_group_flow_proposal(
         here -- the coordinate is group-invariant, so
         :class:`PrimeSpaceTriangularGroupAction` passes it through -- and
         ``k0`` / ``fiducial`` may be omitted.  Default ``False``.
+    effective_spin : bool, optional
+        Must match :func:`triangular_group_reparameterisations`: the flow sees
+        ``chi_eff_prime`` / ``chi_diff_prime`` in place of ``chi_1_prime`` /
+        ``chi_2_prime``.  Default ``False``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -2964,6 +3011,7 @@ def make_triangular_group_flow_proposal(
             chirp_distance_tensors=chirp_distance_tensors,
             chirp_distance_k0=chirp_distance_k0,
             chirp_distance_fiducial=chirp_distance_fiducial,
+            effective_spin=effective_spin,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3222,6 +3270,7 @@ def make_et_group_flow_proposal(
     chirp_distance_tensors=None,
     chirp_distance_k0=None,
     chirp_distance_fiducial=None,
+    effective_spin=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3259,6 +3308,7 @@ def make_et_group_flow_proposal(
         chirp_distance_tensors=chirp_distance_tensors,
         chirp_distance_k0=chirp_distance_k0,
         chirp_distance_fiducial=chirp_distance_fiducial,
+        effective_spin=effective_spin,
         phase_recanon=phase_recanon,
         adaptive_domain=adaptive_domain,
     )
