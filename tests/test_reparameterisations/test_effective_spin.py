@@ -199,6 +199,28 @@ def test_reparameterisation_round_trip(reparam):
     np.testing.assert_allclose(log_j, -log_j_inv, atol=1e-7)
 
 
+def test_inverse_skips_invalid_mass_ratio(reparam):
+    """``q`` underflowed to zero (or non-finite) gives NaN spins without
+    floating-point warnings; the valid points are unaffected."""
+    c1, c2, q = _points(6, seed=7)
+    x = _structured(c1, c2, q)
+    x_prime = np.zeros(len(x), dtype=[(n, "f8") for n in reparam.prime_parameters])
+    x, x_prime, _ = reparam.reparameterise(x, x_prime, np.zeros(len(x)))
+
+    q_in = q.copy()
+    q_in[:3] = [0.0, 1e-310, np.nan]
+    back = _structured(np.zeros_like(c1), np.zeros_like(c2), q_in)
+    with np.errstate(all="raise"):
+        back, _, log_j_inv = reparam.inverse_reparameterise(
+            back, x_prime, np.zeros(len(x))
+        )
+    assert np.all(np.isnan(back["chi_1"][:3]))
+    assert np.all(np.isnan(back["chi_2"][:3]))
+    assert np.all(np.isnan(log_j_inv[:3]))
+    np.testing.assert_allclose(back["chi_1"][3:], c1[3:], atol=1e-12)
+    np.testing.assert_allclose(back["chi_2"][3:], c2[3:], atol=1e-12)
+
+
 # ---------------------------------------------------------------------------
 # wiring
 # ---------------------------------------------------------------------------

@@ -215,6 +215,14 @@ class EffectiveSpinReparameterisation(Reparameterisation):
     Both are invariant under every group action in nessai-gw, which leave the
     intrinsic parameters alone.
 
+    The flow occasionally proposes a mass ratio far outside its prior (with
+    ``log-mass-ratio``, ``q = exp(ln q)`` underflows to zero), where
+    ``chi_2 = (S - chi_1) / q`` is undetermined and the quadratures divide by
+    zero.  The inverse skips points with ``q < min_mass_ratio`` or non-finite
+    inputs and returns NaN spins and log-Jacobian for them; they lie outside
+    any sensible mass-ratio prior, so nessai rejects them on its prior-bounds
+    check as it would anyway.
+
     Parameters
     ----------
     parameters : list of str
@@ -224,6 +232,10 @@ class EffectiveSpinReparameterisation(Reparameterisation):
         Their prior bounds; each must be symmetric, ``[-a_max, a_max]``.
     mass_ratio : str, optional
         Name of the mass ratio ``m_2 / m_1 <= 1`` (default ``"mass_ratio"``).
+    min_mass_ratio : float, optional
+        Smallest mass ratio the inverse is evaluated at (default ``1e-6``;
+        the round trip holds to ~1e-8 in the log-Jacobian there and degrades
+        below it).  Must not exceed the lower bound of the mass-ratio prior.
     """
 
     one_to_one = False
@@ -233,6 +245,7 @@ class EffectiveSpinReparameterisation(Reparameterisation):
         parameters=None,
         prior_bounds=None,
         mass_ratio="mass_ratio",
+        min_mass_ratio=1e-6,
         rng=None,
         **kwargs,
     ):
@@ -269,6 +282,7 @@ class EffectiveSpinReparameterisation(Reparameterisation):
             a_max.append(float(upper))
         self._transform = EffectiveSpinTransform(*a_max)
         self._mass_ratio = mass_ratio
+        self.min_mass_ratio = float(min_mass_ratio)
         self.requires = [mass_ratio]
 
         self.prime_parameters = ["chi_eff_prime", "chi_diff_prime"]
@@ -292,11 +306,20 @@ class EffectiveSpinReparameterisation(Reparameterisation):
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
         chi_1, chi_2 = self.parameters
-        c1, c2, lj = self._transform.inverse(
-            x_prime[self.prime_parameters[0]],
-            x_prime[self.prime_parameters[1]],
-            x[self._mass_ratio],
+        u = x_prime[self.prime_parameters[0]]
+        w = x_prime[self.prime_parameters[1]]
+        q = x[self._mass_ratio]
+        valid = (
+            np.isfinite(u) & np.isfinite(w) & np.isfinite(q)
+            & (q >= self.min_mass_ratio)
         )
+        c1 = np.full(len(q), np.nan)
+        c2 = np.full(len(q), np.nan)
+        lj = np.full(len(q), np.nan)
+        if valid.any():
+            c1[valid], c2[valid], lj[valid] = self._transform.inverse(
+                u[valid], w[valid], q[valid]
+            )
         x[chi_1] = c1
         x[chi_2] = c2
         return x, x_prime, log_j - lj
