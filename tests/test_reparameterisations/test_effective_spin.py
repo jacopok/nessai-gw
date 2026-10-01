@@ -236,6 +236,10 @@ def test_triangular_wiring():
         "reparameterisation": "effective-spin",
         "parameters": ["chi_1", "chi_2"],
     }
+    tab = triangular_group_reparameterisations(
+        WIRING, 1187008882.4, effective_spin="tabulated"
+    )
+    assert tab["chi_1"]["tabulated"] is True
     assert "chi_2" not in reps
     assert next(iter(reps)) == "chi_1"
     default = triangular_group_reparameterisations(WIRING, 1187008882.4)

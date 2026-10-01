@@ -2114,11 +2114,13 @@ def triangular_group_reparameterisations(
         ``ra``, ``dec``, ``psi``, ``theta_jn`` of a reference signal (typically
         the injection or the maximum-likelihood point), used to pick
         ``k0 = argmax_k |R_k|`` once at construction.
-    effective_spin : bool, optional
+    effective_spin : bool or "tabulated", optional
         Reparameterise the aligned spins ``chi_1``, ``chi_2`` jointly as
         ``(chi_eff_prime, chi_diff_prime)`` (``effective-spin``) instead of
         one ``aligned-spin`` coordinate each.  Needs ``mass_ratio`` to be
-        sampled; does nothing without both spins.  Default ``False``.
+        sampled; does nothing without both spins.  ``"tabulated"`` uses the
+        tabulated transform (exactly invertible, approximately normal prior,
+        cheaper inverse).  Default ``False``.
     log_mass_ratio : bool, optional
         Sample ``mass_ratio`` as ``ln q`` (``log-mass-ratio``) rather than
         ``q`` (``mass_ratio``).  The prime name stays ``mass_ratio_prime``.
@@ -2147,6 +2149,7 @@ def triangular_group_reparameterisations(
                 "(the chirp distance is d_L / (chirp_mass^{5/6} |R_k0|)); "
                 "pass chirp_distance=False."
             )
+    tabulated_spin = effective_spin == "tabulated"
     effective_spin = bool(effective_spin) and {"chi_1", "chi_2"} <= set(
         sampling_parameters
     )
@@ -2213,6 +2216,8 @@ def triangular_group_reparameterisations(
                 "reparameterisation": "effective-spin",
                 "parameters": ["chi_1", "chi_2"],
             }
+            if tabulated_spin:
+                reps[name]["tabulated"] = True
         elif name == "chi_2" and effective_spin:
             continue  # covered by the joint ``effective-spin`` entry
         elif name in ("chi_1", "chi_2"):

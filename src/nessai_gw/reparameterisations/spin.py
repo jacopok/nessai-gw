@@ -236,6 +236,12 @@ class EffectiveSpinReparameterisation(Reparameterisation):
         Smallest mass ratio the inverse is evaluated at (default ``1e-6``;
         the round trip holds to ~1e-8 in the log-Jacobian there and degrades
         below it).  Must not exceed the lower bound of the mass-ratio prior.
+    tabulated : bool, optional
+        Use :class:`~nessai_gw._effective_spin_table.TabulatedEffectiveSpinTransform`:
+        the CDFs are tabulated once and the map is defined by the tables, so
+        it is exactly invertible with an exact Jacobian but the prior on the
+        new coordinates is only approximately ``N(0, I)`` (rms ~0.01 from
+        the exact transform); its inverse is ~3x cheaper.  Default ``False``.
     """
 
     one_to_one = False
@@ -246,10 +252,12 @@ class EffectiveSpinReparameterisation(Reparameterisation):
         prior_bounds=None,
         mass_ratio="mass_ratio",
         min_mass_ratio=1e-6,
+        tabulated=False,
         rng=None,
         **kwargs,
     ):
         from .._effective_spin import EffectiveSpinTransform
+        from .._effective_spin_table import TabulatedEffectiveSpinTransform
 
         parent_params = inspect.signature(
             Reparameterisation.__init__
@@ -280,7 +288,11 @@ class EffectiveSpinReparameterisation(Reparameterisation):
                     "about zero, as the AlignedSpin prior requires."
                 )
             a_max.append(float(upper))
-        self._transform = EffectiveSpinTransform(*a_max)
+        self.tabulated = bool(tabulated)
+        if self.tabulated:
+            self._transform = TabulatedEffectiveSpinTransform(*a_max)
+        else:
+            self._transform = EffectiveSpinTransform(*a_max)
         self._mass_ratio = mass_ratio
         self.min_mass_ratio = float(min_mass_ratio)
         self.requires = [mass_ratio]
