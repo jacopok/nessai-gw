@@ -252,7 +252,7 @@ class EffectiveSpinReparameterisation(Reparameterisation):
         prior_bounds=None,
         mass_ratio="mass_ratio",
         min_mass_ratio=1e-6,
-        tabulated=False,
+        tabulated=True,
         rng=None,
         **kwargs,
     ):
