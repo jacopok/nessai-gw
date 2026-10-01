@@ -1614,6 +1614,21 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         out = self._action(d, modes, inverse=False)
         return torch.stack([out[n] for n in self._names], dim=1)
 
+    def _first_in_target(self, z, modes, seams, phase_mode):
+        """Image of each row of ``z`` under the first of the candidate
+        ``modes`` (a list of ``[n]`` tensors, tried in order) that lands in
+        the target domain, and a found mask.  All candidates go through the
+        action in one call: the action is row-wise and its cost is per-call
+        overhead rather than per row."""
+        m, n = len(modes), z.shape[0]
+        cand = self._act(z.repeat(m, 1), torch.cat(modes)).view(m, n, -1)
+        ok = self._in_target(
+            cand.reshape(m * n, -1), seams, phase_mode
+        ).view(m, n)
+        # argmax returns the first maximal index: the first candidate in order
+        first = ok.to(torch.uint8).argmax(dim=0)
+        return cand[first, torch.arange(n, device=z.device)], ok.any(dim=0)
+
     def _map_to(self, z, seams, phase_mode):
         """Image of each row of ``z`` in the target domain, and a found mask."""
         out = z.clone()
@@ -1624,20 +1639,22 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         k = torch.remainder(
             -torch.floor(4.0 * torch.remainder(z[:, self._iu] - cu, 1.0)), 4
         ).long()
-        for j in range(4):
-            cand = self._act(z, k + 8 * j)
-            m = self._in_target(cand, seams, phase_mode) & ~found
-            out[m] = cand[m]
-            found |= m
+        cand, found = self._first_in_target(
+            z, [k + 8 * j for j in range(4)], seams, phase_mode
+        )
+        out[found] = cand[found]
         if not bool(found.all()):
             rest = (~found).nonzero(as_tuple=True)[0]
-            zr = z[rest]
-            fr = torch.zeros(len(rest), dtype=torch.bool, device=z.device)
-            for g in range(self._action._action.group_size):
-                cand = self._act(zr, torch.full_like(rest, g))
-                m = self._in_target(cand, seams, phase_mode) & ~fr
-                out[rest[m]] = cand[m]
-                fr |= m
+            cand, fr = self._first_in_target(
+                z[rest],
+                [
+                    torch.full_like(rest, g)
+                    for g in range(self._action._action.group_size)
+                ],
+                seams,
+                phase_mode,
+            )
+            out[rest[fr]] = cand[fr]
             found[rest] = fr
         return out, found
 
