@@ -92,10 +92,10 @@ def test_pickle_drops_the_tables(transform):
 
 def test_reparameterisation_option():
     bounds = {"chi_1": [-A1, A1], "chi_2": [-A2, A2]}
-    r = EffectiveSpinReparameterisation(prior_bounds=bounds, tabulated=True)
-    assert isinstance(r._transform, TabulatedEffectiveSpinTransform)
-    r = EffectiveSpinReparameterisation(prior_bounds=bounds)
+    r = EffectiveSpinReparameterisation(prior_bounds=bounds, tabulated=False)
     assert isinstance(r._transform, EffectiveSpinTransform)
+    r = EffectiveSpinReparameterisation(prior_bounds=bounds)
+    assert isinstance(r._transform, TabulatedEffectiveSpinTransform)
 
 
 def test_reparameterisation_drops_unresolved_tails():
