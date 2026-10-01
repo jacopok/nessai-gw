@@ -96,3 +96,25 @@ def test_reparameterisation_option():
     assert isinstance(r._transform, TabulatedEffectiveSpinTransform)
     r = EffectiveSpinReparameterisation(prior_bounds=bounds)
     assert isinstance(r._transform, EffectiveSpinTransform)
+
+
+def test_reparameterisation_drops_unresolved_tails():
+    """Far beyond the tables' resolution the log-Jacobian can be non-finite;
+    those points come back as NaN spins (out of bounds), without warnings."""
+    bounds = {"chi_1": [-A1, A1], "chi_2": [-A2, A2]}
+    r = EffectiveSpinReparameterisation(prior_bounds=bounds, tabulated=True)
+    rng = np.random.default_rng(1)
+    n = 100_000
+    x = np.zeros(n, dtype=[(k, "f8") for k in ("chi_1", "chi_2", "mass_ratio")])
+    x["mass_ratio"] = rng.uniform(0.05, 1.0, n)
+    x_prime = np.zeros(
+        n, dtype=[("chi_eff_prime", "f8"), ("chi_diff_prime", "f8")]
+    )
+    x_prime["chi_eff_prime"] = 6 * rng.standard_normal(n)
+    x_prime["chi_diff_prime"] = 6 * rng.standard_normal(n)
+    with np.errstate(all="raise"):
+        x, _, log_j = r.inverse_reparameterise(x, x_prime, np.zeros(n))
+    kept = np.isfinite(x["chi_1"]) & np.isfinite(x["chi_2"])
+    assert not kept.all()
+    assert np.all(np.isfinite(log_j[kept]))
+    assert np.all(np.isnan(x["chi_2"][~np.isfinite(log_j)]))

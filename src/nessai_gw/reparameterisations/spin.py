@@ -329,9 +329,17 @@ class EffectiveSpinReparameterisation(Reparameterisation):
         c2 = np.full(len(q), np.nan)
         lj = np.full(len(q), np.nan)
         if valid.any():
-            c1[valid], c2[valid], lj[valid] = self._transform.inverse(
-                u[valid], w[valid], q[valid]
-            )
+            # beyond the tables' resolution (|u| or |w| >~ 8) the spins land
+            # on the prior box edge, where the log-Jacobian can be +-inf or
+            # nan; a -inf at an interior point would give an infinite
+            # rejection weight, so treat any such point as out of bounds
+            with np.errstate(divide="ignore", invalid="ignore"):
+                c1[valid], c2[valid], lj[valid] = self._transform.inverse(
+                    u[valid], w[valid], q[valid]
+                )
+            bad = ~np.isfinite(lj)
+            c1[bad] = np.nan
+            c2[bad] = np.nan
         x[chi_1] = c1
         x[chi_2] = c2
         return x, x_prime, log_j - lj
