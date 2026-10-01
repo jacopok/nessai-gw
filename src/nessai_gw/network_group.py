@@ -43,7 +43,9 @@ together with the two frame choices a separated network wants:
   ``chi_eff_prime`` (a function of ``chi_eff`` at fixed mass ratio) and
   ``chi_diff_prime`` (the prior-weighted ``cumchidiff``), both ``N(0, 1)``
   under the ``AlignedSpin`` prior, so a well-measured ``chi_eff`` is one axis
-  instead of a curved ridge.  Spins are group-invariant.
+  instead of a curved ridge.  Spins, aligned or precessing (the
+  ``precessing-spin`` reparameterisation), are invariant under ``g``, which
+  only moves ``psi`` and ``phase``.
 
 Co-located interferometers (the three of a triangular ET) are merged into one
 *site* first, so the baseline always joins two distinct locations.  With a
@@ -558,6 +560,7 @@ def network_group_reparameterisations(
     chirp_distance=True,
     effective_spin=True,
     log_mass_ratio=True,
+    precessing_spin=False,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -593,6 +596,10 @@ def network_group_reparameterisations(
     log_mass_ratio : bool, optional
         Sample ``mass_ratio`` as ``ln q`` (``log-mass-ratio``).  Must match
         :func:`make_network_group_flow_proposal`.  Default ``True``.
+    precessing_spin : bool, optional
+        Carry the six precessing spin parameters as the ``precessing-spin``
+        coordinates (needs ``mass_ratio``).  Must match
+        :func:`make_network_group_flow_proposal`.  Default ``False``.
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
@@ -601,6 +608,7 @@ def network_group_reparameterisations(
         phase_coordinates="polarisation-phase",
         effective_spin=effective_spin,
         log_mass_ratio=log_mass_ratio,
+        precessing_spin=precessing_spin,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
@@ -626,6 +634,7 @@ def make_network_group_flow_proposal(
     chirp_distance=True,
     effective_spin=True,
     log_mass_ratio=True,
+    precessing_spin=False,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -672,6 +681,10 @@ def make_network_group_flow_proposal(
     log_mass_ratio : bool, optional
         Whether ``mass_ratio`` is sampled as ``ln q``; must match
         :func:`network_group_reparameterisations`.  Default ``True``.
+    precessing_spin : bool, optional
+        Whether precessing spins are carried as the ``precessing-spin``
+        coordinates; must match :func:`network_group_reparameterisations`.
+        Default ``False``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -702,7 +715,7 @@ def make_network_group_flow_proposal(
     prime_names = _prime_parameter_names(
         names, geometry.reference_time, vertex=geometry.timing_vertex,
         sky_2d=True, psi_single=True, effective_spin=effective_spin,
-        log_mass_ratio=log_mass_ratio,
+        log_mass_ratio=log_mass_ratio, precessing_spin=precessing_spin,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),

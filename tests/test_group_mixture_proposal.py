@@ -1689,3 +1689,96 @@ def test_prime_action_with_ellipse_round_trips(ellipse, prime_points, g):
         assert torch.allclose(
             back[name], prime_points[name], atol=1e-8
         ), name
+
+
+# ---------------------------------------------------------------------------
+# Precessing spins: phi_jl -> phi_jl + pi under the plane reflection
+# ---------------------------------------------------------------------------
+
+PRECESSING_PARAMETERS = [
+    name for name in BNS_PARAMETERS if name not in ("chi_1", "chi_2")
+] + ["a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"]
+
+
+def test_triangular_group_reparameterisations_precessing_spin():
+    reps = triangular_group_reparameterisations(
+        PRECESSING_PARAMETERS, REFERENCE_TIME, precessing_spin=True
+    )
+    assert reps["a_1"] == {
+        "reparameterisation": "precessing-spin",
+        "parameters": ["a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"],
+    }
+    for name in ("tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"):
+        assert name not in reps
+    # ahead of everything (it reads mass_ratio on its inverse)
+    assert list(reps)[0] == "a_1"
+    # off by default, and without all six parameters
+    assert "a_1" not in triangular_group_reparameterisations(
+        PRECESSING_PARAMETERS, REFERENCE_TIME
+    )
+    assert "a_1" not in triangular_group_reparameterisations(
+        [n for n in PRECESSING_PARAMETERS if n != "phi_12"], REFERENCE_TIME,
+        precessing_spin=True,
+    )
+    with pytest.raises(ValueError, match="mass_ratio"):
+        triangular_group_reparameterisations(
+            [n for n in PRECESSING_PARAMETERS if n != "mass_ratio"],
+            REFERENCE_TIME, precessing_spin=True,
+        )
+
+
+def test_prime_parameter_names_precessing_spin():
+    prime = _prime_parameter_names(
+        PRECESSING_PARAMETERS, REFERENCE_TIME, precessing_spin=True
+    )
+    assert {"chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x",
+            "s2_y"} <= set(prime)
+    assert not any(n.startswith(("a_1", "tilt", "phi_jl", "phi_12")) for n in prime)
+
+
+@pytest.mark.parametrize(
+    "phi_jl_names", [("s1_x", "s1_y"), ("phi_jl_x", "phi_jl_y"), ("phi_jl_prime",)]
+)
+def test_prime_space_action_shifts_phi_jl(prime_points, phi_jl_names):
+    """The reflected elements send phi_jl -> phi_jl + pi; the rotations and
+    the identity leave it alone, and the map is an involution on it."""
+    base = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
+    names = PRIME_NAMES + list(phi_jl_names) + ["s2_x"]
+    action = PrimeSpaceTriangularGroupAction(base, names)
+    rng = np.random.default_rng(5)
+    n = len(prime_points["ra_dec_x"])
+    points = dict(prime_points)
+    phi_jl = rng.uniform(0, 2 * np.pi, n)
+    if len(phi_jl_names) == 2:
+        radius = rng.uniform(0.1, 3, n)
+        points[phi_jl_names[0]] = torch.as_tensor(radius * np.cos(phi_jl))
+        points[phi_jl_names[1]] = torch.as_tensor(radius * np.sin(phi_jl))
+    else:
+        points[phi_jl_names[0]] = torch.as_tensor(phi_jl / np.pi - 1)
+    points["s2_x"] = torch.as_tensor(rng.normal(size=n))
+
+    def angle(d):
+        if len(phi_jl_names) == 2:
+            return np.arctan2(d[phi_jl_names[1]].numpy(), d[phi_jl_names[0]].numpy())
+        return (d[phi_jl_names[0]].numpy() + 1) * np.pi
+
+    for g in range(base.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        mapped = action(points, modes)
+        _, reflected, _ = base.decode_modes(modes)
+        shift = np.pi if bool(reflected[0]) else 0.0
+        diff = np.remainder(angle(mapped) - angle(points) - shift + np.pi, 2 * np.pi) - np.pi
+        assert np.abs(diff).max() < 1e-9, g
+        if len(phi_jl_names) == 2:
+            np.testing.assert_allclose(
+                torch.hypot(mapped[phi_jl_names[0]], mapped[phi_jl_names[1]]),
+                torch.hypot(points[phi_jl_names[0]], points[phi_jl_names[1]]),
+            )
+        else:
+            assert torch.all(mapped[phi_jl_names[0]] >= -1)
+            assert torch.all(mapped[phi_jl_names[0]] < 1)
+        # the other in-plane spin is invariant
+        assert torch.equal(mapped["s2_x"], points["s2_x"])
+        back = action(mapped, modes, inverse=True)
+        for name in phi_jl_names:
+            assert torch.allclose(back[name], points[name], atol=1e-12)

@@ -21,6 +21,7 @@ from .sky import EqualAreaSky, RotatedAnglePair
 from .spin import (
     AlignedSpinReparameterisation,
     EffectiveSpinReparameterisation,
+    PrecessingSpinReparameterisation,
 )
 from .time import DetectorCenterTimeReparameterisation
 
@@ -86,6 +87,11 @@ known_reparameterisations.add_reparameterisation(
 known_reparameterisations.add_reparameterisation(
     "effective-spin",
     EffectiveSpinReparameterisation,
+    {},
+)
+known_reparameterisations.add_reparameterisation(
+    "precessing-spin",
+    PrecessingSpinReparameterisation,
     {},
 )
 known_reparameterisations.add_reparameterisation(

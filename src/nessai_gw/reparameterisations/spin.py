@@ -213,7 +213,8 @@ class EffectiveSpinReparameterisation(Reparameterisation):
     read from x-space on the inverse, so the mass-ratio reparameterisation
     must be inverted first (nessai orders this from ``inverse_input_parameters``).
     Both are invariant under every group action in nessai-gw, which leave the
-    intrinsic parameters alone.
+    intrinsic parameters alone (the only spin parameter they act on is the
+    precessing ``phi_jl``; see :class:`PrecessingSpinReparameterisation`).
 
     The flow occasionally proposes a mass ratio far outside its prior (with
     ``log-mass-ratio``, ``q = exp(ln q)`` underflows to zero), where
@@ -342,4 +343,239 @@ class EffectiveSpinReparameterisation(Reparameterisation):
             c2[bad] = np.nan
         x[chi_1] = c1
         x[chi_2] = c2
+        return x, x_prime, log_j - lj
+
+
+#: Smallest ``|chi_z|`` and spin magnitude the precessing-spin chart uses
+#: (both are zero only on sets of zero prior measure).
+_TINY = 1e-300
+
+
+def _in_plane_forward(a, tilt, a_max):
+    r"""The in-plane radius ``rho`` of :class:`PrecessingSpinReparameterisation`
+    and ``log |d(chi_z, s_x, s_y) / d(a, tilt, phi)|``.
+
+    ``u = ln(a / |chi_z|) / ln(a_max / |chi_z|)`` and
+    ``rho = sqrt(-2 ln(1 - u))``; the log-Jacobian is
+    ``log sin(tilt) - log ln(a_max / a)``.
+    """
+    a = np.maximum(a, _TINY)
+    sin2 = np.sin(tilt) ** 2
+    abs_cos = np.maximum(np.abs(np.cos(tilt)), _TINY)
+    log_max_over_a = np.log(a_max / a)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # ln(a / |chi_z|) = -ln|cos tilt|, accurately near tilt = 0, pi
+        log_ratio = np.where(
+            sin2 < 0.5, -0.5 * np.log1p(-sin2), -np.log(abs_cos)
+        )
+        total = log_max_over_a + log_ratio  # ln(a_max / |chi_z|)
+        u = log_ratio / total
+        # 1 - u = ln(a_max / a) / ln(a_max / |chi_z|), directly where u ~ 1
+        log_one_minus_u = np.where(
+            u < 0.5, np.log1p(-u), np.log(log_max_over_a / total)
+        )
+        rho = np.sqrt(np.maximum(-2.0 * log_one_minus_u, 0.0))
+        log_j = 0.5 * np.log(sin2) - np.log(log_max_over_a)
+    return rho, log_j
+
+
+def _in_plane_inverse(chi_z, rho, a_max):
+    """Inverse of :func:`_in_plane_forward` at fixed ``chi_z``: ``(a, tilt,
+    log_j)``, with ``log_j`` the forward log-Jacobian."""
+    abs_z = np.maximum(np.abs(chi_z), _TINY)
+    total = np.log(a_max / abs_z)  # ln(a_max / |chi_z|)
+    half_rho2 = 0.5 * rho**2
+    log_max_over_a = np.exp(-half_rho2) * total  # (1 - u) ln(a_max / |chi_z|)
+    log_a_over_z = -np.expm1(-half_rho2) * total  # u ln(a_max / |chi_z|)
+    a = a_max * np.exp(-log_max_over_a)
+    # a^2 - chi_z^2, accurately where a ~ |chi_z|
+    in_plane2 = abs_z * np.expm1(log_a_over_z) * (a + abs_z)
+    tilt = np.arctan2(np.sqrt(in_plane2), chi_z)
+    with np.errstate(divide="ignore"):
+        log_j = 0.5 * np.log(in_plane2) - np.log(a) - np.log(log_max_over_a)
+    return a, tilt, log_j
+
+
+class PrecessingSpinReparameterisation(Reparameterisation):
+    r"""Precessing spins ``(a_1, tilt_1, a_2, tilt_2, phi_12, phi_jl) ->
+    (chi_eff_prime, chi_diff_prime, s1_x, s1_y, s2_x, s2_y)``.
+
+    For the usual prior on precessing spins, magnitudes uniform in
+    ``[0, a_max]`` and isotropic directions (``tilt_i`` sine-distributed,
+    ``phi_12`` and ``phi_jl`` uniform in ``[0, 2 pi)``), the six new
+    coordinates are a standard normal under the prior (to the ~0.01 of the
+    tabulated effective-spin map).
+
+    * The spin components along the orbital angular momentum, ``chi_iz = a_i
+      cos(tilt_i)``, are distributed as bilby's ``AlignedSpin``; they become
+      ``chi_eff_prime``, ``chi_diff_prime`` exactly as in
+      :class:`EffectiveSpinReparameterisation` (tabulated), so the
+      well-measured effective spin is still a single axis.
+    * Given ``chi_iz``, the in-plane magnitude has the prior CDF
+      :math:`u_i = \ln(a_i / |\chi_{iz}|) / \ln(a_\mathrm{max} / |\chi_{iz}|)`;
+      the Box-Muller radius :math:`\rho_i = \sqrt{-2 \ln(1 - u_i)}` with an
+      azimuth makes a 2D standard normal,
+      ``(s_x, s_y) = rho (cos phi, sin phi)``. The azimuth is ``phi_jl`` for
+      the first spin and ``phi_12`` for the second. ``rho`` is proportional to
+      the in-plane spin near zero, so the chart is smooth there and the
+      angles need no periodic boundaries.
+
+    The log-Jacobian is that of the effective spins plus
+    :math:`\sum_i [\log \sin \mathrm{tilt}_i - \log \ln(a_{\mathrm{max}, i} /
+    a_i)]`.
+
+    The coordinates are invariant under the sky rotations of the triangular
+    detector group. Under its plane reflection ``phi_jl -> phi_jl + pi``,
+    i.e. ``(s1_x, s1_y) -> -(s1_x, s1_y)`` (see
+    :class:`~nessai_gw.group_mixture.TriangularDetectorGroupAction`).
+
+    Parameters
+    ----------
+    parameters : list of str
+        ``[a_1, tilt_1, a_2, tilt_2, phi_12, phi_jl]`` (the default), in this
+        order.
+    prior_bounds : dict
+        Their prior bounds; the magnitudes' must be ``[0, a_max]``.
+    mass_ratio : str, optional
+        Name of the mass ratio ``m_2 / m_1 <= 1`` (default ``"mass_ratio"``),
+        read from x-space on the inverse.
+    min_mass_ratio : float, optional
+        As for :class:`EffectiveSpinReparameterisation`.
+    """
+
+    one_to_one = False
+
+    def __init__(
+        self,
+        parameters=None,
+        prior_bounds=None,
+        mass_ratio="mass_ratio",
+        min_mass_ratio=1e-6,
+        rng=None,
+        **kwargs,
+    ):
+        from .._effective_spin_table import TabulatedEffectiveSpinTransform
+
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        if parameters is None and "input_parameters" in kwargs:
+            parameters = kwargs.pop("input_parameters")
+        if parameters is None:
+            parameters = ["a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"]
+        call = {"parameters": parameters, "prior_bounds": prior_bounds}
+        if "rng" in parent_params:
+            call["rng"] = rng
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
+
+        if len(self.parameters) != 6:
+            raise RuntimeError(
+                "PrecessingSpinReparameterisation needs [a_1, tilt_1, a_2, "
+                f"tilt_2, phi_12, phi_jl]; got {self.parameters}"
+            )
+        self.a_max = []
+        for name in self.parameters[0:4:2]:
+            lower, upper = self.prior_bounds[name]
+            if lower != 0 or upper <= 0:
+                raise RuntimeError(
+                    f"{name} prior bounds {(lower, upper)} are not [0, a_max]"
+                )
+            self.a_max.append(float(upper))
+        for name, bounds in zip(
+            self.parameters[1:],
+            [(0, np.pi), None, (0, np.pi), (0, 2 * np.pi), (0, 2 * np.pi)],
+        ):
+            if bounds is not None and not np.allclose(
+                self.prior_bounds[name], bounds
+            ):
+                logger.warning(
+                    "%s prior bounds %s are not %s, which the "
+                    "precessing-spin prior assumes",
+                    name, tuple(self.prior_bounds[name]), bounds,
+                )
+        self._transform = TabulatedEffectiveSpinTransform(*self.a_max)
+        self._mass_ratio = mass_ratio
+        self.min_mass_ratio = float(min_mass_ratio)
+        self.requires = [mass_ratio]
+
+        self.prime_parameters = [
+            "chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x", "s2_y",
+        ]
+        if hasattr(self, "output_parameters"):
+            self.output_parameters = list(self.prime_parameters)
+        if hasattr(self, "inverse_input_parameters"):
+            self.inverse_input_parameters = list(
+                dict.fromkeys(
+                    list(self.inverse_input_parameters or []) + [mass_ratio]
+                )
+            )
+
+    def _spins(self):
+        """``(magnitude, tilt, azimuth, (x, y) prime names, a_max)`` per spin."""
+        a_1, tilt_1, a_2, tilt_2, phi_12, phi_jl = self.parameters
+        return (
+            (a_1, tilt_1, phi_jl, ("s1_x", "s1_y"), self.a_max[0]),
+            (a_2, tilt_2, phi_12, ("s2_x", "s2_y"), self.a_max[1]),
+        )
+
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        (a_1, tilt_1, *_), (a_2, tilt_2, *_) = self._spins()
+        chi_1z = x[a_1] * np.cos(x[tilt_1])
+        chi_2z = x[a_2] * np.cos(x[tilt_2])
+        u, w, lj = self._transform.forward(chi_1z, chi_2z, x[self._mass_ratio])
+        x_prime["chi_eff_prime"] = u
+        x_prime["chi_diff_prime"] = w
+        for a, tilt, phi, (sx, sy), a_max in self._spins():
+            rho, lj_i = _in_plane_forward(x[a], x[tilt], a_max)
+            x_prime[sx] = rho * np.cos(x[phi])
+            x_prime[sy] = rho * np.sin(x[phi])
+            lj = lj + lj_i
+        return x, x_prime, log_j + lj
+
+    def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
+        u = x_prime["chi_eff_prime"]
+        w = x_prime["chi_diff_prime"]
+        q = x[self._mass_ratio]
+        n = len(q)
+        in_plane = [
+            np.stack([x_prime[sx], x_prime[sy]])
+            for *_, (sx, sy), _ in self._spins()
+        ]
+        valid = (
+            np.isfinite(u) & np.isfinite(w) & np.isfinite(q)
+            & (q >= self.min_mass_ratio)
+            & np.all(np.isfinite(np.concatenate(in_plane)), axis=0)
+        )
+        out = {name: np.full(n, np.nan) for name in self.parameters}
+        lj = np.full(n, np.nan)
+        if valid.any():
+            with np.errstate(divide="ignore", invalid="ignore"):
+                chi_1z, chi_2z, lj_v = self._transform.inverse(
+                    u[valid], w[valid], q[valid]
+                )
+                for (a, tilt, phi, _, a_max), z, (sx, sy) in zip(
+                    self._spins(), (chi_1z, chi_2z), in_plane
+                ):
+                    sx, sy = sx[valid], sy[valid]
+                    a_v, tilt_v, lj_i = _in_plane_inverse(
+                        z, np.hypot(sx, sy), a_max
+                    )
+                    out[a][valid] = a_v
+                    out[tilt][valid] = tilt_v
+                    out[phi][valid] = np.remainder(
+                        np.arctan2(sy, sx), 2 * np.pi
+                    )
+                    lj_v = lj_v + lj_i
+            lj[valid] = lj_v
+            # as EffectiveSpinReparameterisation: a non-finite log-Jacobian
+            # (beyond the tables' resolution, or on the prior's edge) is out
+            # of bounds
+            bad = ~np.isfinite(lj)
+            for name in self.parameters:
+                out[name][bad] = np.nan
+        for name in self.parameters:
+            x[name] = out[name]
         return x, x_prime, log_j - lj
