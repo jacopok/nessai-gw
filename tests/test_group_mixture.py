@@ -151,9 +151,9 @@ def test_metadata_phase_reflection(phase_action):
 @pytest.mark.parametrize(
     "kwargs, expected",
     [
-        ({}, [4, 2]),
-        ({"phase_reflection": True}, [4, 2, 2]),
-        ({"polarisation_quarter": True}, [4, 2, 4]),
+        ({}, [8]),
+        ({"phase_reflection": True}, [8, 2]),
+        ({"polarisation_quarter": True}, [8, 4]),
     ],
 )
 def test_mode_factor_sizes(kwargs, expected):
@@ -172,9 +172,11 @@ def test_mode_factor_sizes(kwargs, expected):
     # The little-endian mixed-radix decode of the factor sizes must agree
     # with the action's own mode decode.
     modes = torch.arange(action.group_size)
+    # The first factor is the joint (k, reflected) sky part.
     k, refl, pf = action.decode_modes(modes)
-    assert torch.equal(modes % sizes[0], k.long())
-    assert torch.equal(torch.div(modes, sizes[0], rounding_mode="floor") % sizes[1], refl.long())
+    assert torch.equal(modes % sizes[0], k.long() + 4 * refl.long())
+    if len(sizes) > 1:
+        assert torch.equal(torch.div(modes, sizes[0], rounding_mode="floor") % sizes[1], pf.long())
 
 
 @pytest.mark.parametrize("phase_reflection", [False, True])

@@ -560,19 +560,30 @@ class TriangularDetectorGroupAction:
 
     @property
     def mode_factor_sizes(self):
-        """Sizes of the commuting cyclic factors, little-endian in the mode
-        index (``k = modes % 4``, ``reflected = modes // 4 % 2``,
-        ``phase_step = modes // 8``): ``[4, 2]`` for the 8-element group,
-        ``[4, 2, 2]`` with ``phase_reflection``, ``[4, 2, 4]`` with
-        ``polarisation_quarter``.  Passed to the group-mixture wrapper so it
-        estimates the per-factor weight marginals independently (robust to
-        transient mode collapse) rather than the flat 8/16/32 joint counts.
+        """Sizes of the independently estimated factors, little-endian in the
+        mode index: the sky part ``modes % 8`` (``k = modes % 4`` and
+        ``reflected = modes // 4 % 2`` together) and ``phase_step =
+        modes // 8``: ``[8]`` for the 8-element group, ``[8, 2]`` with
+        ``phase_reflection``, ``[8, 4]`` with ``polarisation_quarter``.
+        Passed to the group-mixture wrapper so it estimates the per-factor
+        weight marginals independently (robust to transient mode collapse)
+        rather than the flat 16/32 joint counts.
+
+        ``k`` and the reflection are one factor because the sky modes do not
+        depopulate as a product: once the sky ring starts to empty, the
+        surviving modes pair a rotation with a reflection (ET-Delta v59 at
+        it 160k kept only (k=0, reflected) and (k=2, not reflected)), and
+        the product of their marginals put half the weight on empty modes.
+        The phase step stays independent of both.  On the live points of
+        ET-Delta v59, v63 and v66 the joint sky factor brought the
+        factorisation error back to the Poisson floor, at a cost of 2-4% in
+        acceptance factor where the factors are independent.
         """
         if self.polarisation_quarter:
-            return [4, 2, 4]
+            return [8, 4]
         if self.phase_reflection:
-            return [4, 2, 2]
-        return [4, 2]
+            return [8, 2]
+        return [8]
 
     def __call__(self, point_dict: dict, modes, inverse: bool = False) -> dict:
         """Apply the group element ``modes`` (or its inverse) to each point."""
