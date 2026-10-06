@@ -342,8 +342,14 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         )
         for j in range(k):
             n_j = float(counts[j])
-            if n_j <= 0 or self.is_frozen(j):
-                # never rebuild a flow from the few points of a dying mode
+            keeps_warm = getattr(self, "keeps_warm", None)
+            if (
+                n_j <= 0
+                or self.is_frozen(j)
+                or (keeps_warm is not None and keeps_warm(j))
+            ):
+                # never rebuild a flow from the few points of a dying mode:
+                # a small expert (``warm_max_share``) is only warm-started
                 continue
             if ref[j] <= 0:
                 ref[j] = n_j
