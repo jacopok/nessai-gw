@@ -1619,7 +1619,7 @@ class PhaseQuarterRecanonicaliser(torch.nn.Module):
             if abs(off - 0.25) > self.recentre_tol:
                 self._cbar.fill_(float(np.mod(centre - 0.25, 0.5)))
                 changed = True
-        logger.info(
+        (logger.info if was != self.enabled else logger.debug)(
             "Phase-quarter recanon: spread(phase mod pi/2)/spread(delta_phase)"
             " = %.3f/%.3f = %.3f (on < %.2f, off > %.2f), n=%d, %s%s",
             sp_phase, sp_delta, ratio, self.on_ratio, self.off_ratio,
@@ -1937,7 +1937,7 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
             after[1] != before[1]
             or any(abs(a - b) > 1e-12 for a, b in zip(after[0], before[0]))
         )
-        logger.info(
+        logger.debug(
             "Adaptive domain: %s-folded (phase/delta spread ratio %.3f), seams "
             "sky_u %.4f psi %.4f delta %.4f phase %.4f; density at old seams "
             "sky %.2f psi %.2f delta %.2f phase %.2f (x uniform), n=%d%s",
@@ -1945,7 +1945,33 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
             du, dpsi, ddel, dphi, canon.shape[0],
             " [changed]" if changed else "",
         )
+        self._retrain_note = _seam_note(
+            [("sky_u", cu, du), ("psi", cpsi, dpsi),
+             ("delta", cdel, ddel), ("phase", cphi, dphi)],
+            changed, prefix="phase-folded; " if new_phase else "",
+        )
+        if switched:
+            logger.info(
+                "Adaptive domain: switched to the %s fold (phase/delta spread "
+                "ratio %.3f)", "phase" if new_phase else "delta", ratio,
+            )
         return changed
+
+
+def _seam_note(seams, changed, prefix=""):
+    """The adaptive domain's part of the retrain summary (see
+    :meth:`nessai.flowmodel.group_mixture.GroupFlowProposalMixin._log_retrain_summary`):
+    each seam it moved this round (``(name, position, density)``, with a
+    NaN density for a seam it does not adapt) and the density at its old
+    position, relative to uniform."""
+    parts = [
+        f"{name} seam {pos:.3f} (density {dens:.2f})"
+        for name, pos, dens in seams
+        if np.isfinite(dens)
+    ]
+    if not parts:
+        return None
+    return prefix + ", ".join(parts) + (" [moved]" if changed else "")
 
 
 def _lerp_cdf(x, edges, cdf):

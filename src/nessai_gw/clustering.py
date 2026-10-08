@@ -415,6 +415,7 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         docstring)."""
         if self.n_experts < 2:
             return 1
+        self._retrain_note = None
         self._cluster_round_count = (
             getattr(self, "_cluster_round_count", 0) + 1
         )
@@ -455,7 +456,12 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         frac = float(self._split_labels(c, v).mean())
         self._split_gain.fill_(cur_gain)
         normal = self._split_normal.cpu().numpy()
-        logger.info(
+        # the summary's header gives k, i.e. whether the split is on
+        self._retrain_note = (
+            f"diagonal split gain {cur_gain:.2f} nat/pt, clump side "
+            f"{frac:.2f}"
+        )
+        logger.debug(
             "Diagonal split (cos theta_jn, sky_v): gain %.3f nat/pt "
             "(on %.2f / off %.2f), clump-side fraction %.3f, line "
             "%.3f*cos + %.3f*sky_v > %.3f, %s",

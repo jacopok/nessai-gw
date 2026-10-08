@@ -77,6 +77,7 @@ from .group_mixture import (
     SkyOctantProbit,
     _make_group_proposal_class,
     _prime_parameter_names,
+    _seam_note,
     _select_flow_model_factory,
     _wrap_angle,
     detector_tensors,
@@ -620,12 +621,16 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
         changed = any(
             abs(a - b) > 1e-12 for a, b in zip(self._state()[0], before[0])
         )
-        logger.info(
+        logger.debug(
             "Adaptive network domain: seams sky_u %.4f psi %.4f delta %.4f; "
             "density at old seams sky %.2f psi %.2f delta %.2f (x uniform), "
             "n=%d%s",
             cu, cpsi, cdel, du, dpsi, ddel, canon.shape[0],
             " [changed]" if changed else "",
+        )
+        self._retrain_note = _seam_note(
+            [("sky_u", cu, du), ("psi", cpsi, dpsi), ("delta", cdel, ddel)],
+            changed,
         )
         return changed
 
