@@ -2007,6 +2007,8 @@ def triangular_group_reparameterisations(
     chirp_distance_fiducial=None,
     effective_spin=False,
     log_mass_ratio=True,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2064,6 +2066,21 @@ def triangular_group_reparameterisations(
       unset): ``ln q`` rescaled to its bounds, as Roulet et al. sample it, with
       the ``mass_ratio`` edge detection / boundary inversion (the ``q = 1``
       edge) done in log space.
+    * ``lambda_1``, ``lambda_2`` -> ``effective-tidal-deformability`` (only if
+      ``effective_tidal_deformability`` is set; replaces the per-star ``logit`` above):
+      ``lambda_tilde_prime`` (a monotonic function of the binary
+      deformability at fixed ``q``) and ``lambda_diff_prime`` (the position
+      along the line of constant binary deformability), both ``N(0, 1)``
+      under uniform priors; see
+      :class:`~nessai_gw.reparameterisations.EffectiveTidalDeformabilityReparameterisation`.
+      ``mass_ratio`` is a prerequisite.
+    * ``chirp_mass`` -> ``doppler-chirp-mass`` (only if ``doppler_vector`` is
+      given): the chirp mass in a frame comoving with the Earth,
+      ``chirp_mass * (1 - n . v / c)``, rescaled to its bounds, for runs whose
+      detector response follows the Earth's orbit (the sampled masses are then
+      barycentric, and their posterior a thin ridge along the sky); see
+      :class:`~nessai_gw.reparameterisations.DopplerChirpMassReparameterisation`.
+      ``ra`` / ``dec`` are prerequisites.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
@@ -2136,6 +2153,17 @@ def triangular_group_reparameterisations(
         Sample ``mass_ratio`` as ``ln q`` (``log-mass-ratio``) rather than
         ``q`` (``mass_ratio``).  The prime name stays ``mass_ratio_prime``.
         Default ``True``.
+    effective_tidal_deformability : bool, optional
+        Reparameterise ``lambda_1``, ``lambda_2`` jointly as
+        ``(lambda_tilde_prime, lambda_diff_prime)`` (``effective-tidal-deformability``)
+        instead of one ``logit`` coordinate each.  Needs ``mass_ratio``; does
+        nothing without both deformabilities.  Default ``False``.
+    doppler_vector : array_like, optional
+        The Earth's barycentric velocity over ``c`` (3 components, in the axes
+        of ``ra`` / ``dec``) at the coalescence time.  When given, sample the
+        Doppler-corrected chirp mass (``doppler-chirp-mass``).  Only for runs
+        whose detector response includes the orbital motion.  Default
+        ``None``.
 
     Returns
     -------
@@ -2169,6 +2197,23 @@ def triangular_group_reparameterisations(
             "effective_spin needs 'mass_ratio' in the sampling parameters "
             "(chi_eff = (chi_1 + q chi_2) / (1 + q)); pass "
             "effective_spin=False."
+        )
+    effective_tidal_deformability = bool(effective_tidal_deformability) and {
+        "lambda_1", "lambda_2"
+    } <= set(sampling_parameters)
+    if effective_tidal_deformability and "mass_ratio" not in sampling_parameters:
+        raise ValueError(
+            "effective_tidal_deformability needs 'mass_ratio' in the sampling "
+            "parameters (lambda_tilde depends on q); pass "
+            "effective_tidal_deformability=False."
+        )
+    doppler_chirp_mass = doppler_vector is not None and (
+        "chirp_mass" in sampling_parameters
+    )
+    if doppler_chirp_mass and not {"ra", "dec"} <= set(sampling_parameters):
+        raise ValueError(
+            "doppler_vector needs 'ra' and 'dec' in the sampling parameters "
+            "(the Doppler factor depends on the sky position)."
         )
     if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
         raise ValueError(
@@ -2206,6 +2251,12 @@ def triangular_group_reparameterisations(
         # Reads mass_ratio (default-added, hence after every explicit entry)
         # on its inverse.
         _rank["chi_1"] = -1
+    if effective_tidal_deformability:
+        # Reads mass_ratio on its inverse, as the effective spin.
+        _rank["lambda_1"] = -1
+    # ``doppler-chirp-mass`` reads ra / dec (default-added sky) on its
+    # inverse, and ``chirp-distance`` (rank -1) reads chirp_mass: the default
+    # rank puts it between the two.
     ordered_names = sorted(
         sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
@@ -2235,6 +2286,20 @@ def triangular_group_reparameterisations(
             reps[name] = {"reparameterisation": "aligned-spin"}
         elif name == "mass_ratio" and log_mass_ratio:
             reps[name] = {"reparameterisation": "log-mass-ratio"}
+        elif name == "lambda_1" and effective_tidal_deformability:
+            reps[name] = {
+                "reparameterisation": "effective-tidal-deformability",
+                "parameters": ["lambda_1", "lambda_2"],
+            }
+        elif name == "lambda_2" and effective_tidal_deformability:
+            continue  # covered by the joint ``effective-tidal-deformability`` entry
+        elif name == "chirp_mass" and doppler_chirp_mass:
+            reps[name] = {
+                "reparameterisation": "doppler-chirp-mass",
+                "doppler_vector": [
+                    float(v) for v in np.asarray(doppler_vector, dtype=float)
+                ],
+            }
         elif name in ("lambda_1", "lambda_2"):
             reps[name] = {
                 "reparameterisation": "logit",
@@ -2339,6 +2404,8 @@ def _prime_parameter_names(
     chirp_distance_fiducial=None,
     effective_spin=False,
     log_mass_ratio=True,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2400,6 +2467,8 @@ def _prime_parameter_names(
                 chirp_distance_fiducial=chirp_distance_fiducial,
                 effective_spin=effective_spin,
                 log_mass_ratio=log_mass_ratio,
+                effective_tidal_deformability=effective_tidal_deformability,
+                doppler_vector=doppler_vector,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -2468,6 +2537,13 @@ def _prime_parameter_names(
         } <= set(names):
             out.append(
                 "chi_eff_prime" if name == "chi_1" else "chi_diff_prime"
+            )
+        elif name in ("lambda_1", "lambda_2") and effective_tidal_deformability and {
+            "lambda_1", "lambda_2", "mass_ratio"
+        } <= set(names):
+            out.append(
+                "lambda_tilde_prime" if name == "lambda_1"
+                else "lambda_diff_prime"
             )
         else:
             out.append(f"{name}_prime")
@@ -2756,6 +2832,8 @@ def make_triangular_group_flow_proposal(
     chirp_distance_fiducial=None,
     effective_spin=False,
     log_mass_ratio=True,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -2965,6 +3043,12 @@ def make_triangular_group_flow_proposal(
     log_mass_ratio : bool, optional
         Must match :func:`triangular_group_reparameterisations` (only the
         probe's prime order depends on it).  Default ``True``.
+    effective_tidal_deformability, doppler_vector : optional
+        Must match :func:`triangular_group_reparameterisations`: the flow sees
+        ``lambda_tilde_prime`` / ``lambda_diff_prime`` in place of
+        ``lambda_1_prime`` / ``lambda_2_prime`` (the Doppler-corrected chirp
+        mass keeps the name ``chirp_mass_prime``).  Both are invariant under
+        the group.  Defaults ``False`` / ``None``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -3063,6 +3147,8 @@ def make_triangular_group_flow_proposal(
             chirp_distance_fiducial=chirp_distance_fiducial,
             effective_spin=effective_spin,
             log_mass_ratio=log_mass_ratio,
+            effective_tidal_deformability=effective_tidal_deformability,
+            doppler_vector=doppler_vector,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3323,6 +3409,8 @@ def make_et_group_flow_proposal(
     chirp_distance_fiducial=None,
     effective_spin=False,
     log_mass_ratio=True,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3362,6 +3450,8 @@ def make_et_group_flow_proposal(
         chirp_distance_fiducial=chirp_distance_fiducial,
         effective_spin=effective_spin,
         log_mass_ratio=log_mass_ratio,
+        effective_tidal_deformability=effective_tidal_deformability,
+        doppler_vector=doppler_vector,
         phase_recanon=phase_recanon,
         adaptive_domain=adaptive_domain,
     )

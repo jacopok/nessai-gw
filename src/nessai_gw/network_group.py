@@ -653,6 +653,8 @@ def network_group_reparameterisations(
     chirp_distance=True,
     effective_spin=True,
     log_mass_ratio=True,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -688,6 +690,15 @@ def network_group_reparameterisations(
     log_mass_ratio : bool, optional
         Sample ``mass_ratio`` as ``ln q`` (``log-mass-ratio``).  Must match
         :func:`make_network_group_flow_proposal`.  Default ``True``.
+    effective_tidal_deformability : bool, optional
+        Carry ``lambda_1``, ``lambda_2`` as ``(lambda_tilde_prime,
+        lambda_diff_prime)`` (needs ``mass_ratio``).  Must match
+        :func:`make_network_group_flow_proposal`.  Default ``False``.
+    doppler_vector : array_like, optional
+        The Earth's barycentric velocity over ``c`` at the coalescence time:
+        sample the Doppler-corrected chirp mass (runs with the orbital motion
+        only).  Must match :func:`make_network_group_flow_proposal`.  Default
+        ``None``.
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
@@ -696,6 +707,8 @@ def network_group_reparameterisations(
         phase_coordinates="polarisation-phase",
         effective_spin=effective_spin,
         log_mass_ratio=log_mass_ratio,
+        effective_tidal_deformability=effective_tidal_deformability,
+        doppler_vector=doppler_vector,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
@@ -721,6 +734,8 @@ def make_network_group_flow_proposal(
     chirp_distance=True,
     effective_spin=True,
     log_mass_ratio=True,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
     baseline_flip=False,
     sky_u_offset=0.0,
 ):
@@ -769,6 +784,8 @@ def make_network_group_flow_proposal(
     log_mass_ratio : bool, optional
         Whether ``mass_ratio`` is sampled as ``ln q``; must match
         :func:`network_group_reparameterisations`.  Default ``True``.
+    effective_tidal_deformability, doppler_vector : optional
+        Must match :func:`network_group_reparameterisations`.
     baseline_flip : bool, optional
         Also fold the half-turn about the baseline with the inclination
         flipped (the delay-preserving image of the antipodal degeneracy; see
@@ -808,6 +825,8 @@ def make_network_group_flow_proposal(
         names, geometry.reference_time, vertex=geometry.timing_vertex,
         sky_2d=True, psi_single=True, effective_spin=effective_spin,
         log_mass_ratio=log_mass_ratio,
+        effective_tidal_deformability=effective_tidal_deformability,
+        doppler_vector=doppler_vector,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),
