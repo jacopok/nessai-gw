@@ -830,6 +830,7 @@ def make_network_group_flow_proposal(
     circular_psi_phase=False,
     circular_sky_u=False,
     time_reference_frequency=None,
+    time_to_merger=None,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -937,6 +938,7 @@ def make_network_group_flow_proposal(
         effective_tidal_deformability=effective_tidal_deformability,
         doppler_vector=doppler_vector,
         time_reference_frequency=time_reference_frequency,
+        time_to_merger=time_to_merger,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),

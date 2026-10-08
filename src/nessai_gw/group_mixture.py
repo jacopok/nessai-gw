@@ -2624,6 +2624,7 @@ def _prime_parameter_names(
     effective_tidal_deformability=False,
     doppler_vector=None,
     time_reference_frequency=None,
+    time_to_merger=None,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2688,6 +2689,7 @@ def _prime_parameter_names(
                 effective_tidal_deformability=effective_tidal_deformability,
                 doppler_vector=doppler_vector,
                 time_reference_frequency=time_reference_frequency,
+                time_to_merger=time_to_merger,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -3066,6 +3068,7 @@ def make_triangular_group_flow_proposal(
     doppler_vector=None,
     circular_psi_phase=False,
     time_reference_frequency=None,
+    time_to_merger=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -3395,6 +3398,7 @@ def make_triangular_group_flow_proposal(
             effective_tidal_deformability=effective_tidal_deformability,
             doppler_vector=doppler_vector,
             time_reference_frequency=time_reference_frequency,
+            time_to_merger=time_to_merger,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3693,6 +3697,7 @@ def make_et_group_flow_proposal(
     doppler_vector=None,
     circular_psi_phase=False,
     time_reference_frequency=None,
+    time_to_merger=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3738,4 +3743,5 @@ def make_et_group_flow_proposal(
         adaptive_domain=adaptive_domain,
         circular_psi_phase=circular_psi_phase,
         time_reference_frequency=time_reference_frequency,
+        time_to_merger=time_to_merger,
     )
