@@ -1309,14 +1309,19 @@ class SkyOctantProbit:
     ``u_scale`` / ``v_scale`` (default ``4`` / ``2``, the triangular fold) are
     the reciprocal widths of the sub-square; a sky that no group folds (e.g.
     the baseline-aligned sky of :mod:`nessai_gw.network_group`) uses ``1`` /
-    ``1``, the probit of the whole unit square.
+    ``1``, the probit of the whole unit square.  ``u_scale=None`` leaves
+    ``sky_u`` alone (it is then an angle of a
+    :class:`CircularCanonicalTransform`) and probits ``sky_v`` only.
     """
 
     def __init__(self, param_names=None, u_scale=4.0, v_scale=2.0):
         self._iu = self._iv = None
-        self.u_scale = float(u_scale)
+        self.u_scale = None if u_scale is None else float(u_scale)
         self.v_scale = float(v_scale)
-        self._log_scale = float(np.log(self.u_scale * self.v_scale))
+        self._log_scale = float(
+            np.log((1.0 if self.u_scale is None else self.u_scale)
+                   * self.v_scale)
+        )
         if param_names is not None:
             self.bind(param_names)
 
@@ -1333,6 +1338,15 @@ class SkyOctantProbit:
     def forward(self, canon):
         """``canon -> (t, log|det dt/dcanon|)`` (sky block probit-mapped)."""
         iu, iv = self._iu, self._iv
+        if self.u_scale is None:
+            v = torch.clamp(
+                self.v_scale * canon[:, iv], _SKY_PROBIT_EPS,
+                1.0 - _SKY_PROBIT_EPS,
+            )
+            b = torch.special.ndtri(v)
+            t = canon.clone()
+            t[:, iv] = b
+            return t, self._log_scale - _log_std_normal_pdf(b)
         u = torch.clamp(
             self.u_scale * canon[:, iu], _SKY_PROBIT_EPS, 1.0 - _SKY_PROBIT_EPS
         )
@@ -1354,6 +1368,11 @@ class SkyOctantProbit:
     def inverse(self, t):
         """``t -> (canon, log|det dcanon/dt|)``."""
         iu, iv = self._iu, self._iv
+        if self.u_scale is None:
+            b = t[:, iv]
+            canon = t.clone()
+            canon[:, iv] = torch.special.ndtr(b) / self.v_scale
+            return canon, -self._log_scale + _log_std_normal_pdf(b)
         a, b = t[:, iu], t[:, iv]
         canon = t.clone()
         canon[:, iu] = torch.special.ndtr(a) / self.u_scale
@@ -1364,6 +1383,108 @@ class SkyOctantProbit:
             + _log_std_normal_pdf(b)
         )
         return canon, log_j
+
+
+def _wrap_angle(t):
+    """Wrap to ``[-pi, pi)``, also when rounding hits ``pi``."""
+    y = torch.remainder(t + np.pi, _TWO_PI)
+    return torch.where(y >= _TWO_PI, y - _TWO_PI, y) - np.pi
+
+
+class CircularCanonicalTransform:
+    """Periodic canonical coordinates as angles for a circular base flow.
+
+    ``canonical_transform`` for
+    :class:`nessai.flowmodel.group_mixture.DiscreteGroupMixtureFlowWrapper`,
+    to be used with its ``circular_parameters`` and a circular base flow
+    (:class:`nessai.flows.circular.CircularNeuralSplineFlow`).  Each
+    coordinate ``c`` in ``circles`` maps to the angle
+
+        t = 2 pi (c - start) / length - pi   (mod 2 pi, in [-pi, pi))
+
+    so that ``[start, start + length)`` -- in the network and triangular
+    groups the fundamental-domain interval of ``psi_prime`` or
+    ``delta_phase``, whose ends the polarisation/phase quarter turn glues --
+    goes once round the circle, and the base flow sees no seam.  The inverse
+    returns the representative in ``[start, start + length)`` wrapped into
+    the coordinate's range.  Any other coordinate goes through ``inner`` (e.g.
+    :class:`SkyOctantProbit` for the sky), which must leave the circular ones
+    untouched.
+
+    Parameters
+    ----------
+    circles : dict
+        ``{name: (start, length, (low, high))}`` in prime units: the interval
+        that wraps once round the circle and the coordinate's full range.
+    param_names : list of str, optional
+        The prime-parameter names (re-bind with :meth:`bind`).
+    inner : canonical transform, optional
+        Applied to the remaining coordinates.
+    """
+
+    def __init__(self, circles, param_names=None, inner=None):
+        self.circles = {
+            str(n): (float(a), float(b), (float(r[0]), float(r[1])))
+            for n, (a, b, r) in circles.items()
+        }
+        self.inner = inner
+        self._idx = None
+        self._log_scale = float(
+            sum(np.log(_TWO_PI / b) for _, b, _ in self.circles.values())
+        )
+        if param_names is not None:
+            self.bind(param_names)
+
+    @property
+    def circular_parameters(self):
+        """Names of the coordinates mapped to angles."""
+        return list(self.circles)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        missing = [n for n in self.circles if n not in names]
+        if missing:
+            raise RuntimeError(
+                f"CircularCanonicalTransform needs {missing} in the prime "
+                f"parameters; got {names}."
+            )
+        self._idx = {n: names.index(n) for n in self.circles}
+        if self.inner is not None and hasattr(self.inner, "bind"):
+            self.inner.bind(names)
+
+    def forward(self, canon):
+        """``canon -> (t, log|det dt/dcanon|)``."""
+        if self.inner is None:
+            t, log_j = canon.clone(), canon.new_zeros(canon.shape[0])
+        else:
+            t, log_j = self.inner.forward(canon)
+            t = t.clone()
+        for name, (start, length, _) in self.circles.items():
+            i = self._idx[name]
+            t[:, i] = _wrap_angle(
+                _TWO_PI * (canon[:, i] - start) / length - np.pi
+            )
+        return t, log_j + self._log_scale
+
+    def inverse(self, t):
+        """``t -> (canon, log|det dcanon/dt|)``."""
+        if self.inner is None:
+            canon, log_j = t.clone(), t.new_zeros(t.shape[0])
+        else:
+            canon, log_j = self.inner.inverse(t)
+            canon = canon.clone()
+        for name, (start, length, (low, high)) in self.circles.items():
+            i = self._idx[name]
+            c = start + (_wrap_angle(t[:, i]) + np.pi) * (length / _TWO_PI)
+            c = low + torch.remainder(c - low, high - low)
+            canon[:, i] = torch.where(c >= high, c - (high - low), c)
+        return canon, log_j - self._log_scale
+
+
+#: ``circles`` entry of the ``psi_prime`` / ``delta_phase`` coordinates in a
+#: fundamental domain folded by the polarisation/phase quarter turn (and the
+#: (2, 2) reflection) with zero offsets: ``[-1, 0)`` of the range ``[-1, 1)``.
+POLARISATION_PHASE_CIRCLE = (-1.0, 1.0, (-1.0, 1.0))
 
 
 class PhaseQuarterRecanonicaliser(torch.nn.Module):
@@ -1565,9 +1686,18 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     move_factor = 2.0
     min_points = 50
 
-    def __init__(self, action, param_names=None, allow_phase_mode=False):
+    def __init__(self, action, param_names=None, allow_phase_mode=False,
+                 circular_psi_phase=False):
         super().__init__()
         self._action = action
+        #: ``psi_prime`` / ``delta_phase`` are angles of a circular base flow
+        #: (:class:`CircularCanonicalTransform`), which needs no seams there:
+        #: keep them at zero and only move the sky seam.
+        self.circular_psi_phase = bool(circular_psi_phase)
+        if self.circular_psi_phase and allow_phase_mode:
+            raise ValueError(
+                "circular_psi_phase cannot be combined with allow_phase_mode"
+            )
         self.allow_phase_mode = bool(allow_phase_mode)
         # (c_u, c_psi, c_delta, c_phase) in prime units
         self.register_buffer("_seams", torch.zeros(4, dtype=torch.float64))
@@ -1780,7 +1910,10 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
                 new_phase = False
         switched = new_phase != phase
 
-        if new_phase:
+        if getattr(self, "circular_psi_phase", False):
+            cpsi = cdel = cphi = 0.0
+            dpsi = ddel = dphi = float("nan")
+        elif new_phase:
             cphi, dphi, _ = self._choose_seam(
                 phi_n, 0.5, cphi, force=switched or not was_seen
             )
@@ -2777,6 +2910,17 @@ def _make_group_proposal_class(
                 else:
                     model.param_names = prime
 
+        def update_flow_config(self):
+            """Also build the flow model in nessai's actual prime order (its
+            ``param_names``), which the configuration keeps for every
+            rebuild (reset, resume): a circular base flow fixes which of
+            its inputs are angles when it is built, so it cannot be
+            realigned afterwards like the rest of the model."""
+            super().update_flow_config()
+            prime = list(getattr(self, "prime_parameters", []) or [])
+            if action is not None and prime:
+                self.flow_config["param_names"] = prime
+
         def initialise(self, *args, **kwargs):
             super().initialise(*args, **kwargs)
             self._realign_prime_space_action()
@@ -2834,6 +2978,7 @@ def make_triangular_group_flow_proposal(
     log_mass_ratio=True,
     effective_tidal_deformability=False,
     doppler_vector=None,
+    circular_psi_phase=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -3021,6 +3166,15 @@ def make_triangular_group_flow_proposal(
         no ``polarisation_ellipse`` and no boundary reflection.  Default
         ``False``.  With ``adaptive_domain`` this instead allows the
         ``"phase"`` family of :class:`AdaptiveFundamentalDomain`.
+    circular_psi_phase : bool, optional
+        Carry ``psi_prime`` and ``delta_phase`` as angles of a circular base
+        flow (:class:`CircularCanonicalTransform`): the quarter turn and the
+        (2, 2) reflection fold them to a torus, which the base flow models
+        without seams.  Needs a circular flow (``flow_config['ftype'] =
+        'circular'``), ``psi_single``, ``polarisation_quarter``,
+        ``phase_reflection``, the ``polarisation-phase`` coordinates and
+        ``polarisation_offset = 0``; incompatible with ``phase_recanon``.
+        With ``adaptive_domain`` only the sky seam moves.  Default ``False``.
     adaptive_domain : bool, optional
         Give every group-mixture expert an :class:`AdaptiveFundamentalDomain`
         ``base_reparam``: each expert moves the sky, ``psi`` and
@@ -3225,11 +3379,44 @@ def make_triangular_group_flow_proposal(
                 gm_kwargs["base_reparam_factory"] = _functools.partial(
                     AdaptiveFundamentalDomain, action, list(prime_names),
                     allow_phase_mode=bool(phase_recanon),
+                    circular_psi_phase=bool(circular_psi_phase),
                 )
             else:
                 gm_kwargs["base_reparam_factory"] = _functools.partial(
                     PhaseQuarterRecanonicaliser, list(prime_names)
                 )
+        if circular_psi_phase:
+            bad = []
+            if not psi_single:
+                bad.append("psi_single=False")
+            if not polarisation_quarter:
+                bad.append("polarisation_quarter=False")
+            if not phase_reflection:
+                bad.append("phase_reflection=False")
+            if phase_coordinates != "polarisation-phase":
+                bad.append(f"phase_coordinates={phase_coordinates!r}")
+            if polarisation_offset:
+                bad.append("polarisation_offset != 0")
+            if phase_recanon:
+                bad.append("phase_recanon")
+            if bad:
+                raise RuntimeError(
+                    f"circular_psi_phase is incompatible with {', '.join(bad)}."
+                )
+            if "circular_parameters" not in _gm_params:
+                raise RuntimeError(
+                    "circular_psi_phase requires a version of nessai whose "
+                    "make_group_mixture_flow accepts `circular_parameters`."
+                )
+            circles = {
+                "psi_prime": POLARISATION_PHASE_CIRCLE,
+                action._delta_phase: POLARISATION_PHASE_CIRCLE,
+            }
+            gm_kwargs["canonical_transform"] = CircularCanonicalTransform(
+                circles, prime_names,
+                inner=gm_kwargs.get("canonical_transform"),
+            )
+            gm_kwargs["circular_parameters"] = list(circles)
         flow_model_cls = _make_flow_model(
             group_action_fn=action,  # ignored on the prime-space path
             group_size=base_action.group_size,
@@ -3240,9 +3427,10 @@ def make_triangular_group_flow_proposal(
             **gm_kwargs,
         )
     else:
-        if phase_recanon or adaptive_domain:
+        if phase_recanon or adaptive_domain or circular_psi_phase:
             raise RuntimeError(
-                "phase_recanon/adaptive_domain needs the prime-space path."
+                "phase_recanon/adaptive_domain/circular_psi_phase needs the "
+                "prime-space path."
             )
         action = None
         import inspect as _inspect
@@ -3411,6 +3599,7 @@ def make_et_group_flow_proposal(
     log_mass_ratio=True,
     effective_tidal_deformability=False,
     doppler_vector=None,
+    circular_psi_phase=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3454,4 +3643,5 @@ def make_et_group_flow_proposal(
         doppler_vector=doppler_vector,
         phase_recanon=phase_recanon,
         adaptive_domain=adaptive_domain,
+        circular_psi_phase=circular_psi_phase,
     )

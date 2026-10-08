@@ -12,6 +12,7 @@ from nessai_gw.group_mixture import (
 )
 from nessai_gw.network_group import (
     AdaptiveNetworkDomain,
+    BaselineFlipSymmetry,
     DetectorNetworkGeometry,
     PolarisationPhaseGroupAction,
     PrimeSpacePolarisationPhaseAction,
@@ -680,9 +681,10 @@ def _stub_model(names, bounds):
 
 
 @requires_group_mixture
+@pytest.mark.parametrize("circular", [False, True])
 @pytest.mark.parametrize("baseline_flip", [False, True])
 def test_network_proposal_initialise_train_and_draw(
-    geometry, tmp_path, baseline_flip
+    geometry, tmp_path, baseline_flip, circular
 ):
     """End to end: the proposal binds to nessai's real prime order, trains a
     (tiny) group-mixture flow on prior draws and proposes in-bounds points."""
@@ -696,9 +698,15 @@ def test_network_proposal_initialise_train_and_draw(
     }
     model = _stub_model(PARAMETERS, {k: np.asarray(v) for k, v in bounds.items()})
     model.set_rng(np.random.default_rng(0))
-    cls = make_network_group_flow_proposal(
-        PARAMETERS, geometry, baseline_flip=baseline_flip
+    circular_kwargs = (
+        {"circular_psi_phase": True, "circular_sky_u": True} if circular else {}
     )
+    cls = make_network_group_flow_proposal(
+        PARAMETERS, geometry, baseline_flip=baseline_flip, **circular_kwargs
+    )
+    flow_config = {"n_blocks": 1, "n_neurons": 8, "n_layers": 1}
+    if circular:
+        flow_config.update(ftype="circular", n_blocks=2)
     proposal = cls(
         model,
         output=str(tmp_path),
@@ -706,7 +714,7 @@ def test_network_proposal_initialise_train_and_draw(
         reparameterisations=network_group_reparameterisations(
             PARAMETERS, geometry
         ),
-        flow_config={"n_blocks": 1, "n_neurons": 8, "n_layers": 1},
+        flow_config=flow_config,
         training_config={"max_epochs": 3, "patience": 3},
     )
     proposal.initialise()
@@ -752,4 +760,61 @@ def test_network_proposal_initialise_train_and_draw(
     x = proposal.samples
     assert len(x) > 0
     assert np.all(np.isfinite(model.log_prior(x)))
-    assert proposal.flow.model.group_size == (8 if baseline_flip else 4)
+    flow = proposal.flow.model
+    assert flow.group_size == (8 if baseline_flip else 4)
+    if circular:
+        assert sorted(prime[i] for i in flow.circular_features) == sorted(
+            ["psi_prime", "delta_phase", "sky_u"]
+        )
+        assert sorted(flow.base_flow.circular_features) == sorted(
+            prime.index(n) for n in ("psi_prime", "delta_phase", "sky_u")
+        )
+        assert flow.base_reparam is None
+        assert (flow.base_symmetry is not None) == baseline_flip
+        with torch.no_grad():
+            xs, log_q = flow.sample_and_log_prob(500)
+            np.testing.assert_allclose(
+                log_q, flow.log_prob(xs), rtol=1e-5, atol=1e-5
+            )
+        # resume: the flow rebuilt from its configuration takes the weights
+        import pickle
+
+        resumed = pickle.loads(pickle.dumps(proposal))
+        resumed.resume(
+            model, dict(proposal.flow_config), proposal.flow.weights_file
+        )
+        resumed.flow.model.eval()
+        with torch.no_grad():
+            np.testing.assert_allclose(
+                resumed.flow.model.log_prob(xs), flow.log_prob(xs),
+                rtol=1e-5, atol=1e-5,
+            )
+
+
+@requires_group_mixture
+def test_network_proposal_circular_options(geometry):
+    from nessai_gw.group_mixture import CircularCanonicalTransform
+
+    fm = make_network_group_flow_proposal(
+        PARAMETERS, geometry, circular_psi_phase=True
+    )._FlowModelClass
+    assert fm.circular_parameters == ["psi_prime", "delta_phase"]
+    assert isinstance(fm.canonical_transform, CircularCanonicalTransform)
+    # only the (translation) sky_u seam is left for the adaptive domain
+    assert fm.base_reparam_factory().circular_psi_phase
+    fm = make_network_group_flow_proposal(
+        PARAMETERS, geometry, circular_psi_phase=True, circular_sky_u=True,
+        baseline_flip=True, sky_u_offset=0.2,
+    )._FlowModelClass
+    assert fm.circular_parameters == ["psi_prime", "delta_phase", "sky_u"]
+    assert fm.canonical_transform.circles["sky_u"][0] == 0.2
+    assert fm.base_reparam_factory is None
+    assert isinstance(fm.base_symmetry, BaselineFlipSymmetry)
+    with pytest.raises(ValueError, match="circular_psi_phase"):
+        make_network_group_flow_proposal(
+            PARAMETERS, geometry, circular_sky_u=True
+        )
+    with pytest.raises(ValueError, match="psi_offset"):
+        make_network_group_flow_proposal(
+            PARAMETERS, geometry, circular_psi_phase=True, psi_offset=0.3
+        )

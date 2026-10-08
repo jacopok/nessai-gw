@@ -71,11 +71,14 @@ from ._geometry import greenwich_mean_sidereal_time
 from .group_mixture import (
     _DELTA_PHASE_SCALE,
     _MIN_CANON_STD,
+    POLARISATION_PHASE_CIRCLE,
     AdaptiveFundamentalDomain,
+    CircularCanonicalTransform,
     SkyOctantProbit,
     _make_group_proposal_class,
     _prime_parameter_names,
     _select_flow_model_factory,
+    _wrap_angle,
     detector_tensors,
     triangular_group_reparameterisations,
 )
@@ -513,8 +516,14 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
     still applies after it.
     """
 
-    def __init__(self, action, param_names=None):
-        super().__init__(action, param_names, allow_phase_mode=False)
+    def __init__(self, action, param_names=None, circular_psi_phase=False,
+                 circular_sky_u=False):
+        super().__init__(
+            action, param_names, allow_phase_mode=False,
+            circular_psi_phase=circular_psi_phase,
+        )
+        #: ``sky_u`` is an angle of a circular base flow: keep its seam.
+        self.circular_sky_u = bool(circular_sky_u)
 
     @property
     def _u_period(self):
@@ -588,18 +597,21 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
             return False
         before = self._state()
         (cu, cpsi, cdel, _), _ = before
-        du = float("nan")
-        if self._iu is not None:
+        du = dpsi = ddel = float("nan")
+        if self._iu is not None and not getattr(self, "circular_sky_u", False):
             p = self._u_period
             u = canon[:, self._iu].double().cpu().numpy()
             cu, du, _ = self._choose_seam(u / p, 1.0, cu / p)
             cu = cu * p
-        z, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
-        psi = (z[:, self._ipsi] + 1).double().cpu().numpy()
-        cpsi, dpsi, _ = self._choose_seam(psi, 1.0, cpsi)
-        z, _ = self._map_to(canon, (cu, cpsi, 0.0, 0.0), False)
-        dl = (z[:, self._idp] + 1).double().cpu().numpy()
-        cdel, ddel, _ = self._choose_seam(dl, 1.0, cdel)
+        if getattr(self, "circular_psi_phase", False):
+            cpsi = cdel = 0.0
+        else:
+            z, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
+            psi = (z[:, self._ipsi] + 1).double().cpu().numpy()
+            cpsi, dpsi, _ = self._choose_seam(psi, 1.0, cpsi)
+            z, _ = self._map_to(canon, (cu, cpsi, 0.0, 0.0), False)
+            dl = (z[:, self._idp] + 1).double().cpu().numpy()
+            cdel, ddel, _ = self._choose_seam(dl, 1.0, cdel)
 
         self._seams.copy_(
             torch.tensor([cu, cpsi, cdel, 0.0], dtype=torch.float64)
@@ -616,6 +628,64 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
             " [changed]" if changed else "",
         )
         return changed
+
+
+class BaselineFlipSymmetry:
+    """The baseline half-turn ``h`` in the circular base frame (a
+    ``base_symmetry``).
+
+    With ``baseline_flip`` the group folds ``h`` (see
+    :class:`PrimeSpacePolarisationPhaseAction`) onto half the ``sky_u``
+    circle, gluing its two ends with a twist (``theta_jn_prime -> -theta_jn_prime``,
+    ``psi -> -psi``), which a product of circles cannot represent.  The base
+    flow instead models the whole ``sky_u`` circle (a
+    :class:`~nessai_gw.group_mixture.CircularCanonicalTransform` with
+    ``sky_u`` of length 1), the canonical points fill its first half, and the
+    base density is summed over ``h``, which keeps the folded density
+    continuous across the twisted seam.  In the angles of that frame ``h`` is
+
+        t_u -> t_u + pi,   theta_jn_prime -> -theta_jn_prime,
+        t_psi -> -t_psi,   t_delta unchanged
+
+    (``psi -> pi - psi`` is ``psi_prime -> -psi_prime`` mod 2, and
+    ``delta_phase = phase + sign(cos theta_jn) psi`` is invariant).  Unit
+    Jacobian; an involution.  Needs ``psi_prime`` / ``delta_phase`` on the
+    zero-offset polarisation/phase torus and ``sky_u`` starting the circle at
+    the fundamental domain's ``sky_u_offset``.
+    """
+
+    def __init__(self, param_names=None):
+        self._idx = None
+        if param_names is not None:
+            self.bind(param_names)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        need = ("sky_u", "theta_jn_prime", "psi_prime")
+        missing = [n for n in need if n not in names]
+        if missing:
+            raise RuntimeError(
+                f"BaselineFlipSymmetry needs {missing} in the prime "
+                f"parameters; got {names}."
+            )
+        self._idx = tuple(names.index(n) for n in need)
+
+    def _h(self, t):
+        iu, ith, ipsi = self._idx
+        out = t.clone()
+        out[:, iu] = _wrap_angle(t[:, iu] + np.pi)
+        out[:, ith] = -t[:, ith]
+        out[:, ipsi] = _wrap_angle(-t[:, ipsi])
+        return out
+
+    def images(self, t):
+        """The non-identity image of each row."""
+        return [self._h(t)]
+
+    def fold(self, t):
+        """Map each row onto the canonical half circle, ``t_u in [-pi, 0)``."""
+        second = (t[:, self._idx[0]] >= 0)[:, None]
+        return torch.where(second, self._h(t), t)
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +808,8 @@ def make_network_group_flow_proposal(
     doppler_vector=None,
     baseline_flip=False,
     sky_u_offset=0.0,
+    circular_psi_phase=False,
+    circular_sky_u=False,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -794,6 +866,19 @@ def make_network_group_flow_proposal(
     sky_u_offset : float, optional
         Fixed ``sky_u`` seam of the base fundamental domain with
         ``baseline_flip`` (the adaptive domain moves it per expert).
+    circular_psi_phase : bool, optional
+        Carry ``psi_prime`` and ``delta_phase`` as angles of a circular base
+        flow (:class:`~nessai_gw.group_mixture.CircularCanonicalTransform`):
+        the quarter turn folds them to a torus, which the base flow models
+        without seams, so the adaptive domain leaves their seams alone.
+        Needs a circular flow (``flow_config['ftype'] = 'circular'``) and zero
+        ``psi_offset`` / ``delta_offset``.  Default ``False``.
+    circular_sky_u : bool, optional
+        Also carry the baseline azimuth ``sky_u`` as an angle (the posterior
+        ring about the baseline then has no cut); ``sky_v`` alone is
+        probit-mapped.  With ``baseline_flip`` the base flow models the whole
+        ``sky_u`` circle summed over the half-turn (:class:`BaselineFlipSymmetry`).
+        Needs ``circular_psi_phase``.  Default ``False``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -844,25 +929,69 @@ def make_network_group_flow_proposal(
     else:
         physical = PolarisationPhaseGroupAction(psi_offset, delta_offset)
 
+    if circular_sky_u and not circular_psi_phase:
+        raise ValueError("circular_sky_u needs circular_psi_phase.")
+    if circular_sky_u and "sky_u" not in prime_names:
+        raise RuntimeError(
+            "circular_sky_u needs the sky (ra, dec) in the sampling parameters."
+        )
+    if circular_psi_phase and (psi_offset or delta_offset):
+        raise ValueError(
+            "circular_psi_phase needs psi_offset = delta_offset = 0 (the "
+            "circular base flow has no seams to move)."
+        )
+
     gm_params = inspect.signature(make_group_mixture_flow).parameters
     gm_kwargs = {"mode_factor_sizes": action.mode_factor_sizes}
+    canonical = None
     if gaussianise_sky and "sky_u" in prime_names:
+        canonical = SkyOctantProbit(
+            prime_names,
+            u_scale=None if circular_sky_u else 1.0 / action.sky_u_period,
+            v_scale=1.0,
+        )
+    circles = {}
+    if circular_psi_phase:
+        circles["psi_prime"] = POLARISATION_PHASE_CIRCLE
+        circles[action._delta] = POLARISATION_PHASE_CIRCLE
+    if circular_sky_u:
+        # the whole circle, starting at the fundamental domain's seam
+        start = float(sky_u_offset) if baseline_flip else 0.0
+        circles["sky_u"] = (start, 1.0, (0.0, 1.0))
+    if circles:
+        if "circular_parameters" not in gm_params:
+            raise RuntimeError(
+                "circular_psi_phase requires a version of nessai whose "
+                "make_group_mixture_flow accepts `circular_parameters`."
+            )
+        canonical = CircularCanonicalTransform(
+            circles, prime_names, inner=canonical
+        )
+        gm_kwargs["circular_parameters"] = list(circles)
+        if circular_sky_u and baseline_flip:
+            gm_kwargs["base_symmetry"] = BaselineFlipSymmetry(prime_names)
+    if canonical is not None:
         if "canonical_transform" not in gm_params:
             raise RuntimeError(
                 "gaussianise_sky requires a version of nessai whose "
                 "make_group_mixture_flow accepts `canonical_transform`."
             )
-        gm_kwargs["canonical_transform"] = SkyOctantProbit(
-            prime_names, u_scale=1.0 / action.sky_u_period, v_scale=1.0
-        )
-    if adaptive_domain:
+        gm_kwargs["canonical_transform"] = canonical
+    # with circular angles the adaptive domain only has the sky_u seam left
+    # to move, and none if sky_u is circular too
+    moves_seams = not circular_psi_phase or (
+        "sky_u" in prime_names and not circular_sky_u
+    )
+    if adaptive_domain and moves_seams:
         if "base_reparam_factory" not in gm_params:
             raise RuntimeError(
                 "adaptive_domain requires a version of nessai whose "
                 "make_group_mixture_flow accepts `base_reparam_factory`."
             )
         gm_kwargs["base_reparam_factory"] = functools.partial(
-            AdaptiveNetworkDomain, action, list(prime_names)
+            AdaptiveNetworkDomain, action, list(prime_names),
+            circular_psi_phase=bool(circular_psi_phase),
+            circular_sky_u=bool(circular_sky_u),
         )
 
     flow_model_cls = make_flow(
