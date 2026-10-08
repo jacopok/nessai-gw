@@ -2168,6 +2168,8 @@ def triangular_group_reparameterisations(
     log_mass_ratio=True,
     effective_tidal_deformability=False,
     doppler_vector=None,
+    time_reference_frequency=None,
+    time_frequency_range=(8.0, 300.0),
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2323,6 +2325,17 @@ def triangular_group_reparameterisations(
         Doppler-corrected chirp mass (``doppler-chirp-mass``).  Only for runs
         whose detector response includes the orbital motion.  Default
         ``None``.
+    time_reference_frequency : float or "adaptive", optional
+        Measure the ``t_det`` coordinate at the moment the 22 mode passes this
+        frequency (Hz) instead of at merger, which takes out its degeneracy
+        with the masses and spins (Tissino et al. 2026, Eq. 18); ``"adaptive"``
+        picks the frequency of least spread over the training points before
+        every training.  The 2PN time to merger uses the chirp mass in the
+        Earth's frame when ``doppler_vector`` is given, so ``t_det`` stays
+        invariant under the group.  Needs ``chirp_mass`` and ``mass_ratio``
+        (and reads ``chi_1`` / ``chi_2`` if sampled).  Default ``None`` (merger).
+    time_frequency_range : tuple of float, optional
+        Search range (Hz) for ``time_reference_frequency="adaptive"``.
 
     Returns
     -------
@@ -2416,6 +2429,17 @@ def triangular_group_reparameterisations(
     # ``doppler-chirp-mass`` reads ra / dec (default-added sky) on its
     # inverse, and ``chirp-distance`` (rank -1) reads chirp_mass: the default
     # rank puts it between the two.
+    if time_reference_frequency is not None:
+        missing = {"chirp_mass", "mass_ratio"} - set(sampling_parameters)
+        if missing or "geocent_time" not in sampling_parameters:
+            raise ValueError(
+                "time_reference_frequency needs 'geocent_time', 'chirp_mass' "
+                f"and 'mass_ratio' in the sampling parameters; missing "
+                f"{sorted(missing | ({'geocent_time'} - set(sampling_parameters)))}"
+            )
+        # The time at a frequency reads the chirp mass, mass ratio and spins
+        # (effective-spin is rank -1) on its inverse: rank it ahead of them.
+        _rank["geocent_time"] = -2
     ordered_names = sorted(
         sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
@@ -2495,6 +2519,22 @@ def triangular_group_reparameterisations(
                 "reference_time": float(reference_time),
                 "scale": _GEOCENT_SCALE,
             }
+            if time_reference_frequency is not None:
+                reps[name]["reference_frequency"] = (
+                    "adaptive" if time_reference_frequency == "adaptive"
+                    else float(time_reference_frequency)
+                )
+                reps[name]["frequency_range"] = [
+                    float(f) for f in time_frequency_range
+                ]
+                reps[name]["spins"] = (
+                    ["chi_1", "chi_2"]
+                    if {"chi_1", "chi_2"} <= set(sampling_parameters) else None
+                )
+                if doppler_chirp_mass:
+                    reps[name]["doppler_vector"] = [
+                        float(v) for v in np.asarray(doppler_vector, dtype=float)
+                    ]
         elif name == "phase":
             if phase_coordinates == "arg-alpha-beta":
                 # arg_alpha = (phase - psi), arg_beta = (phase + psi): both
@@ -2565,6 +2605,7 @@ def _prime_parameter_names(
     log_mass_ratio=True,
     effective_tidal_deformability=False,
     doppler_vector=None,
+    time_reference_frequency=None,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2628,6 +2669,7 @@ def _prime_parameter_names(
                 log_mass_ratio=log_mass_ratio,
                 effective_tidal_deformability=effective_tidal_deformability,
                 doppler_vector=doppler_vector,
+                time_reference_frequency=time_reference_frequency,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -3005,6 +3047,7 @@ def make_triangular_group_flow_proposal(
     effective_tidal_deformability=False,
     doppler_vector=None,
     circular_psi_phase=False,
+    time_reference_frequency=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -3229,6 +3272,10 @@ def make_triangular_group_flow_proposal(
         ``lambda_1_prime`` / ``lambda_2_prime`` (the Doppler-corrected chirp
         mass keeps the name ``chirp_mass_prime``).  Both are invariant under
         the group.  Defaults ``False`` / ``None``.
+    time_reference_frequency : optional
+        As in :func:`triangular_group_reparameterisations` (the prime names do
+        not depend on it; the probe checks the order of the inverse pass with
+        it).  Default ``None``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -3329,6 +3376,7 @@ def make_triangular_group_flow_proposal(
             log_mass_ratio=log_mass_ratio,
             effective_tidal_deformability=effective_tidal_deformability,
             doppler_vector=doppler_vector,
+            time_reference_frequency=time_reference_frequency,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3626,6 +3674,7 @@ def make_et_group_flow_proposal(
     effective_tidal_deformability=False,
     doppler_vector=None,
     circular_psi_phase=False,
+    time_reference_frequency=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3670,4 +3719,5 @@ def make_et_group_flow_proposal(
         phase_recanon=phase_recanon,
         adaptive_domain=adaptive_domain,
         circular_psi_phase=circular_psi_phase,
+        time_reference_frequency=time_reference_frequency,
     )

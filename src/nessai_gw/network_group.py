@@ -730,6 +730,7 @@ def network_group_reparameterisations(
     log_mass_ratio=True,
     effective_tidal_deformability=False,
     doppler_vector=None,
+    time_reference_frequency=None,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -774,6 +775,12 @@ def network_group_reparameterisations(
         sample the Doppler-corrected chirp mass (runs with the orbital motion
         only).  Must match :func:`make_network_group_flow_proposal`.  Default
         ``None``.
+    time_reference_frequency : float or "adaptive", optional
+        Measure the arrival time at the barycentre when the 22 mode passes
+        this frequency instead of at merger (``"adaptive"``: the frequency of
+        least spread over the training points, chosen before every training);
+        see :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``None``.
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
@@ -784,6 +791,7 @@ def network_group_reparameterisations(
         log_mass_ratio=log_mass_ratio,
         effective_tidal_deformability=effective_tidal_deformability,
         doppler_vector=doppler_vector,
+        time_reference_frequency=time_reference_frequency,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
@@ -815,6 +823,7 @@ def make_network_group_flow_proposal(
     sky_u_offset=0.0,
     circular_psi_phase=False,
     circular_sky_u=False,
+    time_reference_frequency=None,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -884,6 +893,10 @@ def make_network_group_flow_proposal(
         probit-mapped.  With ``baseline_flip`` the base flow models the whole
         ``sky_u`` circle summed over the half-turn (:class:`BaselineFlipSymmetry`).
         Needs ``circular_psi_phase``.  Default ``False``.
+    time_reference_frequency : optional
+        Must match :func:`network_group_reparameterisations` (the prime names
+        do not depend on it; the probe checks the order of the inverse pass
+        with it).  Default ``None``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -917,6 +930,7 @@ def make_network_group_flow_proposal(
         log_mass_ratio=log_mass_ratio,
         effective_tidal_deformability=effective_tidal_deformability,
         doppler_vector=doppler_vector,
+        time_reference_frequency=time_reference_frequency,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),
