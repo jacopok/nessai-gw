@@ -315,6 +315,202 @@ def test_prime_action_missing_coordinate():
 
 
 # ---------------------------------------------------------------------------
+# baseline half-turn
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def flip_action():
+    return PrimeSpacePolarisationPhaseAction(PRIME, baseline_flip=True)
+
+
+def _compose(a, b):
+    """Mode index of ``g^ka h^fa . g^kb h^fb`` (abelian ``Z4 x Z2``)."""
+    return (a % 4 + b % 4) % 4 + 4 * ((a // 4 + b // 4) % 2)
+
+
+def _assert_same_point(a, b, atol=1e-12):
+    for n in PRIME:
+        d = a[n] - b[n]
+        if n in ("psi_prime", "delta_phase"):
+            d = torch.remainder(d + 1, 2.0) - 1
+        elif n == "sky_u":
+            d = torch.remainder(d + 0.5, 1.0) - 0.5
+        assert torch.allclose(d, torch.zeros_like(d), atol=atol), n
+
+
+def test_flip_action_sizes(flip_action):
+    assert flip_action.group_size == 8
+    assert flip_action.mode_factor_sizes == (4, 2)
+    assert flip_action.sky_u_period == 0.5
+    plain = PrimeSpacePolarisationPhaseAction(PRIME)
+    assert plain.group_size == 4 and plain.mode_factor_sizes == (4,)
+    with pytest.raises(RuntimeError, match="sky_u"):
+        PrimeSpacePolarisationPhaseAction(
+            [n for n in PRIME if n != "sky_u"], baseline_flip=True
+        )
+
+
+def test_flip_generator(flip_action):
+    """h: sky_u + 1/2, theta_jn -> pi - theta_jn, psi -> -psi,
+    phase -> phase + pi; delta_phase, sky_v, t_det kept."""
+    p = _prime_points(300)
+    out = flip_action(p, torch.full((300,), 4))
+    psi, phase, _ = _prime_to_physical(p)
+    psi_o, phase_o, _ = _prime_to_physical(out)
+    np.testing.assert_allclose(
+        np.mod(out["sky_u"].numpy() - p["sky_u"].numpy(), 1.0), 0.5, atol=1e-12
+    )
+    assert torch.equal(out["theta_jn_prime"], -p["theta_jn_prime"])
+    np.testing.assert_allclose(
+        np.angle(np.exp(2j * (psi_o + psi))), 0.0, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        np.angle(np.exp(1j * (phase_o - phase - np.pi))), 0.0, atol=1e-12
+    )
+    d = torch.remainder(out["delta_phase"] - p["delta_phase"] + 1, 2.0) - 1
+    assert torch.allclose(d, torch.zeros_like(d), atol=1e-12)
+    for n in ("sky_v", "t_det"):
+        assert torch.equal(out[n], p[n])
+
+
+def test_flip_group_law(flip_action):
+    """Modes compose as Z4 x Z2, and inverse=True undoes each element."""
+    p = _prime_points(200)
+    n = 200
+    for a in range(8):
+        pa = flip_action(p, torch.full((n,), a))
+        _assert_same_point(
+            flip_action(pa, torch.full((n,), a), inverse=True), p
+        )
+        for b in range(8):
+            ab = flip_action(pa, torch.full((n,), b))
+            _assert_same_point(
+                ab, flip_action(p, torch.full((n,), _compose(a, b)))
+            )
+
+
+@pytest.mark.parametrize("offsets", [(0.0, 0.0, 0.0), (0.7, 2.1, 0.33)])
+def test_flip_fundamental_domain_partitions_orbits(offsets):
+    act = PrimeSpacePolarisationPhaseAction(
+        PRIME, *offsets[:2], baseline_flip=True, sky_u_offset=offsets[2]
+    )
+    p = _prime_points(400)
+    hits = sum(
+        act.in_fundamental_domain(act(p, torch.full((400,), k))).long()
+        for k in range(8)
+    )
+    assert torch.all(hits == 1)
+
+
+def _prime_sky_to_radec(geometry, u, v):
+    R = geometry.sky_frame_rotation
+    z = 1.0 - 2.0 * v
+    rho = np.sqrt(1.0 - z * z)
+    w = np.column_stack([rho * np.cos(2 * np.pi * u),
+                         rho * np.sin(2 * np.pi * u), z]) @ R
+    return np.mod(np.arctan2(w[:, 1], w[:, 0]), 2 * np.pi), np.arcsin(w[:, 2])
+
+
+def test_flip_is_the_antipode_on_the_great_circle(geometry, flip_action):
+    """At alpha = 90 deg (sky_v = 1/2) h is the antipodal map, which leaves
+    every detector's (2, 2) response unchanged up to the phase shift the
+    quarter-turn group absorbs: |R_k| and the inter-site ratio are kept."""
+    from nessai_gw._effective_distance import response_R
+
+    n = 300
+    p = _prime_points(n, seed=8)
+    p["sky_v"] = torch.full((n,), 0.5, dtype=torch.float64)
+    out = flip_action(p, torch.full((n,), 4))
+
+    def physical(q):
+        ra, dec = _prime_sky_to_radec(
+            geometry, q["sky_u"].numpy(), q["sky_v"].numpy()
+        )
+        psi, phase, _ = _prime_to_physical(q)
+        theta = (q["theta_jn_prime"].numpy() + 1) * np.pi / 2
+        return ra, dec, psi, phase, theta
+
+    ra0, dec0, psi0, phase0, th0 = physical(p)
+    ra1, dec1, psi1, phase1, th1 = physical(out)
+    np.testing.assert_allclose(
+        _earth_fixed(ra1, dec1, 0.0), -_earth_fixed(ra0, dec0, 0.0), atol=1e-9
+    )
+    r0 = response_R(geometry.tensors, ra0, dec0, psi0, th0, geometry.gmst)
+    r1 = response_R(geometry.tensors, ra1, dec1, psi1, th1, geometry.gmst)
+    # the (2, 2) strain is Re(R e^{-2i phase} ...): compare R e^{-2i phase}
+    h0 = r0 * np.exp(-2j * phase0)[:, None]
+    h1 = r1 * np.exp(-2j * phase1)[:, None]
+    np.testing.assert_allclose(np.abs(h1), np.abs(h0), atol=1e-9)
+    # up to complex conjugation of the whole network (time reversal of the
+    # carrier, absorbed by the inclination flip): one common factor
+    ratio = np.where(
+        np.abs(h0 - h1).max(axis=1, keepdims=True) < 1e-9, h1, np.conj(h1)
+    ) / h0
+    np.testing.assert_allclose(ratio, 1.0, atol=1e-8)
+
+
+def test_flip_keeps_both_arrival_times(geometry, flip_action):
+    """Anywhere on the sky h keeps n . b, and the sites lie on the baseline
+    through the barycentre, so both arrival times are unchanged at fixed
+    t_det."""
+    n = 300
+    p = _prime_points(n, seed=9)
+    out = flip_action(p, torch.full((n,), 4))
+    ra0, dec0 = _prime_sky_to_radec(geometry, p["sky_u"].numpy(), p["sky_v"].numpy())
+    ra1, dec1 = _prime_sky_to_radec(
+        geometry, out["sky_u"].numpy(), out["sky_v"].numpy()
+    )
+    g, bar = geometry.gmst, geometry.timing_vertex
+    for site in (IT, DE):
+        d0 = geocenter_time_delay(site, g, ra0, dec0) - geocenter_time_delay(
+            bar, g, ra0, dec0
+        )
+        d1 = geocenter_time_delay(site, g, ra1, dec1) - geocenter_time_delay(
+            bar, g, ra1, dec1
+        )
+        np.testing.assert_allclose(d1, d0, atol=1e-15)
+
+
+def test_flip_adaptive_domain_moves_the_sky_seam(flip_action):
+    # two modes half a turn apart, centred on the base seams sky_u = 0, 1/2
+    n = 2000
+    rng = np.random.default_rng(10)
+    p = _prime_points(n, 10)
+    mode = rng.integers(0, 2, n)
+    p["sky_u"] = torch.as_tensor(
+        np.mod(0.5 * mode + 0.02 * rng.normal(size=n), 1.0)
+    )
+    p["theta_jn_prime"] = torch.as_tensor(
+        np.where(mode == 0, 1, -1) * np.abs(0.5 + 0.05 * rng.normal(size=n))
+    )
+    z = torch.stack([p[k] for k in PRIME], 1)
+    canon = z.clone()
+    for k in range(8):
+        d = flip_action({m: z[:, i] for i, m in enumerate(PRIME)},
+                        torch.full((n,), k))
+        m = flip_action.in_fundamental_domain(d)
+        canon[m] = torch.stack([d[q] for q in PRIME], 1)[m]
+    iu, ith = PRIME.index("sky_u"), PRIME.index("theta_jn_prime")
+    # D0's seams cut both modes
+    assert 0.2 < float((canon[:, ith] > 0).float().mean()) < 0.8
+    dom = AdaptiveNetworkDomain(flip_action, PRIME)
+    assert dom.update(canon)
+    y = dom.forward(canon)
+    assert bool(dom._box_valid(y, False).all())
+    # the moved seam folds both modes onto one, with one inclination sign
+    assert float((y[:, ith] > 0).float().mean()) in (0.0, 1.0)
+    u = y[:, iu]
+    assert float(u.max()) < 0.5
+    assert float(((u < 0.025) | (u > 0.475)).float().mean()) < 0.01
+    assert torch.allclose(dom.inverse(y), canon, atol=1e-10)
+    # through the half-width probit and back
+    tr = SkyOctantProbit(PRIME, u_scale=2.0, v_scale=1.0)
+    t, lj = tr.forward(y)
+    back, lj_inv = tr.inverse(t)
+    assert torch.allclose(back, y, atol=1e-9)
+    assert torch.allclose(lj, -lj_inv)
+
+
+# ---------------------------------------------------------------------------
 # adaptive seams + sky probit
 # ---------------------------------------------------------------------------
 def _canonical(act, n, psi0, delta0, u0, seed=5):
@@ -454,6 +650,12 @@ def test_make_network_group_flow_proposal_class(geometry):
     fm = cls._FlowModelClass
     assert fm.group_size == 4
     assert fm.mode_factor_sizes == [4]
+    fm8 = make_network_group_flow_proposal(
+        PARAMETERS, geometry, baseline_flip=True
+    )._FlowModelClass
+    assert fm8.group_size == 8
+    assert list(fm8.mode_factor_sizes) == [4, 2]
+    assert fm8.canonical_transform.u_scale == 2.0
     with pytest.raises(RuntimeError, match="psi"):
         make_network_group_flow_proposal(
             [p for p in PARAMETERS if p != "psi"], geometry
@@ -478,7 +680,10 @@ def _stub_model(names, bounds):
 
 
 @requires_group_mixture
-def test_network_proposal_initialise_train_and_draw(geometry, tmp_path):
+@pytest.mark.parametrize("baseline_flip", [False, True])
+def test_network_proposal_initialise_train_and_draw(
+    geometry, tmp_path, baseline_flip
+):
     """End to end: the proposal binds to nessai's real prime order, trains a
     (tiny) group-mixture flow on prior draws and proposes in-bounds points."""
     bounds = {
@@ -491,7 +696,9 @@ def test_network_proposal_initialise_train_and_draw(geometry, tmp_path):
     }
     model = _stub_model(PARAMETERS, {k: np.asarray(v) for k, v in bounds.items()})
     model.set_rng(np.random.default_rng(0))
-    cls = make_network_group_flow_proposal(PARAMETERS, geometry)
+    cls = make_network_group_flow_proposal(
+        PARAMETERS, geometry, baseline_flip=baseline_flip
+    )
     proposal = cls(
         model,
         output=str(tmp_path),
@@ -545,3 +752,4 @@ def test_network_proposal_initialise_train_and_draw(geometry, tmp_path):
     x = proposal.samples
     assert len(x) > 0
     assert np.all(np.isfinite(model.log_prior(x)))
+    assert proposal.flow.model.group_size == (8 if baseline_flip else 4)
