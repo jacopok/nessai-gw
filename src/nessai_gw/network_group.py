@@ -731,6 +731,7 @@ def network_group_reparameterisations(
     effective_tidal_deformability=False,
     doppler_vector=None,
     time_reference_frequency=None,
+    time_to_merger=None,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -781,6 +782,10 @@ def network_group_reparameterisations(
         least spread over the training points, chosen before every training);
         see :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
         Default ``None``.
+    time_to_merger : str, optional
+        The waveform's time to merger, ``"module:function"``, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``None`` (2PN).
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
@@ -792,6 +797,7 @@ def network_group_reparameterisations(
         effective_tidal_deformability=effective_tidal_deformability,
         doppler_vector=doppler_vector,
         time_reference_frequency=time_reference_frequency,
+        time_to_merger=time_to_merger,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,

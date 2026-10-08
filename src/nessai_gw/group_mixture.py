@@ -2170,6 +2170,7 @@ def triangular_group_reparameterisations(
     doppler_vector=None,
     time_reference_frequency=None,
     time_frequency_range=(8.0, 300.0),
+    time_to_merger=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2336,6 +2337,13 @@ def triangular_group_reparameterisations(
         (and reads ``chi_1`` / ``chi_2`` if sampled).  Default ``None`` (merger).
     time_frequency_range : tuple of float, optional
         Search range (Hz) for ``time_reference_frequency="adaptive"``.
+    time_to_merger : str, optional
+        ``"module:function"`` giving the waveform's time from each frequency to
+        the merger (see
+        :class:`~nessai_gw.reparameterisations.DetectorCenterTimeReparameterisation`):
+        the time is then 2PN plus a correction fitted to the waveform at every
+        training, tides included.  Needs ``time_reference_frequency``.
+        Default ``None`` (2PN).
 
     Returns
     -------
@@ -2437,9 +2445,12 @@ def triangular_group_reparameterisations(
                 f"and 'mass_ratio' in the sampling parameters; missing "
                 f"{sorted(missing | ({'geocent_time'} - set(sampling_parameters)))}"
             )
-        # The time at a frequency reads the chirp mass, mass ratio and spins
-        # (effective-spin is rank -1) on its inverse: rank it ahead of them.
+        # The time at a frequency reads the chirp mass, mass ratio, spins and
+        # (with time_to_merger) tides on its inverse (effective-spin and
+        # effective-tidal-deformability are rank -1): rank it ahead of them.
         _rank["geocent_time"] = -2
+    elif time_to_merger is not None:
+        raise ValueError("time_to_merger needs time_reference_frequency")
     ordered_names = sorted(
         sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
@@ -2535,6 +2546,13 @@ def triangular_group_reparameterisations(
                     reps[name]["doppler_vector"] = [
                         float(v) for v in np.asarray(doppler_vector, dtype=float)
                     ]
+                if time_to_merger is not None:
+                    reps[name]["time_to_merger"] = time_to_merger
+                    reps[name]["tides"] = (
+                        ["lambda_1", "lambda_2"]
+                        if {"lambda_1", "lambda_2"} <= set(sampling_parameters)
+                        else None
+                    )
         elif name == "phase":
             if phase_coordinates == "arg-alpha-beta":
                 # arg_alpha = (phase - psi), arg_beta = (phase + psi): both

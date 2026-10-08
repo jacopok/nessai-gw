@@ -412,3 +412,118 @@ def test_triangular_wiring_time_reference_frequency():
             [n for n in names if n != "mass_ratio"], REFERENCE_TIME,
             time_reference_frequency="adaptive",
         )
+
+
+# --- the waveform's own time to merger -----------------------------------------
+
+def _fake_waveform_time(params, frequencies):
+    """A stand-in for the waveform: 2PN plus a tidal merger shift (larger
+    deformabilities merge earlier) and a small spin term, smooth in the
+    parameters."""
+    f = np.atleast_1d(frequencies)
+    tau = np.stack([
+        pn_time_to_merger(params["chirp_mass"], params["mass_ratio"],
+                          params["chi_1"], params["chi_2"], fi)
+        for fi in f
+    ], axis=1)
+    shift = (-4e-6 * (params["lambda_1"] + params["lambda_2"])
+             + 0.02 * params["chi_1"] ** 2)
+    return tau + shift[:, None]
+
+
+def _tidal_points(n, seed):
+    x = _full_points(n, seed)
+    rng = np.random.default_rng(seed + 100)
+    values = {name: x[name] for name in
+              ("chirp_mass", "mass_ratio", "chi_1", "chi_2", "ra", "dec",
+               "geocent_time")}
+    values["lambda_1"] = rng.uniform(0, 2000, n)
+    values["lambda_2"] = rng.uniform(0, 2000, n)
+    return dict_to_live_points(values)
+
+
+def test_waveform_correction_is_fitted_at_update():
+    reparam = _ref_reparam(25.0, doppler_vector=DOPPLER,
+                           time_to_merger=_fake_waveform_time)
+    assert {"lambda_1", "lambda_2"} <= set(reparam.requires)
+    x = _tidal_points(1500, 12)
+    reparam.update(x)
+    assert reparam._correction is not None
+    params = reparam._params(x)
+    want = _fake_waveform_time(params, 25.0)[:, 0]
+    np.testing.assert_allclose(reparam._tau(x), want, atol=1e-7)
+
+
+def test_waveform_time_needs_a_reference_frequency():
+    with pytest.raises(ValueError, match="needs a `reference_frequency`"):
+        _ref_reparam(None, time_to_merger=_fake_waveform_time)
+
+
+def test_waveform_adaptive_frequency_and_round_trip():
+    """Arrival times equal at 30 Hz by the waveform's clock (which has the
+    tidal merger shift): the adaptive update finds 30 Hz, removes the spread
+    and the map stays exactly invertible."""
+    f_true = 30.0
+    reparam = _ref_reparam("adaptive", doppler_vector=DOPPLER,
+                           time_to_merger=_fake_waveform_time)
+    plain = _ref_reparam(reference_frequency=None)
+    x = _tidal_points(2000, 13)
+    tau = _fake_waveform_time(reparam._params(x), f_true)[:, 0]
+    rng = np.random.default_rng(14)
+    target = tau - np.median(tau) + rng.normal(0, 1e-4, len(x))
+    _, t_det, _ = _forward(plain, x)
+    x["geocent_time"] = x["geocent_time"] + (target - t_det["t_det"] * SCALE)
+
+    reparam.update(x)
+    assert reparam.reference_frequency == pytest.approx(f_true, rel=0.05)
+    _, at_f, log_j = _forward(reparam, x)
+    assert np.std(at_f["t_det"]) * SCALE < 2e-4
+
+    x_in = x.copy()
+    x_in["geocent_time"] = np.nan
+    x_out, _, _ = reparam.inverse_reparameterise(x_in, at_f.copy(), log_j.copy())
+    np.testing.assert_allclose(x_out["geocent_time"] - REFERENCE_TIME,
+                               x["geocent_time"] - REFERENCE_TIME, atol=1e-12)
+
+
+def test_waveform_function_pickles_by_name_and_is_optional():
+    import pickle
+
+    reparam = _ref_reparam(25.0, time_to_merger=pn_time_to_merger)
+    state = reparam.__getstate__()
+    assert state["_time_to_merger"] == (
+        "nessai_gw.reparameterisations.time:pn_time_to_merger"
+    )
+    assert state["_time_to_merger_fn"] is None
+
+    x = _tidal_points(500, 15)
+    fitted = _ref_reparam(25.0, time_to_merger=_fake_waveform_time)
+    fitted.update(x)
+    fitted._time_to_merger = "no_such_module:time"   # e.g. a monitor's venv
+    loaded = pickle.loads(pickle.dumps(fitted.__getstate__()))
+    restored = DetectorCenterTimeReparameterisation.__new__(
+        DetectorCenterTimeReparameterisation)
+    restored.__setstate__(loaded)
+    # the fitted correction travels with the checkpoint
+    np.testing.assert_allclose(restored._tau(x), fitted._tau(x))
+    assert restored._waveform() is None   # warns, keeps the last correction
+    np.testing.assert_allclose(restored._tau(x), fitted._tau(x))
+
+
+def test_triangular_wiring_time_to_merger():
+    from nessai_gw.group_mixture import triangular_group_reparameterisations
+
+    names = ["chirp_mass", "mass_ratio", "chi_1", "chi_2", "lambda_1",
+             "lambda_2", "ra", "dec", "theta_jn", "psi", "phase", "geocent_time"]
+    reps = triangular_group_reparameterisations(
+        names, REFERENCE_TIME, effective_spin=True,
+        effective_tidal_deformability=True, doppler_vector=DOPPLER,
+        time_reference_frequency="adaptive", time_to_merger="pkg.mod:fn",
+    )
+    entry = reps["geocent_time"]
+    assert entry["time_to_merger"] == "pkg.mod:fn"
+    assert entry["tides"] == ["lambda_1", "lambda_2"]
+    assert list(reps)[0] == "geocent_time"
+    with pytest.raises(ValueError, match="time_to_merger needs"):
+        triangular_group_reparameterisations(
+            names, REFERENCE_TIME, time_to_merger="pkg.mod:fn")

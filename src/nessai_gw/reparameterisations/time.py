@@ -1,6 +1,8 @@
 """Timing reparameterisations for single-site triangular detectors."""
 
+import importlib
 import inspect
+from itertools import combinations_with_replacement
 
 import numpy as np
 from nessai.reparameterisations import Reparameterisation
@@ -103,6 +105,18 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
     barycentric reference point, reaches the same minimum variance only by
     moving the point ~(5/3) v tau against the Earth's velocity.)
 
+    **The waveform's own time.**  2PN leaves out the higher orders and the
+    tides, and the merger the time refers to is itself shifted by the tides
+    (more deformable stars merge earlier, by milliseconds for a BNS): with
+    ``time_to_merger``, a function giving the waveform's
+    :math:`-\\frac{1}{2\\pi}\\partial_f\\phi_{22}`, ``tau`` is 2PN plus a
+    polynomial correction in the intrinsic parameters (``correction_degree``)
+    fitted, at every :meth:`update`, to ``tau_waveform - tau_2PN`` on the
+    training points; the adaptive frequency is then chosen with the
+    waveform's time.  The waveform is only evaluated there (it is far too
+    slow for every flow draw); any smooth correction keeps the map exactly
+    invertible, the fit only sets how well the coordinate decorrelates.
+
     ``reference_frequency="adaptive"`` chooses ``f`` before every training
     (:meth:`update`, on the training points) as the frequency that minimises
     the spread of ``t_f`` over them, as in the paper's Fig. 4; the search is a
@@ -141,6 +155,20 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
     spins : tuple of str or None, optional
         Names of the aligned spins of the heavier and lighter mass, or
         ``None`` for no spins.
+    time_to_merger : callable or str, optional
+        ``f(params, frequencies) -> tau`` of shape ``(N, len(frequencies))``,
+        the waveform's time (s) from each frequency of the 22 mode to the
+        merger, ``params`` a dict of arrays ``chirp_mass`` (in the Earth's
+        frame), ``mass_ratio`` (``<= 1``), ``chi_1``, ``chi_2``, ``lambda_1``,
+        ``lambda_2``; NaN where the waveform is not defined.  A
+        ``"module:function"`` string is imported when first needed, and is
+        what is pickled with the proposal (a checkpoint then loads without
+        that module).  ``None`` (default): 2PN only.
+    tides : tuple of str or None, optional
+        Names of the tidal deformabilities of the heavier and lighter mass,
+        read for ``time_to_merger`` (``None``: zero).
+    correction_degree : int, optional
+        Degree of the polynomial correction to 2PN (default 2).
     prior : optional
         Accepted for registry compatibility and ignored.
     """
@@ -160,6 +188,9 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         chirp_mass="chirp_mass",
         mass_ratio="mass_ratio",
         spins=("chi_1", "chi_2"),
+        time_to_merger=None,
+        tides=("lambda_1", "lambda_2"),
+        correction_degree=2,
         prior=None,
         rng=None,
         **kwargs,
@@ -228,8 +259,19 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         if self._spins is not None and len(self._spins) != 2:
             raise ValueError(f"`spins` must name two parameters; got {spins}")
         self._tau_ref = None
+        self._time_to_merger = time_to_merger
+        self._time_to_merger_fn = None
+        self._tides = None if tides is None else tuple(tides)
+        if self._tides is not None and len(self._tides) != 2:
+            raise ValueError(f"`tides` must name two parameters; got {tides}")
+        self._correction_degree = int(correction_degree)
+        self._correction = None
+        if time_to_merger is not None and self.reference_frequency is None:
+            raise ValueError("`time_to_merger` needs a `reference_frequency`")
         if self.reference_frequency is not None:
             self.requires += [chirp_mass, mass_ratio] + list(self._spins or [])
+            if time_to_merger is not None:
+                self.requires += list(self._tides or [])
 
         if hasattr(self, "inverse_input_parameters"):
             self.inverse_input_parameters = list(
@@ -244,22 +286,79 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
             self._vertex, self._gmst, x["ra"], x["dec"]
         )
 
-    def _tau(self, x, frequency=None):
-        """2PN time to merger (s) from ``frequency`` (default: the reference
-        frequency), with the chirp mass in the frame of the Earth."""
-        chirp_mass = x[self._chirp_mass]
+    def _params(self, x):
+        """The intrinsic parameters ``tau`` depends on, as a dict of arrays
+        (the chirp mass in the Earth's frame)."""
+        chirp_mass = np.asarray(x[self._chirp_mass], dtype=float)
         if self.doppler_vector is not None:
             chirp_mass = chirp_mass * doppler_factor(
                 x["ra"], x["dec"], self.doppler_vector
             )
-        if self._spins is None:
-            chi_1 = chi_2 = 0.0
-        else:
-            chi_1, chi_2 = x[self._spins[0]], x[self._spins[1]]
+        zeros = np.zeros_like(chirp_mass)
+        params = dict(chirp_mass=chirp_mass,
+                      mass_ratio=np.asarray(x[self._mass_ratio], dtype=float))
+        for key, names in (("chi", self._spins), ("lambda", self._tides)):
+            for i in (0, 1):
+                params[f"{key}_{i + 1}"] = (
+                    zeros if names is None or names[i] not in x.dtype.names
+                    else np.asarray(x[names[i]], dtype=float)
+                )
+        return params
+
+    def _tau_2pn(self, params, frequency):
         return pn_time_to_merger(
-            chirp_mass, x[self._mass_ratio], chi_1, chi_2,
-            self.reference_frequency if frequency is None else frequency,
+            params["chirp_mass"], params["mass_ratio"], params["chi_1"],
+            params["chi_2"], frequency,
         )
+
+    def _features(self, params):
+        """Polynomial features for the correction, standardised on the
+        training points of its fit (and clipped, so that the tails of the
+        flow stay finite and smooth)."""
+        c = self._correction
+        u = np.stack([params[k] for k in c["keys"]], axis=-1)
+        u = np.clip((u - c["mean"]) / c["std"], -8.0, 8.0)
+        columns = [np.ones(len(u))]
+        for degree in range(1, self._correction_degree + 1):
+            for combo in combinations_with_replacement(range(u.shape[1]), degree):
+                columns.append(np.prod(u[:, list(combo)], axis=1))
+        return np.stack(columns, axis=1)
+
+    def _tau(self, x, frequency=None):
+        """Time to merger (s) from ``frequency`` (default: the reference
+        frequency), with the chirp mass in the frame of the Earth: 2PN, plus
+        the fitted waveform correction at the reference frequency."""
+        params = self._params(x)
+        tau = self._tau_2pn(
+            params, self.reference_frequency if frequency is None else frequency
+        )
+        if frequency is None and getattr(self, "_correction", None) is not None:
+            tau = tau + self._features(params) @ self._correction["beta"]
+        return tau
+
+    def _waveform(self):
+        """The ``time_to_merger`` function, imported if given by name; None
+        if there is none or it cannot be imported (then 2PN)."""
+        spec = getattr(self, "_time_to_merger", None)
+        if spec is None:
+            return None
+        if getattr(self, "_time_to_merger_fn", None) is None:
+            if callable(spec):
+                self._time_to_merger_fn = spec
+            else:
+                module, _, name = str(spec).partition(":")
+                try:
+                    self._time_to_merger_fn = getattr(
+                        importlib.import_module(module), name
+                    )
+                except (ImportError, AttributeError) as exc:
+                    logger.warning(
+                        "Cannot import time_to_merger %r (%s): the arrival "
+                        "time keeps its last correction", spec, exc,
+                    )
+                    self._time_to_merger = None
+                    return None
+        return self._time_to_merger_fn
 
     def _shift(self, x):
         """``tau(f) - tau_ref`` (s): what is subtracted from ``t_det``."""
@@ -276,25 +375,39 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
     def update(self, x, x_prime=None):
         """With ``reference_frequency="adaptive"``, move the frequency to
         the one that minimises the spread of the coordinate over ``x`` (the
-        training points); with any reference frequency, recentre
-        ``tau_ref`` on them."""
+        training points); with ``time_to_merger``, refit the correction to
+        2PN there; with any reference frequency, recentre ``tau_ref`` on
+        them."""
         if self.reference_frequency is None or len(x) < 2:
             return
         t_det = (x["geocent_time"] - self._reference_time) + self._delay(x)
+        params = self._params(x)
+        waveform = self._waveform()
         if self.adaptive:
             low, high = self.frequency_range
             freqs = np.geomspace(low, high, 97)
-            spreads = np.array([
-                np.nanstd(t_det - self._tau(x, f)) for f in freqs
-            ])
+            tau_grid = None
+            if waveform is not None:
+                tau_grid = np.asarray(waveform(params, freqs), dtype=float)
+            if tau_grid is None or not np.isfinite(tau_grid).any():
+                tau_grid = np.stack(
+                    [self._tau_2pn(params, f) for f in freqs], axis=1
+                )
+            with np.errstate(invalid="ignore"):
+                spreads = np.nanstd(t_det[:, None] - tau_grid, axis=0)
             if np.isfinite(spreads).any():
                 i = int(np.nanargmin(spreads))
                 # refine between the neighbouring grid points
                 fine = np.geomspace(freqs[max(i - 1, 0)],
-                                    freqs[min(i + 1, len(freqs) - 1)], 33)
-                fine_spreads = np.array([
-                    np.nanstd(t_det - self._tau(x, f)) for f in fine
-                ])
+                                    freqs[min(i + 1, len(freqs) - 1)], 17)
+                if waveform is not None:
+                    fine_grid = np.asarray(waveform(params, fine), dtype=float)
+                else:
+                    fine_grid = np.stack(
+                        [self._tau_2pn(params, f) for f in fine], axis=1
+                    )
+                with np.errstate(invalid="ignore"):
+                    fine_spreads = np.nanstd(t_det[:, None] - fine_grid, axis=0)
                 j = int(np.nanargmin(fine_spreads))
                 previous = self.reference_frequency
                 self.reference_frequency = float(fine[j])
@@ -304,13 +417,54 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
                     self.reference_frequency, previous,
                     1e3 * fine_spreads[j], 1e3 * np.std(t_det),
                 )
+        if waveform is not None:
+            self._fit_correction(params, waveform)
         tau = self._tau(x)
         finite = np.isfinite(tau)
         if finite.any():
             self._tau_ref = float(np.median(tau[finite]))
 
+    def _fit_correction(self, params, waveform):
+        """Least-squares fit of ``tau_waveform - tau_2PN`` at the reference
+        frequency, a polynomial in the standardised intrinsic parameters."""
+        f = self.reference_frequency
+        target = (np.asarray(waveform(params, np.array([f])), dtype=float)[:, 0]
+                  - self._tau_2pn(params, f))
+        ok = np.isfinite(target)
+        keys = [k for k in ("chirp_mass", "mass_ratio", "chi_1", "chi_2",
+                            "lambda_1", "lambda_2")
+                if np.std(params[k][ok]) > 0]
+        n_terms = len(list(combinations_with_replacement(
+            range(len(keys) + 1), self._correction_degree)))
+        if ok.sum() < 2 * n_terms:
+            logger.warning("Too few points (%d) to fit the arrival-time "
+                           "correction; keeping 2PN", ok.sum())
+            self._correction = None
+            return
+        u = np.stack([params[k][ok] for k in keys], axis=-1)
+        self._correction = dict(keys=keys, mean=u.mean(axis=0),
+                                std=u.std(axis=0), beta=None)
+        design = self._features({k: v[ok] for k, v in params.items()})
+        beta, *_ = np.linalg.lstsq(design, target[ok], rcond=None)
+        self._correction["beta"] = beta
+        residual = target[ok] - design @ beta
+        logger.info(
+            "Arrival-time correction to 2PN at %.1f Hz from the waveform: "
+            "spread %.3g ms, fit residual %.3g ms (%d terms)", f,
+            1e3 * np.std(target[ok]), 1e3 * np.std(residual), len(beta),
+        )
+
     def reset(self):
         self._tau_ref = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # the imported function goes with its name, not by value
+        state["_time_to_merger_fn"] = None
+        if callable(state.get("_time_to_merger")):
+            fn = state["_time_to_merger"]
+            state["_time_to_merger"] = f"{fn.__module__}:{fn.__qualname__}"
+        return state
 
     def __setstate__(self, state):
         # checkpoints pickled before the reference frequency existed
@@ -319,6 +473,9 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
             ("frequency_range", (8.0, 300.0)), ("doppler_vector", None),
             ("_chirp_mass", "chirp_mass"), ("_mass_ratio", "mass_ratio"),
             ("_spins", ("chi_1", "chi_2")), ("_tau_ref", None),
+            ("_time_to_merger", None), ("_time_to_merger_fn", None),
+            ("_tides", ("lambda_1", "lambda_2")), ("_correction_degree", 2),
+            ("_correction", None),
         ):
             state.setdefault(key, value)
         self.__dict__.update(state)
