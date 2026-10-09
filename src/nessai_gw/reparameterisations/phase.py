@@ -1,4 +1,6 @@
+import importlib
 import inspect
+from itertools import combinations_with_replacement
 
 import numpy as np
 from nessai.reparameterisations import (
@@ -6,6 +8,7 @@ from nessai.reparameterisations import (
 )
 
 from .. import nessai_logger
+from .mass import doppler_factor
 
 logger = nessai_logger.getChild(__name__)
 
@@ -142,9 +145,61 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         (:class:`nessai_gw.group_mixture.ETTriangleGroupAction` with
         ``phase_reflection=True``), which folds ``phase <-> phase + pi`` while
         this coordinate stays a clean bijection.
+    waveform_phase : callable or str, optional
+        ``f(params, frequencies) -> phi_22`` of shape
+        ``(N, len(frequencies))``, the (unwrapped) phase of the waveform's 22
+        mode, in the convention where ``phase`` enters the 22 mode as
+        ``2 phase + phi_22``; ``params`` as for
+        :class:`~nessai_gw.reparameterisations.DetectorCenterTimeReparameterisation`'s
+        ``time_to_merger`` (chirp mass in the Earth's frame).  A
+        ``"module:function"`` string is imported when first needed and is
+        what is pickled.  With it the coordinate is measured at a reference
+        frequency (see the class notes); ``None`` (default): at the merger.
+    frequency_range : tuple of float, optional
+        Search range (Hz) for the reference frequency of the phase.
+    correction_degree : int, optional
+        Degree of the polynomial fit of the phase offset (default 4).
+    doppler_vector : array_like, optional
+        :math:`\\mathbf{v}_\\oplus / c` in the axes of ``(ra, dec)``, as for
+        ``doppler-chirp-mass``, for the chirp mass in the Earth's frame.
+    chirp_mass, mass_ratio : str, optional
+        Names of the chirp mass and mass ratio.
+    spins, tides : tuple of str or None, optional
+        Names of the aligned spins and tidal deformabilities of the heavier
+        and lighter mass (``None``: zero).
     prior : optional
         Accepted for registry compatibility and ignored (the flow models the
         prime coordinate directly).
+
+    Notes
+    -----
+    **Phase at a reference frequency.**  ``phase`` is the orbital phase at
+    the merger.  What the data measure is the 22 mode's phase over the band
+    the detector is most sensitive to: given the arrival time, a change of
+    the masses, spins or tides changes the phase accumulated between that
+    band and the merger, and ``phase`` moves to compensate -- by tens of
+    radians across a high-SNR posterior, which winds ``delta_phase`` into a
+    helix around the intrinsic parameters that the flow cannot follow (on
+    the ET-2L v6 live points the circular concentration ``R`` of
+    ``delta_phase`` is 0.02; with the offset below it is 0.57).  With
+    ``waveform_phase`` the coordinate is ::
+
+        delta_phase = phase + sign(cos theta_jn) * psi + a(theta) / 2
+
+    with ``a`` the intercept at ``f = 0`` of the tangent to ``phi_22`` at a
+    reference frequency ``f_p`` (the phase there, with its slope -- the
+    time, carried by ``t_det`` -- removed).  At every :meth:`update` (on the
+    training points) ``f_p`` is the one in ``frequency_range`` that makes
+    ``delta_phase`` the most concentrated, and ``a`` is fitted there as a
+    polynomial in the standardised intrinsic parameters (the waveform is
+    far too slow for every flow draw).  The offset depends only on the
+    intrinsic parameters, so the Jacobian is unchanged; it is invariant
+    under the triangular group (with the chirp mass in the Earth's frame,
+    as for the time), which translates the phase by constants.  The
+    intrinsic parameters are read on the inverse pass, so this has to be
+    ranked ahead of their reparameterisations.  If no frequency
+    concentrates ``delta_phase`` more than the merger phase does, beyond the
+    noise (early in a run), the offset is left out.
     """
 
     one_to_one = False
@@ -154,6 +209,14 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         parameters=None,
         prior_bounds=None,
         scale=1.0,
+        waveform_phase=None,
+        frequency_range=(8.0, 300.0),
+        correction_degree=4,
+        doppler_vector=None,
+        chirp_mass="chirp_mass",
+        mass_ratio="mass_ratio",
+        spins=("chi_1", "chi_2"),
+        tides=("lambda_1", "lambda_2"),
         prior=None,
         rng=None,
         **kwargs,
@@ -185,11 +248,43 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         # psi and theta_jn are needed both to build delta_phase (forward) and to
         # recover phase (inverse).
         self.requires = ["psi", "theta_jn"]
+        self._waveform_phase = waveform_phase
+        self._waveform_phase_fn = None
+        self.frequency_range = tuple(float(f) for f in frequency_range)
+        if len(self.frequency_range) != 2 or not (
+            0 < self.frequency_range[0] < self.frequency_range[1]
+        ):
+            raise ValueError(
+                f"`frequency_range` must be (low, high) with 0 < low < high; "
+                f"got {frequency_range}"
+            )
+        self._correction_degree = int(correction_degree)
+        self.doppler_vector = (
+            None if doppler_vector is None
+            else np.asarray(doppler_vector, dtype=float)
+        )
+        if self.doppler_vector is not None and self.doppler_vector.shape != (3,):
+            raise ValueError(
+                f"`doppler_vector` must have 3 components; got {doppler_vector}"
+            )
+        self._chirp_mass, self._mass_ratio = chirp_mass, mass_ratio
+        self._spins = None if spins is None else tuple(spins)
+        self._tides = None if tides is None else tuple(tides)
+        for key, names in (("spins", self._spins), ("tides", self._tides)):
+            if names is not None and len(names) != 2:
+                raise ValueError(f"`{key}` must name two parameters; got {names}")
+        #: frequency (Hz) the phase is measured at; None: the merger
+        self.reference_frequency = None
+        self._offset = None
+        if waveform_phase is not None:
+            self.requires += [chirp_mass, mass_ratio]
+            self.requires += list(self._spins or []) + list(self._tides or [])
+            if self.doppler_vector is not None:
+                self.requires += ["ra", "dec"]
         if hasattr(self, "inverse_input_parameters"):
             self.inverse_input_parameters = list(
                 dict.fromkeys(
-                    list(self.inverse_input_parameters or [])
-                    + ["psi", "theta_jn"]
+                    list(self.inverse_input_parameters or []) + self.requires
                 )
             )
         self._log_j = float(np.log(self.scale / np.pi))
@@ -199,9 +294,139 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         """``sign(cos theta_jn)`` (0 exactly at edge-on -- a measure-zero set)."""
         return np.sign(np.cos(x["theta_jn"]))
 
+    def _waveform(self):
+        """The ``waveform_phase`` function, imported if given by name; None
+        if there is none or it cannot be imported."""
+        spec = getattr(self, "_waveform_phase", None)
+        if spec is None:
+            return None
+        if getattr(self, "_waveform_phase_fn", None) is None:
+            if callable(spec):
+                self._waveform_phase_fn = spec
+            else:
+                module, _, name = str(spec).partition(":")
+                try:
+                    self._waveform_phase_fn = getattr(
+                        importlib.import_module(module), name
+                    )
+                except (ImportError, AttributeError) as exc:
+                    logger.warning(
+                        "Cannot import waveform_phase %r (%s): the phase "
+                        "keeps its last offset", spec, exc,
+                    )
+                    self._waveform_phase = None
+                    return None
+        return self._waveform_phase_fn
+
+    def _params(self, x):
+        """The intrinsic parameters the offset depends on, as a dict of
+        arrays (the chirp mass in the Earth's frame)."""
+        chirp_mass = np.asarray(x[self._chirp_mass], dtype=float)
+        if self.doppler_vector is not None:
+            chirp_mass = chirp_mass * doppler_factor(
+                x["ra"], x["dec"], self.doppler_vector
+            )
+        zeros = np.zeros_like(chirp_mass)
+        params = dict(chirp_mass=chirp_mass,
+                      mass_ratio=np.asarray(x[self._mass_ratio], dtype=float))
+        for key, names in (("chi", self._spins), ("lambda", self._tides)):
+            for i in (0, 1):
+                params[f"{key}_{i + 1}"] = (
+                    zeros if names is None or names[i] not in x.dtype.names
+                    else np.asarray(x[names[i]], dtype=float)
+                )
+        return params
+
+    def _tangent_intercepts(self, params, frequencies, step=1e-3):
+        """``phi_22(f) - f phi_22'(f)`` at each frequency, shape
+        ``(N, len(frequencies))`` (central differences)."""
+        f = np.asarray(frequencies, dtype=float)
+        grid = np.concatenate([f * (1 - step), f, f * (1 + step)])
+        phi = np.asarray(self._waveform()(params, grid), dtype=float)
+        lo, mid, hi = np.split(phi, 3, axis=1)
+        return mid - (hi - lo) / (2 * step)
+
+    def _features(self, params):
+        """Polynomial features of the standardised intrinsic parameters
+        (clipped, so that the tails of the flow stay finite and smooth)."""
+        c = self._offset
+        u = np.stack([params[k] for k in c["keys"]], axis=-1)
+        u = np.clip((u - c["mean"]) / c["std"], -8.0, 8.0)
+        columns = [np.ones(len(u))]
+        for degree in range(1, self._correction_degree + 1):
+            for combo in combinations_with_replacement(range(u.shape[1]), degree):
+                columns.append(np.prod(u[:, list(combo)], axis=1))
+        return np.stack(columns, axis=1)
+
+    def _shift(self, x):
+        """``a(theta) / 2``: what is added to the phase."""
+        if getattr(self, "_offset", None) is None:
+            return 0.0
+        return 0.5 * (self._features(self._params(x)) @ self._offset["beta"])
+
+    def _concentration(self, angle):
+        """Circular concentration of ``delta_phase`` at the first two
+        harmonics of its period (the group mixture can leave it
+        ``pi``-periodic), the larger of the two."""
+        angle = np.asarray(angle) * self.scale
+        return np.maximum.reduce([
+            np.abs(np.mean(np.exp(1j * k * angle), axis=0)) for k in (1, 2)
+        ])
+
+    def update(self, x, x_prime=None):
+        """With ``waveform_phase``, choose the reference frequency of the
+        phase and refit its offset on ``x`` (the training points)."""
+        if self._waveform() is None or len(x) < 2:
+            return
+        params = self._params(x)
+        base = x["phase"] + self._psi_sign(x) * x["psi"]
+        low, high = self.frequency_range
+        freqs = np.geomspace(low, high, 33)
+        offsets = self._tangent_intercepts(params, freqs)
+        ok = np.isfinite(offsets).all(axis=0)
+        r_merger = float(self._concentration(base))
+        if not ok.any():
+            logger.warning("waveform_phase gave no finite phases: phase "
+                           "measured at the merger")
+            self.reference_frequency, self._offset = None, None
+            return
+        r = np.where(ok, self._concentration(base[:, None] + 0.5 * offsets), -1.0)
+        i = int(np.argmax(r))
+        keys = [k for k in ("chirp_mass", "mass_ratio", "chi_1", "chi_2",
+                            "lambda_1", "lambda_2") if np.std(params[k]) > 0]
+        n_terms = len(list(combinations_with_replacement(
+            range(len(keys) + 1), self._correction_degree)))
+        # a gain within the noise of the best of many frequencies is chance
+        # (uniform phases: 2 N R^2 ~ chi^2_2, so ~e^-16 per frequency)
+        if r[i] <= r_merger + 4.0 / np.sqrt(len(x)) or len(x) < 2 * n_terms:
+            logger.info(
+                "Phase measured at the merger (concentration %.3f; best %.3f "
+                "at %.1f Hz, %d points for %d terms)", r_merger, r[i],
+                freqs[i], len(x), n_terms,
+            )
+            self.reference_frequency, self._offset = None, None
+            return
+        target = offsets[:, i]
+        u = np.stack([params[k] for k in keys], axis=-1)
+        self._offset = dict(keys=keys, mean=u.mean(axis=0), std=u.std(axis=0),
+                            beta=None)
+        design = self._features(params)
+        beta, *_ = np.linalg.lstsq(design, target, rcond=None)
+        self._offset["beta"] = beta
+        self.reference_frequency = float(freqs[i])
+        residual = target - design @ beta
+        logger.info(
+            "Phase measured at %.1f Hz: offset spread %.3g rad, fit residual "
+            "%.3g rad (%d terms); concentration of delta_phase %.3f (%.3f at "
+            "the merger)", self.reference_frequency, np.std(target),
+            np.std(residual), len(beta),
+            self._concentration(base + self._shift(x)), r_merger,
+        )
+
     def reparameterise(self, x, x_prime, log_j, **kwargs):
         angle = np.mod(
-            (x["phase"] + self._psi_sign(x) * x["psi"]) * self.scale, _TWO_PI
+            (x["phase"] + self._psi_sign(x) * x["psi"] + self._shift(x))
+            * self.scale, _TWO_PI
         )
         x_prime[self.prime_parameters[0]] = angle / np.pi - 1.0
         return x, x_prime, log_j + self._log_j
@@ -211,9 +436,32 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             (x_prime[self.prime_parameters[0]] + 1.0) * np.pi, _TWO_PI
         )
         x["phase"] = np.mod(
-            angle / self.scale - self._psi_sign(x) * x["psi"], _TWO_PI
+            angle / self.scale - self._psi_sign(x) * x["psi"] - self._shift(x),
+            _TWO_PI,
         )
         return x, x_prime, log_j - self._log_j
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # the imported function goes with its name, not by value
+        state["_waveform_phase_fn"] = None
+        if callable(state.get("_waveform_phase")):
+            fn = state["_waveform_phase"]
+            state["_waveform_phase"] = f"{fn.__module__}:{fn.__qualname__}"
+        return state
+
+    def __setstate__(self, state):
+        # checkpoints pickled before the reference-frequency phase existed
+        for key, value in (
+            ("_waveform_phase", None), ("_waveform_phase_fn", None),
+            ("frequency_range", (8.0, 300.0)), ("_correction_degree", 4),
+            ("doppler_vector", None), ("_chirp_mass", "chirp_mass"),
+            ("_mass_ratio", "mass_ratio"), ("_spins", ("chi_1", "chi_2")),
+            ("_tides", ("lambda_1", "lambda_2")),
+            ("reference_frequency", None), ("_offset", None),
+        ):
+            state.setdefault(key, value)
+        self.__dict__.update(state)
 
 
 class ArgAlphaBetaReparameterisation(Reparameterisation):

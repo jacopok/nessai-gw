@@ -2172,6 +2172,7 @@ def triangular_group_reparameterisations(
     time_frequency_range=(8.0, 300.0),
     time_to_merger=None,
     chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2337,7 +2338,8 @@ def triangular_group_reparameterisations(
         invariant under the group.  Needs ``chirp_mass`` and ``mass_ratio``
         (and reads ``chi_1`` / ``chi_2`` if sampled).  Default ``None`` (merger).
     time_frequency_range : tuple of float, optional
-        Search range (Hz) for ``time_reference_frequency="adaptive"``.
+        Search range (Hz) for ``time_reference_frequency="adaptive"``, and
+        for the reference frequency of the phase with ``waveform_phase``.
     chirp_distance_inversion : bool, optional
         With ``chirp_distance``: reflect the luminosity distance about the
         prior edge the live points pile up against, training on mirror copies
@@ -2351,6 +2353,13 @@ def triangular_group_reparameterisations(
         the time is then 2PN plus a correction fitted to the waveform at every
         training, tides included.  Needs ``time_reference_frequency``.
         Default ``None`` (2PN).
+    waveform_phase : str, optional
+        ``"module:function"`` giving the phase of the waveform's 22 mode (see
+        :class:`~nessai_gw.reparameterisations.PolarisationPhaseReparameterisation`):
+        ``delta_phase`` is then measured at a reference frequency chosen and
+        fitted at every training, which unwinds its helix around the
+        intrinsic parameters.  Needs ``phase_coordinates="polarisation-phase"``,
+        ``chirp_mass`` and ``mass_ratio``.  Default ``None`` (merger phase).
 
     Returns
     -------
@@ -2458,6 +2467,17 @@ def triangular_group_reparameterisations(
         _rank["geocent_time"] = -2
     elif time_to_merger is not None:
         raise ValueError("time_to_merger needs time_reference_frequency")
+    if waveform_phase is not None:
+        missing = {"chirp_mass", "mass_ratio", "phase"} - set(sampling_parameters)
+        if missing or phase_coordinates != "polarisation-phase":
+            raise ValueError(
+                "waveform_phase needs phase_coordinates='polarisation-phase' "
+                "and 'phase', 'chirp_mass' and 'mass_ratio' in the sampling "
+                f"parameters; missing {sorted(missing)}"
+            )
+        # The phase at a frequency reads the chirp mass, mass ratio, spins
+        # and tides on its inverse, as the time at a frequency does.
+        _rank["phase"] = -2
     ordered_names = sorted(
         sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
@@ -2582,6 +2602,26 @@ def triangular_group_reparameterisations(
                 # polarisation/phase combination an explicit flow axis.  ``psi``
                 # (angle-pi) and ``theta_jn`` (angle-sine) are prerequisites.
                 reps[name] = {"reparameterisation": "polarisation-phase"}
+                if waveform_phase is not None:
+                    reps[name]["waveform_phase"] = waveform_phase
+                    reps[name]["frequency_range"] = [
+                        float(f) for f in time_frequency_range
+                    ]
+                    reps[name]["spins"] = (
+                        ["chi_1", "chi_2"]
+                        if {"chi_1", "chi_2"} <= set(sampling_parameters)
+                        else None
+                    )
+                    reps[name]["tides"] = (
+                        ["lambda_1", "lambda_2"]
+                        if {"lambda_1", "lambda_2"} <= set(sampling_parameters)
+                        else None
+                    )
+                    if doppler_chirp_mass:
+                        reps[name]["doppler_vector"] = [
+                            float(v)
+                            for v in np.asarray(doppler_vector, dtype=float)
+                        ]
 
     if phase_coordinates == "arg-alpha-beta" and "phase" in sampling_parameters:
         reps["arg-alpha-beta"] = {"parameters": ["psi", "phase"]}
@@ -2635,6 +2675,7 @@ def _prime_parameter_names(
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2701,6 +2742,7 @@ def _prime_parameter_names(
                 time_reference_frequency=time_reference_frequency,
                 time_to_merger=time_to_merger,
                 chirp_distance_inversion=chirp_distance_inversion,
+                waveform_phase=waveform_phase,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -3081,6 +3123,7 @@ def make_triangular_group_flow_proposal(
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -3412,6 +3455,7 @@ def make_triangular_group_flow_proposal(
             time_reference_frequency=time_reference_frequency,
             time_to_merger=time_to_merger,
             chirp_distance_inversion=chirp_distance_inversion,
+            waveform_phase=waveform_phase,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3712,6 +3756,7 @@ def make_et_group_flow_proposal(
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3759,4 +3804,5 @@ def make_et_group_flow_proposal(
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,
+        waveform_phase=waveform_phase,
     )

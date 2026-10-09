@@ -355,3 +355,215 @@ class TestFittedPhaseRotation:
         r_before = np.hypot(phase, psi)
         r_after = np.hypot(x_prime["phase_rot_1"], x_prime["phase_rot_2"])
         np.testing.assert_allclose(r_after, r_before, atol=1e-10)
+
+
+# --- phase at a reference frequency ---------------------------------------------
+
+_PHASE_GRID = np.geomspace(8.0, 300.0, 33)
+_F_TRUE = float(_PHASE_GRID[19])          # ~47 Hz, on the search grid
+_DOPPLER = [3e-5, -8e-5, 4e-5]
+
+
+def _fake_waveform_phase(params, frequencies):
+    """A stand-in for the 22-mode phase: a time term (linear in f, which the
+    tangent intercept removes), a chirp term whose intercept depends on the
+    frequency, and a constant; smooth in the parameters."""
+    f = np.atleast_1d(frequencies)[None, :]
+    time = 0.02 * params["chi_1"][:, None]
+    chirp = (30.0 * (params["chirp_mass"] - 1.2) / 0.01
+             + 1e-3 * params["lambda_1"])[:, None]
+    const = 5.0 * params["chi_2"][:, None]
+    return -2 * np.pi * f * time + chirp * (f / 30.0) ** (-5.0 / 3.0) + const
+
+
+def _intercept(params, f):
+    """Exact tangent intercept of :func:`_fake_waveform_phase` at ``f``."""
+    chirp = 30.0 * (params["chirp_mass"] - 1.2) / 0.01 + 1e-3 * params["lambda_1"]
+    return 5.0 * params["chi_2"] + chirp * (8.0 / 3.0) * (f / 30.0) ** (-5.0 / 3.0)
+
+
+def _waveform_reparam(**kwargs):
+    kwargs.setdefault("doppler_vector", _DOPPLER)
+    return PolarisationPhaseReparameterisation(
+        parameters="phase", prior_bounds={"phase": [0, 2 * np.pi]},
+        waveform_phase=_fake_waveform_phase, **kwargs,
+    )
+
+
+def _helix_points(n, seed, concentrated=True):
+    """Points whose ``phase + sign(cos theta_jn) psi + a(f_true) / 2`` is
+    concentrated (as on a posterior), so that ``delta_phase`` at the merger
+    winds around the intrinsic parameters."""
+    rng = np.random.default_rng(seed)
+    x = dict_to_live_points({
+        "chirp_mass": rng.uniform(1.19, 1.21, n),
+        "mass_ratio": rng.uniform(0.7, 1.0, n),
+        "chi_1": rng.uniform(-0.05, 0.05, n),
+        "chi_2": rng.uniform(-0.05, 0.05, n),
+        "lambda_1": rng.uniform(0, 2000, n),
+        "lambda_2": rng.uniform(0, 2000, n),
+        "ra": rng.uniform(0, 2 * np.pi, n),
+        "dec": np.arcsin(rng.uniform(-1, 1, n)),
+        "psi": rng.uniform(0, np.pi, n),
+        "theta_jn": np.arccos(rng.uniform(-1, 1, n)),
+        "phase": rng.uniform(0, 2 * np.pi, n),
+    })
+    if concentrated:
+        reparam = _waveform_reparam()
+        a = _intercept(reparam._params(x), _F_TRUE)
+        sign = np.sign(np.cos(x["theta_jn"]))
+        x["phase"] = np.mod(np.pi - sign * x["psi"] - a / 2
+                            + rng.normal(0, 0.1, n), 2 * np.pi)
+    return x
+
+
+def _forward_phase(reparam, x):
+    x_prime = empty_structured_array(len(x), names=reparam.prime_parameters)
+    return reparam.reparameterise(x.copy(), x_prime, np.zeros(len(x)))
+
+
+def _concentration(delta_phase_prime):
+    return np.abs(np.mean(np.exp(1j * np.pi * (delta_phase_prime + 1))))
+
+
+def test_waveform_phase_requires_the_intrinsic_parameters():
+    reparam = _waveform_reparam()
+    assert set(reparam.requires) == {
+        "psi", "theta_jn", "chirp_mass", "mass_ratio", "chi_1", "chi_2",
+        "lambda_1", "lambda_2", "ra", "dec",
+    }
+    plain = PolarisationPhaseReparameterisation(parameters="phase")
+    assert plain.requires == ["psi", "theta_jn"]
+    assert plain.reference_frequency is None
+
+
+def test_waveform_phase_unwinds_the_helix_and_inverts():
+    reparam = _waveform_reparam()
+    plain = PolarisationPhaseReparameterisation(parameters="phase")
+    x = _helix_points(3000, 1)
+    _, at_merger, log_j_plain = _forward_phase(plain, x)
+    assert _concentration(at_merger["delta_phase"]) < 0.2
+
+    reparam.update(x)
+    assert reparam.reference_frequency == pytest.approx(_F_TRUE)
+    _, at_f, log_j = _forward_phase(reparam, x)
+    assert _concentration(at_f["delta_phase"]) > 0.95
+    # the offset depends only on the intrinsic parameters: same Jacobian
+    np.testing.assert_array_equal(log_j, log_j_plain)
+
+    x_in = x.copy()
+    x_in["phase"] = np.nan
+    x_out, _, log_j_back = reparam.inverse_reparameterise(
+        x_in, at_f.copy(), log_j.copy())
+    d = np.angle(np.exp(1j * (x_out["phase"] - x["phase"])))
+    np.testing.assert_allclose(d, 0.0, atol=1e-10)
+    np.testing.assert_allclose(log_j_back, 0.0, atol=1e-12)
+
+
+def test_waveform_phase_left_out_when_it_does_not_help():
+    """Uniform phases (early in a run): no frequency concentrates
+    delta_phase, so the phase stays at the merger."""
+    reparam = _waveform_reparam()
+    x = _helix_points(3000, 2, concentrated=False)
+    reparam.update(x)
+    assert reparam.reference_frequency is None
+    assert reparam._shift(x) == 0.0
+
+
+def test_waveform_phase_offset_is_group_invariant():
+    """The offset reads the chirp mass in the Earth's frame: moving the sky
+    (as the triangular group does) with that chirp mass held fixed leaves it
+    unchanged, so the group's translations of the phase commute with it."""
+    from nessai_gw.reparameterisations.mass import doppler_factor
+
+    reparam = _waveform_reparam()
+    x = _helix_points(3000, 3)
+    reparam.update(x)
+    moved = x.copy()
+    rng = np.random.default_rng(4)
+    moved["ra"] = rng.uniform(0, 2 * np.pi, len(x))
+    moved["dec"] = np.arcsin(rng.uniform(-1, 1, len(x)))
+    moved["psi"] = rng.uniform(0, np.pi, len(x))
+    moved["theta_jn"] = np.pi - x["theta_jn"]
+    moved["chirp_mass"] = (
+        x["chirp_mass"] * doppler_factor(x["ra"], x["dec"], _DOPPLER)
+        / doppler_factor(moved["ra"], moved["dec"], _DOPPLER)
+    )
+    np.testing.assert_allclose(reparam._shift(moved), reparam._shift(x),
+                               atol=1e-9)
+    # without the Doppler factor it would not be invariant
+    sky_only = x.copy()
+    sky_only["ra"], sky_only["dec"] = moved["ra"], moved["dec"]
+    assert not np.allclose(reparam._shift(sky_only), reparam._shift(x))
+
+
+def test_waveform_phase_pickles_by_name_and_keeps_its_offset():
+    import pickle
+
+    reparam = PolarisationPhaseReparameterisation(
+        parameters="phase",
+        waveform_phase="nessai_gw.reparameterisations.phase:no_such_function",
+    )
+    assert reparam._waveform() is None     # warns
+    reparam.update(_helix_points(100, 5))  # nothing to fit with
+
+    fitted = _waveform_reparam()
+    x = _helix_points(2000, 6)
+    fitted.update(x)
+    state = fitted.__getstate__()
+    assert state["_waveform_phase"].endswith(":_fake_waveform_phase")
+    assert state["_waveform_phase_fn"] is None
+    fitted._waveform_phase = "no_such_module:phase"   # e.g. a monitor's venv
+    restored = pickle.loads(pickle.dumps(fitted))
+    np.testing.assert_allclose(restored._shift(x), fitted._shift(x))
+    assert restored._waveform() is None
+    restored.update(x)                                # keeps the offset
+    np.testing.assert_allclose(restored._shift(x), fitted._shift(x))
+
+
+def test_waveform_phase_old_pickles_load():
+    plain = PolarisationPhaseReparameterisation(parameters="phase")
+    state = dict(plain.__dict__)
+    for key in ("_waveform_phase", "_waveform_phase_fn", "_offset",
+                "reference_frequency", "doppler_vector"):
+        state.pop(key)
+    restored = PolarisationPhaseReparameterisation.__new__(
+        PolarisationPhaseReparameterisation)
+    restored.__setstate__(state)
+    x = _helix_points(50, 7)
+    _, a, _ = _forward_phase(restored, x)
+    _, b, _ = _forward_phase(plain, x)
+    np.testing.assert_array_equal(a["delta_phase"], b["delta_phase"])
+
+
+def test_triangular_wiring_waveform_phase():
+    from nessai_gw.group_mixture import triangular_group_reparameterisations
+
+    names = ["chirp_mass", "mass_ratio", "chi_1", "chi_2", "lambda_1",
+             "lambda_2", "ra", "dec", "theta_jn", "psi", "phase",
+             "geocent_time"]
+    reps = triangular_group_reparameterisations(
+        names, 1187008882.4, effective_spin=True,
+        effective_tidal_deformability=True, doppler_vector=_DOPPLER,
+        time_reference_frequency="adaptive", waveform_phase="pkg.mod:phase",
+    )
+    entry = reps["phase"]
+    assert entry["reparameterisation"] == "polarisation-phase"
+    assert entry["waveform_phase"] == "pkg.mod:phase"
+    assert entry["spins"] == ["chi_1", "chi_2"]
+    assert entry["tides"] == ["lambda_1", "lambda_2"]
+    assert entry["doppler_vector"] == _DOPPLER
+    # ahead of the intrinsic reparameterisations it reads on the inverse
+    order = list(reps)
+    assert order.index("phase") < order.index("chi_1")
+    assert order.index("phase") < order.index("lambda_1")
+    assert "waveform_phase" not in triangular_group_reparameterisations(
+        names, 1187008882.4)["phase"]
+    with pytest.raises(ValueError, match="waveform_phase needs"):
+        triangular_group_reparameterisations(
+            names, 1187008882.4, waveform_phase="pkg.mod:phase",
+            phase_coordinates="arg-alpha-beta")
+    with pytest.raises(ValueError, match="waveform_phase needs"):
+        triangular_group_reparameterisations(
+            [n for n in names if n != "mass_ratio"], 1187008882.4,
+            waveform_phase="pkg.mod:phase")

@@ -733,6 +733,7 @@ def network_group_reparameterisations(
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -792,6 +793,10 @@ def network_group_reparameterisations(
         distance, as in
         :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
         Default ``False``.
+    waveform_phase : str, optional
+        The waveform's 22-mode phase, ``"module:function"``, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``None`` (merger phase).
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
@@ -805,6 +810,7 @@ def network_group_reparameterisations(
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,
+        waveform_phase=waveform_phase,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
@@ -839,6 +845,7 @@ def make_network_group_flow_proposal(
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -948,6 +955,7 @@ def make_network_group_flow_proposal(
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,
+        waveform_phase=waveform_phase,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),
