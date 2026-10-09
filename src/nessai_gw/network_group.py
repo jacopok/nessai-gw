@@ -732,6 +732,7 @@ def network_group_reparameterisations(
     doppler_vector=None,
     time_reference_frequency=None,
     time_to_merger=None,
+    chirp_distance_inversion=False,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -786,6 +787,11 @@ def network_group_reparameterisations(
         The waveform's time to merger, ``"module:function"``, as in
         :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
         Default ``None`` (2PN).
+    chirp_distance_inversion : bool, optional
+        Boundary inversion of the luminosity distance under the chirp
+        distance, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``False``.
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
@@ -798,6 +804,7 @@ def network_group_reparameterisations(
         doppler_vector=doppler_vector,
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
+        chirp_distance_inversion=chirp_distance_inversion,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
@@ -831,6 +838,7 @@ def make_network_group_flow_proposal(
     circular_sky_u=False,
     time_reference_frequency=None,
     time_to_merger=None,
+    chirp_distance_inversion=False,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -939,6 +947,7 @@ def make_network_group_flow_proposal(
         doppler_vector=doppler_vector,
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
+        chirp_distance_inversion=chirp_distance_inversion,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),

@@ -2171,6 +2171,7 @@ def triangular_group_reparameterisations(
     time_reference_frequency=None,
     time_frequency_range=(8.0, 300.0),
     time_to_merger=None,
+    chirp_distance_inversion=False,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2337,6 +2338,12 @@ def triangular_group_reparameterisations(
         (and reads ``chi_1`` / ``chi_2`` if sampled).  Default ``None`` (merger).
     time_frequency_range : tuple of float, optional
         Search range (Hz) for ``time_reference_frequency="adaptive"``.
+    chirp_distance_inversion : bool, optional
+        With ``chirp_distance``: reflect the luminosity distance about the
+        prior edge the live points pile up against, training on mirror copies
+        (see
+        :class:`~nessai_gw.reparameterisations.ChirpDistanceReparameterisation`).
+        Default ``False``.
     time_to_merger : str, optional
         ``"module:function"`` giving the waveform's time from each frequency to
         the merger (see
@@ -2467,6 +2474,8 @@ def triangular_group_reparameterisations(
                 "k0": chirp_distance_k0,
                 "fiducial": chirp_distance_fiducial,
             }
+            if chirp_distance_inversion:
+                reps[name]["boundary_inversion"] = True
         elif name == "chi_1" and effective_spin:
             reps[name] = {
                 "reparameterisation": "effective-spin",
@@ -2625,6 +2634,7 @@ def _prime_parameter_names(
     doppler_vector=None,
     time_reference_frequency=None,
     time_to_merger=None,
+    chirp_distance_inversion=False,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2690,6 +2700,7 @@ def _prime_parameter_names(
                 doppler_vector=doppler_vector,
                 time_reference_frequency=time_reference_frequency,
                 time_to_merger=time_to_merger,
+                chirp_distance_inversion=chirp_distance_inversion,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -3069,6 +3080,7 @@ def make_triangular_group_flow_proposal(
     circular_psi_phase=False,
     time_reference_frequency=None,
     time_to_merger=None,
+    chirp_distance_inversion=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -3399,6 +3411,7 @@ def make_triangular_group_flow_proposal(
             doppler_vector=doppler_vector,
             time_reference_frequency=time_reference_frequency,
             time_to_merger=time_to_merger,
+            chirp_distance_inversion=chirp_distance_inversion,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3698,6 +3711,7 @@ def make_et_group_flow_proposal(
     circular_psi_phase=False,
     time_reference_frequency=None,
     time_to_merger=None,
+    chirp_distance_inversion=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3744,4 +3758,5 @@ def make_et_group_flow_proposal(
         circular_psi_phase=circular_psi_phase,
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
+        chirp_distance_inversion=chirp_distance_inversion,
     )

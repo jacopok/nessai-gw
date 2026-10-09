@@ -20,6 +20,16 @@ docstring for why ``R_k0`` must be built on the *real* detector tensors (not
 the idealised triangle), why ``k0 = argmax_k |R_k(fiducial)|`` is the right way
 to pick the reference detector for the co-located ET-EMR sub-interferometers,
 and why the coordinate is invariant under the group actions.
+
+With ``boundary_inversion`` the prior edge of ``luminosity_distance`` the
+live points pile up against (typically the upper one: a source-frame-uniform
+prior grows towards ``d_max``) is reflected in the *physical* distance,
+``d -> 2 d_max - d``: the flow is trained on the live points plus their
+mirror copies (``chirp_distance = (2 d_max - d) / c``), so it sees no cliff
+at the edge, and draws past it are folded back.  The edge sits at a
+parameter-dependent ``chirp_distance = d_max / c``, so this cannot be done
+by a fixed-bound inversion in the prime space; the reflection leaves ``c``
+(hence the group invariance) untouched and has unit Jacobian.
 """
 
 from __future__ import annotations
@@ -69,6 +79,16 @@ class ChirpDistanceReparameterisation(Reparameterisation):
     chirp_mass, theta_jn, ra, dec, psi : str, optional
         Names of the parameters ``R_k0`` depends on (defaults match the
         standard ``xg_inference`` parameter names).
+    boundary_inversion : bool, optional
+        Reflect the luminosity distance about the prior edge the live points
+        pile up against (detected with :func:`nessai.utils.detect_edge` at
+        every :meth:`update`, i.e. before every training), training on mirror
+        copies and folding draws back.  Needs ``prior_bounds``.
+    inversion_bounds : sequence of str, optional
+        The edges that may be inverted, from ``"lower"``/``"upper"``
+        (default ``("upper",)``: the lower one sits near zero distance).
+    detect_edges_kwargs : dict, optional
+        Extra keyword arguments for :func:`nessai.utils.detect_edge`.
     """
 
     one_to_one = False
@@ -89,6 +109,9 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         psi="psi",
         prior=None,
         rng=None,
+        boundary_inversion=False,
+        inversion_bounds=("upper",),
+        detect_edges_kwargs=None,
         **kwargs,
     ):
         parent_params = inspect.signature(
@@ -167,6 +190,26 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         self._psi = psi
         self.requires = [chirp_mass, theta_jn, ra, dec, psi]
 
+        self.boundary_inversion = bool(boundary_inversion)
+        self.inversion_bounds = tuple(inversion_bounds)
+        if not set(self.inversion_bounds) <= {"lower", "upper"}:
+            raise ValueError(
+                f"inversion_bounds must be from 'lower'/'upper'; got "
+                f"{self.inversion_bounds}"
+            )
+        self.detect_edges_kwargs = dict(detect_edges_kwargs or {})
+        self._edge = None
+        if self.boundary_inversion:
+            if prior_bounds is None:
+                raise ValueError("boundary_inversion needs `prior_bounds`.")
+            bounds = (
+                prior_bounds["luminosity_distance"]
+                if isinstance(prior_bounds, dict) else prior_bounds
+            )
+            self.distance_bounds = tuple(
+                float(b) for b in np.asarray(bounds, dtype=float).ravel()
+            )
+
         self.prime_parameters = ["chirp_distance"]
         if hasattr(self, "output_parameters"):
             self.output_parameters = ["chirp_distance"]
@@ -189,12 +232,71 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         )[..., self.k0]
         return np.abs(r)
 
+    def _detect_edge(self, distance):
+        from nessai.utils import detect_edge
+
+        kwargs = dict(
+            x_range=self.distance_bounds,
+            allow_none=True,
+            allowed_bounds=list(self.inversion_bounds),
+        )
+        kwargs.update(self.detect_edges_kwargs)
+        edge = detect_edge(np.asarray(distance, dtype=float), **kwargs)
+        if edge == "both":     # a single reflection: take the denser edge
+            lo, hi = self.distance_bounds
+            d = np.asarray(distance, dtype=float)
+            edge = "upper" if np.median(d) > 0.5 * (lo + hi) else "lower"
+        self._edge = edge or False
+        logger.debug(
+            "ChirpDistanceReparameterisation: distance inversion at %s edge",
+            self._edge,
+        )
+
+    def _mirror(self, distance):
+        lo, hi = self.distance_bounds
+        return 2.0 * (hi if self._edge == "upper" else lo) - distance
+
     def reparameterise(self, x, x_prime, log_j, **kwargs):
         c = x[self._chirp_mass] ** (5.0 / 6.0) * self._abs_r(x)
         x_prime[self.prime_parameters[0]] = x["luminosity_distance"] / c
-        return x, x_prime, log_j - np.log(c)
+        log_j = log_j - np.log(c)
+        if self.boundary_inversion:
+            if self._edge is None:
+                self._detect_edge(x["luminosity_distance"])
+            if self._edge:
+                # mirror copies in a block after the originals (the
+                # reflection has unit Jacobian, so log_j is shared)
+                x_inv = x_prime.copy()
+                x_inv[self.prime_parameters[0]] = (
+                    self._mirror(x["luminosity_distance"]) / c
+                )
+                x_prime = np.concatenate([x_prime, x_inv])
+                x = np.concatenate([x, x])
+                log_j = np.concatenate([log_j, log_j])
+        return x, x_prime, log_j
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
         c = x[self._chirp_mass] ** (5.0 / 6.0) * self._abs_r(x)
-        x["luminosity_distance"] = x_prime[self.prime_parameters[0]] * c
+        distance = x_prime[self.prime_parameters[0]] * c
+        if self.boundary_inversion and self._edge:
+            lo, hi = self.distance_bounds
+            past = distance > hi if self._edge == "upper" else distance < lo
+            distance = np.where(past, self._mirror(distance), distance)
+        x["luminosity_distance"] = distance
         return x, x_prime, log_j + np.log(c)
+
+    def update(self, x, x_prime=None):
+        """Re-detect the inversion edge on the points about to be trained on."""
+        if self.boundary_inversion:
+            self._detect_edge(x["luminosity_distance"])
+
+    def reset(self):
+        self._edge = None
+
+    def __setstate__(self, state):
+        # checkpoints pickled before boundary inversion existed
+        state.setdefault("boundary_inversion", False)
+        state.setdefault("inversion_bounds", ("upper",))
+        state.setdefault("detect_edges_kwargs", {})
+        state.setdefault("_edge", None)
+        self.__dict__.update(state)

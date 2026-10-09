@@ -382,3 +382,186 @@ def test_triangular_wiring_without_distance_is_a_no_op():
     assert triangular_group_reparameterisations(
         names, REFERENCE_TIME, chirp_distance=True,
     ) == triangular_group_reparameterisations(names, REFERENCE_TIME)
+
+
+# ---------------------------------------------------------------------------
+# Boundary inversion of the luminosity distance
+# ---------------------------------------------------------------------------
+
+D_BOUNDS = (1.0, 100.0)
+
+
+@pytest.fixture
+def inverting(tensors, gmst):
+    return ChirpDistanceReparameterisation(
+        parameters="luminosity_distance",
+        prior_bounds={"luminosity_distance": D_BOUNDS},
+        tensors=tensors,
+        gmst=gmst,
+        fiducial=FIDUCIAL,
+        boundary_inversion=True,
+    )
+
+
+def piled_up_points(n, seed=0):
+    """Distances growing as d^2 up to the upper prior edge, as a
+    source-frame-uniform prior cut by a weak likelihood."""
+    d_l, *rest = random_points(n, seed=seed)
+    rng = np.random.default_rng(seed + 100)
+    d_l = D_BOUNDS[1] * rng.uniform(0.1, 1.0, n) ** (1 / 3)
+    return structured(d_l, *rest)
+
+
+def test_boundary_inversion_needs_prior_bounds(tensors, gmst):
+    with pytest.raises(ValueError, match="prior_bounds"):
+        ChirpDistanceReparameterisation(
+            parameters="luminosity_distance", tensors=tensors, gmst=gmst,
+            k0=0, boundary_inversion=True,
+        )
+
+
+def test_boundary_inversion_bounds_are_checked(tensors, gmst):
+    with pytest.raises(ValueError, match="inversion_bounds"):
+        ChirpDistanceReparameterisation(
+            parameters="luminosity_distance", tensors=tensors, gmst=gmst,
+            k0=0, prior_bounds={"luminosity_distance": D_BOUNDS},
+            boundary_inversion=True, inversion_bounds=("top",),
+        )
+
+
+def test_boundary_inversion_mirrors_and_folds(inverting):
+    n = 2000
+    x = piled_up_points(n, seed=3)
+    inverting.update(x)
+    assert inverting._edge == "upper"
+    x_prime = np.zeros(n, dtype=[("chirp_distance", "f8")])
+    x2, x_prime, log_j = inverting.reparameterise(x.copy(), x_prime, np.zeros(n))
+    assert len(x2) == len(x_prime) == len(log_j) == 2 * n
+    c = x["chirp_mass"] ** (5 / 6) * inverting._abs_r(x)
+    np.testing.assert_allclose(x_prime["chirp_distance"][:n] * c,
+                               x["luminosity_distance"])
+    # the mirror copies sit past the edge, reflected in the physical distance
+    np.testing.assert_allclose(x_prime["chirp_distance"][n:] * c,
+                               2 * D_BOUNDS[1] - x["luminosity_distance"])
+    np.testing.assert_array_equal(log_j[:n], log_j[n:])
+    # both copies map back to the same physical point, with the inverse
+    # Jacobian minus the forward one
+    back = np.concatenate([x, x])
+    back["luminosity_distance"] = 0.0
+    back, _, log_j_inv = inverting.inverse_reparameterise(
+        back, x_prime, np.zeros(2 * n)
+    )
+    np.testing.assert_allclose(
+        back["luminosity_distance"], np.tile(x["luminosity_distance"], 2),
+        rtol=1e-12,
+    )
+    np.testing.assert_allclose(log_j + log_j_inv, 0.0, atol=1e-10)
+
+
+def test_boundary_inversion_skipped_without_an_edge(inverting):
+    n = 2000
+    x = piled_up_points(n, seed=4)
+    x["luminosity_distance"] = np.random.default_rng(4).normal(40.0, 8.0, n)
+    inverting.update(x)
+    assert inverting._edge is False
+    x_prime = np.zeros(n, dtype=[("chirp_distance", "f8")])
+    _, x_prime, _ = inverting.reparameterise(x, x_prime, np.zeros(n))
+    assert len(x_prime) == n
+    # and nothing is folded on the way back
+    x_prime["chirp_distance"] *= 3.0
+    back, _, _ = inverting.inverse_reparameterise(
+        x.copy(), x_prime, np.zeros(n)
+    )
+    assert back["luminosity_distance"].max() > D_BOUNDS[1]
+
+
+def test_boundary_inversion_detects_lazily_after_reset(inverting):
+    n = 2000
+    x = piled_up_points(n, seed=5)
+    inverting.reset()
+    assert inverting._edge is None
+    x_prime = np.zeros(n, dtype=[("chirp_distance", "f8")])
+    _, x_prime, _ = inverting.reparameterise(x, x_prime, np.zeros(n))
+    assert inverting._edge == "upper" and len(x_prime) == 2 * n
+
+
+def test_old_pickles_load_without_inversion(reparam):
+    import pickle
+
+    state = dict(reparam.__dict__)
+    for key in ("boundary_inversion", "inversion_bounds",
+                "detect_edges_kwargs", "_edge"):
+        state.pop(key)
+    old = ChirpDistanceReparameterisation.__new__(ChirpDistanceReparameterisation)
+    old.__setstate__(state)
+    old = pickle.loads(pickle.dumps(old))
+    assert old.boundary_inversion is False
+    x = piled_up_points(10)
+    x_prime = np.zeros(10, dtype=[("chirp_distance", "f8")])
+    _, x_prime, _ = old.reparameterise(x, x_prime, np.zeros(10))
+    assert len(x_prime) == 10
+
+
+def test_triangular_wiring_boundary_inversion():
+    reps = triangular_group_reparameterisations(
+        WIRING_PARAMETERS, REFERENCE_TIME, chirp_distance=True,
+        chirp_distance_k0=0, chirp_distance_inversion=True,
+    )
+    assert reps["luminosity_distance"]["boundary_inversion"] is True
+    reps = triangular_group_reparameterisations(
+        WIRING_PARAMETERS, REFERENCE_TIME, chirp_distance=True,
+        chirp_distance_k0=0,
+    )
+    assert "boundary_inversion" not in reps["luminosity_distance"]
+
+
+def test_boundary_inversion_in_a_proposal():
+    """Through GWFlowProposal: mirror copies come in blocks of n rows, each
+    mapping back to the live points (with the mass-ratio inversion, too)."""
+    from nessai.livepoint import empty_structured_array
+    from nessai.model import Model
+
+    from nessai_gw.proposals import GWFlowProposal
+
+    names = ["luminosity_distance", "chirp_mass", "mass_ratio", "theta_jn",
+             "ra", "dec", "psi"]
+    bounds = {
+        "luminosity_distance": D_BOUNDS, "chirp_mass": (15.0, 60.0),
+        "mass_ratio": (0.5, 1.0), "theta_jn": (0.0, np.pi),
+        "ra": (0.0, 2 * np.pi), "dec": (-np.pi / 2, np.pi / 2),
+        "psi": (0.0, np.pi),
+    }
+
+    class _Model(Model):
+        def __init__(self):
+            self.names = list(names)
+            self.bounds = {k: np.asarray(v, dtype=float) for k, v in bounds.items()}
+
+        def log_prior(self, x):
+            return np.zeros(len(np.atleast_1d(x)))
+
+        def log_likelihood(self, x):
+            return np.zeros(len(np.atleast_1d(x)))
+
+    reps = triangular_group_reparameterisations(
+        names, REFERENCE_TIME, chirp_distance=True, chirp_distance_k0=0,
+        chirp_distance_inversion=True,
+    )
+    proposal = GWFlowProposal(_Model(), poolsize=100, reparameterisations=reps,
+                              fallback_reparameterisation="zscore")
+    proposal.set_rescaling()
+    n = 500
+    pts = piled_up_points(n, seed=7)
+    x = empty_structured_array(n, names=names)
+    rng = np.random.default_rng(8)
+    for name in names:
+        x[name] = pts[name] if name in pts.dtype.names else rng.uniform(*bounds[name], n)
+    proposal.check_state(x)
+    x_prime, log_j = proposal.rescale(x.copy())
+    assert len(x_prime) % n == 0 and len(x_prime) >= 2 * n
+    x_back, log_j_back = proposal.inverse_rescale(x_prime)
+    for k in range(len(x_prime) // n):
+        rows = slice(k * n, (k + 1) * n)
+        np.testing.assert_allclose(x_back["luminosity_distance"][rows],
+                                   x["luminosity_distance"], rtol=1e-10)
+    np.testing.assert_allclose(log_j + log_j_back, 0.0, atol=1e-8)
