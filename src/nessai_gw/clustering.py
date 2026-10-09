@@ -386,6 +386,23 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
             canon, _ = e._from_base(t)
         return split_coordinates(canon.cpu().numpy(), list(e.param_names))
 
+    def _gaussian_frame(self, t):
+        """``t`` without the columns the routing frame zeroes.
+
+        :meth:`_fold_to_base` sets circular dims (e.g. ``circular-psi-phase``)
+        to zero for nearest-centroid routing; left in, those constant columns
+        make every covariance singular, the gain ``-inf`` and the split
+        impossible.  Any other zero-variance column is dropped too.
+        """
+        t = np.asarray(t, dtype=float)
+        keep = np.ones(t.shape[1], dtype=bool)
+        experts = getattr(self, "experts", None)
+        idx = getattr(experts[0], "_circular_idx", None) if experts else None
+        if idx is not None and idx.numel():
+            keep[idx.cpu().numpy()] = False
+        keep &= t.std(axis=0) > 0
+        return t[:, keep]
+
     def _split_labels(self, c, v):
         """1 on the (higher-``sky_v``) clump side of the stored line, else 0."""
         normal = self._split_normal.cpu().numpy()
@@ -424,10 +441,11 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         )
 
         c, v = self._split_coords(t)
+        t_gauss = self._gaussian_frame(t)
         fit = fit_live_diagonal_split(
             c,
             v,
-            t,
+            t_gauss,
             n_angles=self.n_angles,
             n_offsets=self.n_offsets,
             min_fraction=self.activate_fraction,
@@ -436,7 +454,7 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         dying = False
         if bool(self._split_fitted):
             cur_lab = self._split_labels(c, v)
-            cur_gain = gaussian_split_gain(t, cur_lab)
+            cur_gain = gaussian_split_gain(t_gauss, cur_lab)
             n_cur = int(min(cur_lab.sum(), len(cur_lab) - cur_lab.sum()))
             dying = (
                 active

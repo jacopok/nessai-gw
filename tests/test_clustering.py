@@ -115,6 +115,17 @@ def test_k_want_activates_on_heteroscedastic_split():
     assert np.mean(w._split_labels(t[:, 0], t[:, 1]) == truth) > 0.97
 
 
+def test_k_want_ignores_zeroed_circular_columns():
+    """The routing frame zeroes circular dims (``circular-psi-phase``): the
+    constant columns must not make the gain -inf and block the split."""
+    _, _, t, truth = _two_populations()
+    t = np.column_stack([t[:, :4], np.zeros(len(t)), t[:, 4:], np.zeros(len(t))])
+    w = _FakeWrapper()
+    assert w._k_want(t, None, None, None) == 2
+    assert np.isfinite(float(w._split_gain)) and float(w._split_gain) > 1.0
+    assert np.mean(w._split_labels(t[:, 0], t[:, 1]) == truth) > 0.97
+
+
 def test_k_want_stays_one_on_single_gaussian():
     t = np.random.default_rng(4).normal(size=(6000, 6))
     assert _FakeWrapper()._k_want(t, None, None, None) == 1
