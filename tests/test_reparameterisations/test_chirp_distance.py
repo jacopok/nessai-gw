@@ -1,6 +1,8 @@
 """Tests for the Roulet et al. (arXiv:2207.03508) chirp-distance
 reparameterisation."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -176,6 +178,19 @@ def test_round_trip(reparam):
     assert np.abs(back["luminosity_distance"] - d_l).max() < 1e-8
     # the inverse Jacobian is minus the forward one at the same point
     assert np.abs(log_j + log_j_inv).max() < 1e-8
+
+
+def test_inverse_is_quiet_for_negative_chirp_mass(reparam):
+    """A flow draw with chirp mass < 0 gives NaN without a warning (the
+    prior-bounds check rejects it)."""
+    x = structured(*random_points(3, seed=2))
+    x["chirp_mass"][0] = -1.0
+    x_prime = np.ones(len(x), dtype=[("chirp_distance", "f8")])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        x, _, _ = reparam.inverse_reparameterise(x, x_prime, np.zeros(len(x)))
+    assert np.isnan(x["luminosity_distance"][0])
+    assert np.isfinite(x["luminosity_distance"][1:]).all()
 
 
 def test_round_trip_matches_inverse_function(reparam, tensors, gmst):

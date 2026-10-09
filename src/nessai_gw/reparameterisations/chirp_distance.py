@@ -276,7 +276,10 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         return x, x_prime, log_j
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
-        c = x[self._chirp_mass] ** (5.0 / 6.0) * self._abs_r(x)
+        # NaN for flow draws with chirp mass < 0, which the prior-bounds
+        # check rejects
+        with np.errstate(invalid="ignore"):
+            c = x[self._chirp_mass] ** (5.0 / 6.0) * self._abs_r(x)
         distance = x_prime[self.prime_parameters[0]] * c
         if self.boundary_inversion and self._edge:
             lo, hi = self.distance_bounds

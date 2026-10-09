@@ -490,6 +490,10 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         return x, x_prime, log_j + self._log_j
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
-        t_det = x_prime[self.prime_parameters[0]] * self.scale + self._shift(x)
+        # flow draws outside the prior (chirp mass < 0, q <= 0) give NaN
+        # here; they are rejected by the prior-bounds check on those masses
+        with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+            shift = self._shift(x)
+        t_det = x_prime[self.prime_parameters[0]] * self.scale + shift
         x["geocent_time"] = self._reference_time + (t_det - self._delay(x))
         return x, x_prime, log_j - self._log_j

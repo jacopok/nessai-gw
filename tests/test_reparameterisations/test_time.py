@@ -1,5 +1,7 @@
 """Tests for :class:`DetectorCenterTimeReparameterisation`."""
 
+import warnings
+
 import numpy as np
 import pytest
 from nessai.livepoint import dict_to_live_points, empty_structured_array
@@ -233,6 +235,22 @@ def test_reference_frequency_round_trip(doppler_vector):
         x["geocent_time"] - REFERENCE_TIME, atol=1e-12,
     )
     np.testing.assert_allclose(log_j_out, 0.0, atol=1e-10)
+
+
+def test_inverse_is_quiet_outside_the_prior():
+    """Flow draws with chirp mass < 0 or q <= 0 give NaN without warnings
+    (the prior-bounds check on the masses rejects them)."""
+    reparam = _ref_reparam(doppler_vector=DOPPLER)
+    x = _full_points(4, 6)
+    _, x_prime, log_j = _forward(reparam, x)
+    x["chirp_mass"][0] = -1.0
+    x["mass_ratio"][1] = 0.0
+    x["mass_ratio"][2] = -1.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        x_out, _, _ = reparam.inverse_reparameterise(x, x_prime, log_j)
+    assert np.isnan(x_out["geocent_time"][:3]).all()
+    assert np.isfinite(x_out["geocent_time"][3])
 
 
 def test_reference_frequency_is_merger_time_minus_tau():
