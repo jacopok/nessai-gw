@@ -810,6 +810,16 @@ def test_network_proposal_circular_options(geometry):
     assert fm.canonical_transform.circles["sky_u"][0] == 0.2
     assert fm.base_reparam_factory is None
     assert isinstance(fm.base_symmetry, BaselineFlipSymmetry)
+    assert not fm.circular_standardisation
+    fm = make_network_group_flow_proposal(
+        PARAMETERS, geometry, circular_psi_phase=True, circular_sky_u=True,
+        circular_standardisation=True,
+    )._FlowModelClass
+    assert fm.circular_standardisation
+    with pytest.raises(ValueError, match="circular angles"):
+        make_network_group_flow_proposal(
+            PARAMETERS, geometry, circular_standardisation=True
+        )
     with pytest.raises(ValueError, match="circular_psi_phase"):
         make_network_group_flow_proposal(
             PARAMETERS, geometry, circular_sky_u=True

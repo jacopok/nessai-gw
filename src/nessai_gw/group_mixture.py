@@ -3120,6 +3120,7 @@ def make_triangular_group_flow_proposal(
     effective_tidal_deformability=False,
     doppler_vector=None,
     circular_psi_phase=False,
+    circular_standardisation=False,
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
@@ -3320,6 +3321,13 @@ def make_triangular_group_flow_proposal(
         ``phase_reflection``, the ``polarisation-phase`` coordinates and
         ``polarisation_offset = 0``; incompatible with ``phase_recanon``.
         With ``adaptive_domain`` only the sky seam moves.  Default ``False``.
+    circular_standardisation : bool, optional
+        Standardise the circular ``psi_prime`` / ``delta_phase`` as well:
+        each is rotated to its mean direction and spread over the circle by a
+        Möbius map fitted to the live points (nessai's
+        ``circular_standardisation``), so a tightly measured angle reaches the
+        uniform latent as an O(1) shape rather than a spike.  Needs
+        ``circular_psi_phase``.  Default ``False``.
     adaptive_domain : bool, optional
         Give every group-mixture expert an :class:`AdaptiveFundamentalDomain`
         ``base_reparam``: each expert moves the sky, ``psi`` and
@@ -3570,6 +3578,17 @@ def make_triangular_group_flow_proposal(
                 inner=gm_kwargs.get("canonical_transform"),
             )
             gm_kwargs["circular_parameters"] = list(circles)
+            if circular_standardisation:
+                if "circular_standardisation" not in _gm_params:
+                    raise RuntimeError(
+                        "circular_standardisation requires a version of "
+                        "nessai whose make_group_mixture_flow accepts it."
+                    )
+                gm_kwargs["circular_standardisation"] = True
+        elif circular_standardisation:
+            raise RuntimeError(
+                "circular_standardisation needs circular_psi_phase."
+            )
         flow_model_cls = _make_flow_model(
             group_action_fn=action,  # ignored on the prime-space path
             group_size=base_action.group_size,
@@ -3753,6 +3772,7 @@ def make_et_group_flow_proposal(
     effective_tidal_deformability=False,
     doppler_vector=None,
     circular_psi_phase=False,
+    circular_standardisation=False,
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
@@ -3801,6 +3821,7 @@ def make_et_group_flow_proposal(
         phase_recanon=phase_recanon,
         adaptive_domain=adaptive_domain,
         circular_psi_phase=circular_psi_phase,
+        circular_standardisation=circular_standardisation,
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,

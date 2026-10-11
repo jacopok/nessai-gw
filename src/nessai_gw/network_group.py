@@ -842,6 +842,7 @@ def make_network_group_flow_proposal(
     sky_u_offset=0.0,
     circular_psi_phase=False,
     circular_sky_u=False,
+    circular_standardisation=False,
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
@@ -915,6 +916,13 @@ def make_network_group_flow_proposal(
         probit-mapped.  With ``baseline_flip`` the base flow models the whole
         ``sky_u`` circle summed over the half-turn (:class:`BaselineFlipSymmetry`).
         Needs ``circular_psi_phase``.  Default ``False``.
+    circular_standardisation : bool, optional
+        Standardise the circular angles as well: each is rotated to its mean
+        direction and spread over the circle by a Möbius map fitted to the
+        live points (nessai's ``circular_standardisation``), so a tightly
+        measured angle (``delta_phase``, ``sky_u`` late in a run) reaches the
+        uniform latent as an O(1) shape rather than a spike.  Needs circular
+        angles.  Default ``False``.
     time_reference_frequency : optional
         Must match :func:`network_group_reparameterisations` (the prime names
         do not depend on it; the probe checks the order of the inverse pass
@@ -1014,6 +1022,15 @@ def make_network_group_flow_proposal(
         gm_kwargs["circular_parameters"] = list(circles)
         if circular_sky_u and baseline_flip:
             gm_kwargs["base_symmetry"] = BaselineFlipSymmetry(prime_names)
+        if circular_standardisation:
+            if "circular_standardisation" not in gm_params:
+                raise RuntimeError(
+                    "circular_standardisation requires a version of nessai "
+                    "whose make_group_mixture_flow accepts it."
+                )
+            gm_kwargs["circular_standardisation"] = True
+    elif circular_standardisation:
+        raise ValueError("circular_standardisation needs circular angles.")
     if canonical is not None:
         if "canonical_transform" not in gm_params:
             raise RuntimeError(

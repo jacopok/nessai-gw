@@ -284,16 +284,20 @@ def _check_trained_proposal(proposal, model, live):
 
 
 @requires_circular
-@pytest.mark.parametrize("adaptive_domain", [False, True])
-def test_et_proposal_circular_end_to_end(tmp_path, adaptive_domain):
+@pytest.mark.parametrize(
+    "adaptive_domain, standardise", [(False, False), (True, False), (True, True)]
+)
+def test_et_proposal_circular_end_to_end(tmp_path, adaptive_domain, standardise):
     cls = make_et_group_flow_proposal(
         BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
         polarisation_quarter=True, psi_single=True, sky_2d="auto",
         gaussianise_sky=True, adaptive_domain=adaptive_domain,
         circular_psi_phase=True, log_mass_ratio=False,
+        circular_standardisation=standardise,
     )
     fm = cls._FlowModelClass
     assert fm.circular_parameters == ["psi_prime", "delta_phase"]
+    assert fm.circular_standardisation == standardise
     assert isinstance(fm.canonical_transform, CircularCanonicalTransform)
     model = _stub_model()
     proposal = cls(
@@ -315,10 +319,16 @@ def test_et_proposal_circular_end_to_end(tmp_path, adaptive_domain):
         proposal, model, _prior_live_points(model, 1000)
     )
     assert set(circ) == {"psi_prime", "delta_phase"}
+    assert proposal.flow.model.circular_standardisation == standardise
 
 
 @requires_circular
 def test_et_proposal_circular_incompatibilities():
+    with pytest.raises(RuntimeError, match="circular_standardisation"):
+        make_et_group_flow_proposal(
+            BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
+            polarisation_quarter=True, circular_standardisation=True,
+        )
     with pytest.raises(RuntimeError, match="phase_recanon"):
         make_et_group_flow_proposal(
             BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
