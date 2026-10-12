@@ -828,3 +828,13 @@ def test_network_proposal_circular_options(geometry):
         make_network_group_flow_proposal(
             PARAMETERS, geometry, circular_psi_phase=True, psi_offset=0.3
         )
+    # phase_recanon: the adaptive domain picks each expert's torus basis,
+    # even with every seam circular
+    fm = make_network_group_flow_proposal(
+        PARAMETERS, geometry, circular_psi_phase=True, circular_sky_u=True,
+        baseline_flip=True, phase_recanon=True,
+    )._FlowModelClass
+    dom = fm.base_reparam_factory()
+    assert dom.allow_phase_mode and dom.circular_psi_phase
+    with pytest.raises(ValueError, match="phase_recanon"):
+        make_network_group_flow_proposal(PARAMETERS, geometry, phase_recanon=True)

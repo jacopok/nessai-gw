@@ -515,12 +515,21 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
     stays in ``[0, P)`` (``P = action.sky_u_period``), so a
     :class:`~nessai_gw.group_mixture.SkyOctantProbit` with ``u_scale = 1/P``
     still applies after it.
+
+    With ``circular_psi_phase`` the ``psi`` / ``delta_phase`` seams stay at
+    zero and, with ``allow_phase_mode``, each expert picks its basis of the
+    ``(psi_prime, delta_phase)`` torus instead, as in the parent class (e.g.
+    ``phase mod pi/2`` where the phase is pinned rather than ``delta_phase``).
     """
 
     def __init__(self, action, param_names=None, circular_psi_phase=False,
-                 circular_sky_u=False):
+                 circular_sky_u=False, allow_phase_mode=False):
+        if allow_phase_mode and not circular_psi_phase:
+            raise ValueError(
+                "AdaptiveNetworkDomain: allow_phase_mode needs circular_psi_phase"
+            )
         super().__init__(
-            action, param_names, allow_phase_mode=False,
+            action, param_names, allow_phase_mode=allow_phase_mode,
             circular_psi_phase=circular_psi_phase,
         )
         #: ``sky_u`` is an angle of a circular base flow: keep its seam.
@@ -597,6 +606,8 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
         if canon.shape[0] < self.min_points:
             return False
         before = self._state()
+        torus_before = self._torus_mn()
+        torus_note = ""
         (cu, cpsi, cdel, _), _ = before
         du = dpsi = ddel = float("nan")
         if self._iu is not None and not getattr(self, "circular_sky_u", False):
@@ -606,6 +617,9 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
             cu = cu * p
         if getattr(self, "circular_psi_phase", False):
             cpsi = cdel = 0.0
+            if self.allow_phase_mode:
+                z, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
+                torus_note = self._update_torus(z)
         else:
             z, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
             psi = (z[:, self._ipsi] + 1).double().cpu().numpy()
@@ -620,7 +634,7 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
         self._seen.fill_(True)
         changed = any(
             abs(a - b) > 1e-12 for a, b in zip(self._state()[0], before[0])
-        )
+        ) or self._torus_mn() != torus_before
         logger.debug(
             "Adaptive network domain: seams sky_u %.4f psi %.4f delta %.4f; "
             "density at old seams sky %.2f psi %.2f delta %.2f (x uniform), "
@@ -632,6 +646,11 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
             [("sky_u", cu, du), ("psi", cpsi, dpsi), ("delta", cdel, ddel)],
             changed,
         )
+        if torus_note:
+            self._retrain_note = (
+                torus_note + "; " + self._retrain_note
+                if self._retrain_note else torus_note
+            )
         return changed
 
 
@@ -847,6 +866,7 @@ def make_network_group_flow_proposal(
     time_to_merger=None,
     chirp_distance_inversion=False,
     waveform_phase=None,
+    phase_recanon=False,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -927,7 +947,17 @@ def make_network_group_flow_proposal(
         Must match :func:`network_group_reparameterisations` (the prime names
         do not depend on it; the probe checks the order of the inverse pass
         with it).  Default ``None``.
+    phase_recanon : bool, optional
+        Let each expert's :class:`AdaptiveNetworkDomain` pick its basis of the
+        ``(psi_prime, delta_phase)`` torus off its live points (``delta_phase``
+        on a clump, ``phase mod pi/2`` where the phase is pinned instead).
+        Needs ``circular_psi_phase`` and ``adaptive_domain``.  Default
+        ``False``.
     """
+    if phase_recanon and not (circular_psi_phase and adaptive_domain):
+        raise ValueError(
+            "phase_recanon needs circular_psi_phase and adaptive_domain."
+        )
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
     except ImportError as exc:  # pragma: no cover - depends on nessai version
@@ -1040,7 +1070,7 @@ def make_network_group_flow_proposal(
         gm_kwargs["canonical_transform"] = canonical
     # with circular angles the adaptive domain only has the sky_u seam left
     # to move, and none if sky_u is circular too
-    moves_seams = not circular_psi_phase or (
+    moves_seams = not circular_psi_phase or bool(phase_recanon) or (
         "sky_u" in prime_names and not circular_sky_u
     )
     if adaptive_domain and moves_seams:
@@ -1053,6 +1083,7 @@ def make_network_group_flow_proposal(
             AdaptiveNetworkDomain, action, list(prime_names),
             circular_psi_phase=bool(circular_psi_phase),
             circular_sky_u=bool(circular_sky_u),
+            allow_phase_mode=bool(phase_recanon),
         )
 
     flow_model_cls = make_flow(

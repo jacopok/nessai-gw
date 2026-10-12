@@ -461,3 +461,37 @@ def test_et_proposal_circular_incompatibilities():
             BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=False,
             polarisation_quarter=True, circular_psi_phase=True,
         )
+
+
+@pytest.mark.parametrize("baseline_flip", [False, True])
+@pytest.mark.parametrize("mn", [(1, -2), (1, 1), (2, -1)])
+def test_network_torus_basis_round_trip(baseline_flip, mn):
+    action = PrimeSpacePolarisationPhaseAction(PRIME, baseline_flip=baseline_flip)
+    canon = _canonical_points(2000)
+    dom = AdaptiveNetworkDomain(
+        action, PRIME, circular_psi_phase=True, allow_phase_mode=True
+    )
+    dom._torus.copy_(torch.tensor(mn))
+    y = dom.forward(canon)
+    assert dom._box_valid(y, False).all()
+    np.testing.assert_allclose(dom.inverse(y), canon, atol=1e-9)
+
+
+@pytest.mark.parametrize("baseline_flip", [False, True])
+def test_network_torus_basis_follows_the_pinned_combination(baseline_flip):
+    action = PrimeSpacePolarisationPhaseAction(PRIME, baseline_flip=baseline_flip)
+    canon = _canonical_points(2000)
+    dom = AdaptiveNetworkDomain(
+        action, PRIME, circular_psi_phase=True, circular_sky_u=True,
+        allow_phase_mode=True,
+    )
+    assert not dom.update(_pinned(canon, PRIME, (0, 1)))
+    assert dom._identity()
+    plateau = _pinned(canon, PRIME, (1, -2))
+    assert dom.update(plateau)
+    assert dom._torus_mn() == (1, -2)
+    b = dom.forward(plateau)[:, PRIME.index("delta_phase")].numpy()
+    assert abs(np.mean(np.exp(2j * np.pi * b))) > 0.95
+    with pytest.raises(ValueError, match="allow_phase_mode"):
+        AdaptiveNetworkDomain(action, PRIME, allow_phase_mode=True)
+
