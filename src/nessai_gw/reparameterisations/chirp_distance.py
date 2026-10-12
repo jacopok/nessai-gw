@@ -221,16 +221,35 @@ class ChirpDistanceReparameterisation(Reparameterisation):
             )
 
     # ------------------------------------------------------------------
-    def _abs_r(self, x):
+    def set_gmst(self, gmst):
+        """Evaluate the response at the Earth's orientation ``gmst`` (a
+        moved reference epoch) instead of at the merger's."""
+        self.gmst = float(gmst)
+
+    def _abs_r(self, x, gmst=None):
         r = response_R(
             self.tensors,
             x[self._ra],
             x[self._dec],
             x[self._psi],
             x[self._theta_jn],
-            self.gmst,
+            self.gmst if gmst is None else gmst,
         )[..., self.k0]
         return np.abs(r)
+
+    def log_spread(self, x, gmsts):
+        """Standard deviation over ``x`` of the log chirp distance with the
+        response at each of ``gmsts``: how well that epoch's coordinate
+        strips the antenna pattern from the measured amplitude."""
+        log_m = (5.0 / 6.0) * np.log(np.asarray(x[self._chirp_mass], float))
+        log_d = np.log(np.asarray(x["luminosity_distance"], float))
+        out = np.empty(len(gmsts))
+        for i, g in enumerate(gmsts):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                v = log_d - log_m - np.log(self._abs_r(x, gmst=g))
+            v = v[np.isfinite(v)]
+            out[i] = np.std(v) if len(v) > 1 else np.inf
+        return out
 
     def _detect_edge(self, distance):
         from nessai.utils import detect_edge

@@ -281,6 +281,13 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
             )
         self._log_j = -float(np.log(self.scale))
 
+    def set_gmst(self, gmst):
+        """Evaluate the geocentre-to-detector delay at the Earth's
+        orientation ``gmst`` (a moved reference epoch) instead of at the
+        merger's: the detector-centre time then stays invariant under the
+        group acting in that epoch's frame."""
+        self._gmst = float(gmst)
+
     def _delay(self, x):
         return geocenter_time_delay(
             self._vertex, self._gmst, x["ra"], x["dec"]

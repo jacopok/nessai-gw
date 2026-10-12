@@ -69,6 +69,10 @@ class RotatedAnglePair(AnglePair):
             a = 1.0 / float(radial_sigma) ** 2
             self.chi = stats.gamma(a=a, scale=1.0 / a)
 
+    def set_rotation(self, rotation):
+        """Replace the frame rotation (a moved reference epoch)."""
+        self._rotation = np.asarray(rotation, dtype=float)
+
     @property
     def _cartesian_names(self):
         """The three Cartesian coordinate names (nessai-version agnostic)."""
@@ -191,6 +195,10 @@ class EqualAreaSky(Reparameterisation):
                 f"EqualAreaSky needs ra in [0, 2pi]; got {(ra_lo, ra_hi)}"
             )
         self.prime_prior_bounds = {"sky_u": [0.0, 1.0], "sky_v": [0.0, 1.0]}
+
+    def set_rotation(self, rotation):
+        """Replace the frame rotation (a moved reference epoch)."""
+        self._R = np.asarray(rotation, dtype=float)
 
     # -- transform -----------------------------------------------------------
 

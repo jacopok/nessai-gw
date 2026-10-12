@@ -158,6 +158,7 @@ import torch
 from . import nessai_logger
 from ._geometry import SPEED_OF_LIGHT as _SPEED_OF_LIGHT
 from ._geometry import greenwich_mean_sidereal_time as _greenwich_mean_sidereal_time
+from ._geometry import gmst_hours_before
 
 logger = nessai_logger.getChild(__name__)
 
@@ -438,7 +439,6 @@ class TriangularDetectorGroupAction:
             if self.phase_reflection
             else TRIANGULAR_DETECTOR_GROUP_SIZE
         )
-        self.gmst = _greenwich_mean_sidereal_time(self.reference_time)
         self.plane_normal = np.asarray(plane_normal, dtype=float)
         self._basis_np = _detector_frame_basis(
             self.plane_normal, self.azimuth_offset
@@ -446,7 +446,20 @@ class TriangularDetectorGroupAction:
         self._basis = torch.as_tensor(self._basis_np, dtype=torch.float64)
         self.vertex = np.asarray(vertex, dtype=float)
         self._vertex = torch.as_tensor(self.vertex, dtype=torch.float64)
+        #: GMST at the merger; :meth:`set_gmst` moves the frame away from it
+        self.merger_gmst = _greenwich_mean_sidereal_time(self.reference_time)
+        self.set_gmst(self.merger_gmst)
 
+    def set_gmst(self, gmst):
+        """Place the detector frame at the Earth's orientation ``gmst``.
+
+        The group acts in the frame of the detector at one instant (by
+        default the merger).  For a signal that lasts hours the response
+        rotates with the Earth, and the near-degeneracies are those of the
+        frame at the epoch the data constrain the most
+        (:class:`ReferenceEpoch`).
+        """
+        self.gmst = float(gmst)
         # Equatorial (ra-based) Cartesian sky vector -> detector-frame vector,
         # with GMST folded in: ``w_f = R @ w_eq`` where
         # ``w_eq = (cos dec cos ra, cos dec sin ra, sin dec)`` and ``w_f`` is
@@ -825,6 +838,26 @@ class PrimeSpaceTriangularGroupAction:
             action.sky_frame_rotation, dtype=torch.float64
         )
         self.bind(prime_names)
+
+    def set_gmst(self, gmst):
+        """Move the group's detector frame (and the flow's sky frame it
+        decodes) to the Earth's orientation ``gmst``."""
+        if self._ellipse is not None:
+            raise NotImplementedError(
+                "a movable frame is not supported with the polarisation "
+                "ellipse")
+        self._action.set_gmst(gmst)
+        self._sky_R = torch.as_tensor(
+            self._action.sky_frame_rotation, dtype=torch.float64
+        )
+
+    @property
+    def sky_frame_rotation(self):
+        return self._action.sky_frame_rotation
+
+    @property
+    def sky_frame_merger_gmst(self):
+        return self._action.merger_gmst
 
     # -- binding -----------------------------------------------------------
 
@@ -2933,6 +2966,92 @@ def _select_flow_model_factory(
     return _make_flow_model
 
 
+class ReferenceEpoch:
+    """The Earth orientation the frame-dependent coordinates refer to.
+
+    A long signal (hours, for a 3 Hz lower frequency) is seen by a detector
+    that turns with the Earth: the antenna pattern it is measured with
+    changes over the signal, and the epoch whose pattern the data constrain
+    the most moves with the information the live points carry -- in an
+    early-warning mixture, from the first hours of the signal (only the
+    earliest thresholds constrain the first live points) towards the merger.
+    The chirp distance's response, the flow's sky frame, the group's frame
+    and the detector-centre time's delay are all taken at this one epoch, so
+    the chirp distance and the detector-centre time stay invariant under
+    the group.
+
+    :meth:`choose` (before every training, on the training points) moves the
+    epoch to the one that minimises the spread of the log chirp distance,
+    the coordinate that strips the antenna pattern from the amplitude the
+    data measure, searched on a grid of ``n_grid`` epochs from the merger to
+    ``max_hours`` before it and refined between the neighbours of the best.
+    It moves only when that lowers the spread by more than ``tolerance``
+    (relative): every move changes the flow's coordinates, so the flow is
+    trained afresh.
+
+    Parameters
+    ----------
+    merger_gmst : float
+        GMST (rad) at the merger.
+    max_hours : float
+        Earliest epoch searched, in hours before the merger (e.g. the
+        signal's duration from the lower frequency).
+    n_grid : int, optional
+        Grid size of the search (default 97).
+    tolerance : float, optional
+        Relative spread reduction needed to move (default 0.05).
+    """
+
+    def __init__(self, merger_gmst, max_hours, n_grid=97, tolerance=0.05):
+        if max_hours <= 0:
+            raise ValueError("max_hours must be positive")
+        self.merger_gmst = float(merger_gmst)
+        self.max_hours = float(max_hours)
+        self.n_grid = int(n_grid)
+        self.tolerance = float(tolerance)
+        #: the current epoch, hours before the merger
+        self.hours = 0.0
+
+    @property
+    def gmst(self):
+        return gmst_hours_before(self.merger_gmst, self.hours)
+
+    def _gmsts(self, hours):
+        return [gmst_hours_before(self.merger_gmst, h) for h in hours]
+
+    def choose(self, spread):
+        """Move to the epoch of least ``spread(gmsts) -> spreads``; returns
+        whether the epoch moved."""
+        hours = np.linspace(0.0, self.max_hours, self.n_grid)
+        s = np.asarray(spread(self._gmsts(hours)), dtype=float)
+        if not np.isfinite(s).any():
+            return False
+        i = int(np.nanargmin(np.where(np.isfinite(s), s, np.nan)))
+        fine = np.linspace(hours[max(i - 1, 0)],
+                           hours[min(i + 1, len(hours) - 1)], 17)
+        sf = np.asarray(spread(self._gmsts(fine)), dtype=float)
+        j = int(np.nanargmin(np.where(np.isfinite(sf), sf, np.nan)))
+        best_hours, best = float(fine[j]), float(sf[j])
+        current = float(np.asarray(spread([self.gmst]), dtype=float)[0])
+        moved = not current <= (1.0 + self.tolerance) * best
+        if moved:
+            logger.info(
+                "Reference epoch %.2f h before merger (was %.2f h): log "
+                "chirp-distance spread %.3f (%.3f at the previous epoch, "
+                "%.3f at merger)", best_hours, self.hours, best, current,
+                float(s[0]),
+            )
+        else:
+            logger.info(
+                "Reference epoch kept at %.2f h before merger: log "
+                "chirp-distance spread %.3f (best %.3f at %.2f h, %.3f at "
+                "merger)", self.hours, current, best, best_hours, float(s[0]),
+            )
+        if moved:
+            self.hours = best_hours
+        return moved
+
+
 def _make_group_proposal_class(
     class_name,
     flow_model_cls,
@@ -2942,6 +3061,7 @@ def _make_group_proposal_class(
     psi_single,
     phase_coordinates,
     sky_radial_sigma=0.15,
+    reference_epoch=None,
 ):
     """``FlowProposal`` subclass for a nessai-gw group-mixture flow.
 
@@ -2954,6 +3074,13 @@ def _make_group_proposal_class(
     ``action`` (``None`` on the physical-space path) is re-bound to nessai's
     actual prime-parameter order after every (re-)initialisation.  The class is
     published at module scope as ``class_name`` so checkpoints unpickle.
+
+    ``reference_epoch`` (a dict of :class:`ReferenceEpoch` arguments other
+    than ``merger_gmst``) moves the Earth orientation of the sky frame, the
+    group's frame, the chirp distance's response and the detector-centre
+    time's delay before every training (:meth:`check_state`); a move trains
+    the flow afresh.  It needs the prime-space ``action`` and the
+    chirp distance.
     """
     from nessai.flowmodel.group_mixture import GroupFlowProposalMixin
     from nessai.proposal import FlowProposal
@@ -3065,6 +3192,66 @@ def _make_group_proposal_class(
         def initialise(self, *args, **kwargs):
             super().initialise(*args, **kwargs)
             self._realign_prime_space_action()
+            if reference_epoch is not None:
+                if getattr(self, "reference_epoch", None) is None:
+                    self.reference_epoch = ReferenceEpoch(
+                        action.sky_frame_merger_gmst, **reference_epoch
+                    )
+                # a resumed proposal's epoch: the action is rebuilt at the
+                # merger's, and the reparameterisations may be too
+                self._apply_reference_epoch()
+
+        def _apply_reference_epoch(self):
+            """Put every frame-dependent piece at the current epoch."""
+            epoch = getattr(self, "reference_epoch", None)
+            if epoch is None:
+                return
+            action.set_gmst(epoch.gmst)
+            rotation = action.sky_frame_rotation
+            for rep in self._reparameterisation.values():
+                if hasattr(rep, "set_rotation"):
+                    rep.set_rotation(rotation)
+                elif hasattr(rep, "set_gmst"):
+                    rep.set_gmst(epoch.gmst)
+
+        def _reset_for_reference_epoch(self):
+            """A new frame: train every expert afresh (none kept warm or
+            frozen) and re-bootstrap the canonical standardisation, which
+            is an average over rounds in the old frame."""
+            flow = getattr(self, "flow", None)
+            model = getattr(flow, "model", None)
+            if model is None:
+                return
+            frozen = getattr(model, "_frozen", None)
+            with torch.no_grad():
+                if frozen is not None:
+                    frozen.zero_()
+            if hasattr(model, "warm_max_share"):
+                model.warm_max_share = None
+            flow.reset_model(weights=True, permutations=True)
+            with torch.no_grad():
+                for m in flow.model.modules():
+                    if hasattr(m, "_canon_seen"):
+                        m._canon_seen.fill_(False)
+                        m._domain_mass_seen = False
+            self._realign_prime_space_action()
+            logger.info("Reference epoch moved: every expert retrained "
+                        "from scratch")
+
+        def check_state(self, x):
+            """Choose the reference epoch on the training points before the
+            reparameterisations update on them."""
+            epoch = getattr(self, "reference_epoch", None)
+            if epoch is not None and len(x) > 1:
+                cd = next(
+                    (r for r in self._reparameterisation.values()
+                     if hasattr(r, "log_spread")), None)
+                if cd is not None and epoch.choose(
+                    lambda gmsts: cd.log_spread(x, gmsts)
+                ):
+                    self._apply_reference_epoch()
+                    self._reset_for_reference_epoch()
+            super().check_state(x)
 
         def reset_model_weights(self, **kwargs):
             super().reset_model_weights(**kwargs)
@@ -3125,8 +3312,16 @@ def make_triangular_group_flow_proposal(
     time_to_merger=None,
     chirp_distance_inversion=False,
     waveform_phase=None,
+    reference_epoch=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
+
+    ``reference_epoch`` (optional): a dict of :class:`ReferenceEpoch`
+    arguments (``max_hours``, and optionally ``n_grid`` and ``tolerance``).
+    The sky frame, the group's frame, the chirp distance's response and the
+    detector-centre time's delay then refer to the Earth's orientation at an
+    epoch chosen before every training, instead of the merger's.  Needs
+    ``prime_space`` and ``chirp_distance``.
 
     ``flow_model_factory`` (optional): a callable used *instead of*
     :func:`nessai.flowmodel.group_mixture.make_clustered_group_mixture_flow`
@@ -3433,6 +3628,11 @@ def make_triangular_group_flow_proposal(
             "group action needs; this proposal only applies to a single-site "
             "triangular-detector run with the standard extrinsic parameters."
         )
+    if reference_epoch is not None and not (prime_space and chirp_distance):
+        raise RuntimeError(
+            "reference_epoch needs prime_space and chirp_distance (the epoch "
+            "is chosen on the chirp distance)."
+        )
 
     base_action = TriangularDetectorGroupAction(
         reference_time=reference_time,
@@ -3631,6 +3831,7 @@ def make_triangular_group_flow_proposal(
         psi_single=psi_single,
         phase_coordinates=phase_coordinates,
         sky_radial_sigma=sky_radial_sigma,
+        reference_epoch=reference_epoch,
     )
 
 
@@ -3777,6 +3978,7 @@ def make_et_group_flow_proposal(
     time_to_merger=None,
     chirp_distance_inversion=False,
     waveform_phase=None,
+    reference_epoch=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3826,4 +4028,5 @@ def make_et_group_flow_proposal(
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,
         waveform_phase=waveform_phase,
+        reference_epoch=reference_epoch,
     )
