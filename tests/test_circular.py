@@ -180,10 +180,126 @@ def test_adaptive_domains_keep_circular_seams():
     )
     dom.update(canon)
     assert dom._identity()
-    with pytest.raises(ValueError, match="allow_phase_mode"):
-        AdaptiveFundamentalDomain(
-            action, None, allow_phase_mode=True, circular_psi_phase=True
-        )
+
+
+# ---------------------------------------------------------------------------
+# ET triangle, per-expert torus basis (circular_psi_phase + allow_phase_mode)
+# ---------------------------------------------------------------------------
+def _et_torus_setup(n=3000, seed=3):
+    from nessai_gw.group_mixture import (
+        ETTriangleGroupAction,
+        PrimeSpaceTriangularGroupAction,
+        _prime_parameter_names,
+    )
+
+    names = _prime_parameter_names(
+        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True, psi_single=True
+    )
+    action = PrimeSpaceTriangularGroupAction(
+        ETTriangleGroupAction(
+            reference_time=REFERENCE_TIME, polarisation_quarter=True,
+            phase_reflection=True,
+        ),
+        names,
+    )
+    rng = np.random.default_rng(seed)
+    x = torch.as_tensor(np.column_stack([
+        rng.uniform(0, 1, n) if nm in ("sky_u", "sky_v") else rng.uniform(-1, 1, n)
+        for nm in names
+    ]))
+    out = torch.full_like(x, float("nan"))
+    found = torch.zeros(n, dtype=torch.bool)
+    for g in range(action._action.group_size):
+        d = {nm: x[:, i] for i, nm in enumerate(names)}
+        img = action(d, torch.full((n,), g, dtype=torch.long), inverse=True)
+        img = torch.stack([img[nm] for nm in names], dim=1)
+        ok = action.in_fundamental_domain(
+            {nm: img[:, i] for i, nm in enumerate(names)}
+        ).to(torch.bool) & ~found
+        out[ok] = img[ok]
+        found |= ok
+    assert found.all()
+    return names, action, out
+
+
+def _torus_domain(names, action, mn=(0, 1)):
+    dom = AdaptiveFundamentalDomain(
+        action, names, allow_phase_mode=True, circular_psi_phase=True
+    )
+    dom._torus.copy_(torch.tensor(mn))
+    return dom
+
+
+@pytest.mark.parametrize("mn", AdaptiveFundamentalDomain.torus_candidates)
+def test_torus_basis_is_a_bijection_of_the_torus(mn):
+    names, action, canon = _et_torus_setup()
+    ipsi, idp = names.index("psi_prime"), names.index("delta_phase")
+    assert (canon[:, [ipsi, idp]] < 0).all() and (canon[:, [ipsi, idp]] >= -1).all()
+    dom = _torus_domain(names, action, mn)
+    (p, q), (m, n) = dom._torus_matrix(*mn)
+    assert abs(p * n - q * m) == 1
+    y = dom.forward(canon)
+    assert dom._box_valid(y, False).all()
+    np.testing.assert_allclose(dom.inverse(y), canon, atol=1e-9)
+    # onto: any box point comes back from its preimage
+    rng = np.random.default_rng(5)
+    t = y.clone()
+    t[:, ipsi] = torch.as_tensor(rng.uniform(-1, 0, len(t)))
+    t[:, idp] = torch.as_tensor(rng.uniform(-1, 0, len(t)))
+    back = dom.inverse(t)
+    assert (back[:, idp] != 0.5).all()
+    np.testing.assert_allclose(dom.forward(back), t, atol=1e-9)
+    # unit Jacobian on the (psi', delta') plane, away from the wraps
+    if mn != (0, 1):
+        z = canon[:1].clone().requires_grad_(False)
+        eps = 1e-7
+        y0 = dom.forward(z)
+        cols = []
+        for i in (ipsi, idp):
+            dz = z.clone()
+            dz[0, i] += eps
+            cols.append(((dom.forward(dz) - y0)[0, [ipsi, idp]]) / eps)
+        jac = torch.stack(cols, dim=1)
+        if (jac.abs() < 10).all():  # no wrap crossed
+            assert abs(abs(float(torch.linalg.det(jac))) - 1) < 1e-5
+
+
+def _pinned(canon, names, mn, b0=0.3, sigma=0.02, seed=9):
+    """Re-draw delta' so that m x + n y = b0 (+ noise) with x free."""
+    rng = np.random.default_rng(seed)
+    ipsi, idp, ith = (names.index(k) for k in ("psi_prime", "delta_phase", "theta_jn_prime"))
+    c = canon.clone()
+    m, n = mn
+    x = (c[:, ipsi] + 1).numpy()
+    s = np.where(c[:, ith].numpy() > 0, -1.0, 1.0)
+    b = b0 + rng.normal(0, sigma, len(c))
+    k = rng.integers(0, abs(n), len(c))
+    y = np.mod((b - m * x + k) / n, 1.0)
+    c[:, idp] = torch.as_tensor(np.mod(s * y, 1.0) - 1)
+    return c
+
+
+def test_torus_basis_follows_the_pinned_combination():
+    names, action, canon = _et_torus_setup()
+    dom = _torus_domain(names, action)
+    # delta_phase pinned: stays the identity
+    assert not dom.update(_pinned(canon, names, (0, 1)))
+    assert dom._torus_mn() == (0, 1)
+    # phase pinned (the plateau): switches to phase mod pi/2 in one band
+    plateau = _pinned(canon, names, (1, -2))
+    assert dom.update(plateau)
+    assert dom._torus_mn() == (1, -2)
+    assert "pins 1psi'-2delta'" in dom._retrain_note
+    b = dom.forward(plateau)[:, names.index("delta_phase")].numpy()
+    r = abs(np.mean(np.exp(2j * np.pi * b)))
+    assert r > 0.95
+    # and back once delta_phase is pinned again
+    assert dom.update(_pinned(canon, names, (0, 1)))
+    assert dom._torus_mn() == (0, 1)
+    # without allow_phase_mode the basis never moves
+    off = AdaptiveFundamentalDomain(action, names, circular_psi_phase=True)
+    off.update(plateau)
+    assert off._torus_mn() == (0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -285,13 +401,18 @@ def _check_trained_proposal(proposal, model, live):
 
 @requires_circular
 @pytest.mark.parametrize(
-    "adaptive_domain, standardise", [(False, False), (True, False), (True, True)]
+    "adaptive_domain, standardise, recanon",
+    [(False, False, False), (True, False, False), (True, True, False),
+     (True, True, True)],
 )
-def test_et_proposal_circular_end_to_end(tmp_path, adaptive_domain, standardise):
+def test_et_proposal_circular_end_to_end(
+    tmp_path, adaptive_domain, standardise, recanon
+):
     cls = make_et_group_flow_proposal(
         BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
         polarisation_quarter=True, psi_single=True, sky_2d="auto",
         gaussianise_sky=True, adaptive_domain=adaptive_domain,
+        phase_recanon=recanon,
         circular_psi_phase=True, log_mass_ratio=False,
         circular_standardisation=standardise,
     )
@@ -329,7 +450,7 @@ def test_et_proposal_circular_incompatibilities():
             BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
             polarisation_quarter=True, circular_standardisation=True,
         )
-    with pytest.raises(RuntimeError, match="phase_recanon"):
+    with pytest.raises(RuntimeError, match="phase_recanon without adaptive"):
         make_et_group_flow_proposal(
             BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
             polarisation_quarter=True, phase_recanon=True,

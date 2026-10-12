@@ -1709,6 +1709,24 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     position exceeds ``move_density`` (relative to uniform) *and*
     ``move_factor`` times the minimum -- a seam in an empty or flat region is
     left alone, so the base-flow frame stays fixed between rounds.
+
+    With ``circular_psi_phase`` the base flow sees ``(psi', delta')`` as a
+    torus (each of ``[-1, 0)`` once round a circle), which needs no seams;
+    there, ``allow_phase_mode`` instead picks the torus' basis.  Writing
+    ``x = psi' + 1`` and ``y = s (delta' + 1)`` (mod 1), the ``psi_prime``
+    and ``delta_phase`` slots carry
+
+        a = p x + q y,   b = m x + n y   (mod 1, then shifted to [-1, 0))
+
+    for an integer matrix ``[[p, q], [m, n]]`` of determinant +-1 (exactly
+    the linear maps of the torus onto itself: unit Jacobian, bijective).
+    ``b`` is the combination the expert pins: ``(m, n) = (0, 1)`` is
+    ``delta_phase`` (the identity), ``(1, -2)`` is ``-2 phase/pi``, i.e.
+    ``phase mod pi/2`` (the plateau: two ``delta``-vs-``psi`` ridges half a
+    period apart become one band).  :meth:`update` takes the ``(m, n)`` of
+    :attr:`torus_candidates` whose ``b`` has the least wrapped spread over the
+    expert's points, moving off the current one only when that spread is
+    below ``torus_switch_ratio`` times the current one's.
     """
 
     on_ratio = 0.5
@@ -1718,6 +1736,11 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     move_density = 0.25
     move_factor = 2.0
     min_points = 50
+    #: ``(m, n)``, the pinned torus combination ``m x + n y`` (circular mode).
+    torus_candidates = (
+        (0, 1), (1, 0), (1, 1), (1, -1), (1, 2), (1, -2), (2, 1), (2, -1),
+    )
+    torus_switch_ratio = 0.6
 
     def __init__(self, action, param_names=None, allow_phase_mode=False,
                  circular_psi_phase=False):
@@ -1727,15 +1750,13 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         #: (:class:`CircularCanonicalTransform`), which needs no seams there:
         #: keep them at zero and only move the sky seam.
         self.circular_psi_phase = bool(circular_psi_phase)
-        if self.circular_psi_phase and allow_phase_mode:
-            raise ValueError(
-                "circular_psi_phase cannot be combined with allow_phase_mode"
-            )
         self.allow_phase_mode = bool(allow_phase_mode)
         # (c_u, c_psi, c_delta, c_phase) in prime units
         self.register_buffer("_seams", torch.zeros(4, dtype=torch.float64))
         self.register_buffer("_phase_mode", torch.zeros((), dtype=torch.bool))
         self.register_buffer("_seen", torch.zeros((), dtype=torch.bool))
+        # (m, n) of the torus basis (circular mode); (0, 1) is the identity
+        self.register_buffer("_torus", torch.tensor([0, 1], dtype=torch.int64))
         self._names = None
         if param_names is not None:
             self.bind(param_names)
@@ -1758,9 +1779,57 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     def _state(self):
         return tuple(float(c) for c in self._seams), bool(self._phase_mode)
 
+    def _torus_mn(self):
+        t = getattr(self, "_torus", None)
+        return (0, 1) if t is None else (int(t[0]), int(t[1]))
+
     def _identity(self):
         seams, phase = self._state()
-        return not phase and not any(seams)
+        return not phase and not any(seams) and self._torus_mn() == (0, 1)
+
+    # -- torus basis (circular mode) ---------------------------------------
+    @staticmethod
+    def _torus_matrix(m, n):
+        """``[[p, q], [m, n]]`` of determinant +-1 (identity for (0, 1))."""
+        if m == 0:
+            return ((1, 0), (0, 1)) if n == 1 else ((-1, 0), (0, -1))
+        if m == 1:
+            return ((0, 1), (1, n))
+        if m == 2 and n % 2:
+            return ((1, (n - 1) // 2), (2, n))
+        raise ValueError(f"no unimodular completion coded for (m, n)={(m, n)}")
+
+    def _torus_xy(self, z):
+        """``(x, y)`` in ``[0, 1)`` from the prime ``(psi', delta')``."""
+        x = torch.remainder(z[:, self._ipsi] + 1, 1.0)
+        y = torch.remainder(self._s(z) * (z[:, self._idp] + 1), 1.0)
+        return x, y
+
+    def _torus_forward(self, y_box):
+        mn = self._torus_mn()
+        if mn == (0, 1):
+            return y_box
+        (p, q), (m, n) = self._torus_matrix(*mn)
+        x, yy = self._torus_xy(y_box)
+        out = y_box.clone()
+        out[:, self._ipsi] = torch.remainder(p * x + q * yy, 1.0) - 1
+        out[:, self._idp] = torch.remainder(m * x + n * yy, 1.0) - 1
+        return out
+
+    def _torus_inverse(self, t):
+        mn = self._torus_mn()
+        if mn == (0, 1):
+            return t
+        (p, q), (m, n) = self._torus_matrix(*mn)
+        det = p * n - q * m
+        a = torch.remainder(t[:, self._ipsi] + 1, 1.0)
+        b = torch.remainder(t[:, self._idp] + 1, 1.0)
+        x = torch.remainder(det * (n * a - q * b), 1.0)
+        yy = torch.remainder(det * (-m * a + p * b), 1.0)
+        out = t.clone()
+        out[:, self._ipsi] = x - 1
+        out[:, self._idp] = torch.remainder(self._s(t) * yy, 1.0) - 1
+        return out
 
     # -- geometry ------------------------------------------------------------
     def _s(self, z):
@@ -1873,12 +1942,13 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
             return canon
         seams, phase = self._state()
         z, _ = self._map_to(canon, seams, phase)
-        return self._to_box(z, seams, phase)
+        return self._torus_forward(self._to_box(z, seams, phase))
 
     def inverse(self, y):
         if self._identity():
             return y
         seams, phase = self._state()
+        y = self._torus_inverse(y)
         valid = self._box_valid(y, phase)
         z = self._from_box(y, seams, phase)
         canon, found = self._map_to(z, (0.0, 0.0, 0.0, 0.0), False)
@@ -1917,6 +1987,39 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
             return best, d_cur, float(dens[i_min])
         return float(current), d_cur, float(dens[i_min])
 
+    def _update_torus(self, z):
+        """Pick the torus basis off the expert's points ``z`` (canonical,
+        in the current sky domain); return a note for the retrain summary."""
+        x, y = (v.double().cpu().numpy() for v in self._torus_xy(z))
+        spread = {
+            mn: self._circ_spread(mn[0] * x + mn[1] * y, 1.0)
+            for mn in self.torus_candidates
+        }
+        cur = self._torus_mn()
+        sp_cur = spread.get(cur)
+        if sp_cur is None:
+            sp_cur = self._circ_spread(cur[0] * x + cur[1] * y, 1.0)
+        best = min(spread, key=spread.get)
+        new = cur
+        if best != cur and spread[best] < self.torus_switch_ratio * sp_cur:
+            new = best
+        self._torus.copy_(torch.tensor(new, dtype=torch.int64))
+        logger.debug(
+            "Adaptive domain: torus spreads %s; current %s, now %s, n=%d",
+            ", ".join(f"{k}: {v:.3f}" for k, v in spread.items()),
+            cur, new, z.shape[0],
+        )
+        if new != cur:
+            logger.info(
+                "Adaptive domain: torus basis %s -> %s (spread %.3f -> %.3f)",
+                cur, new, sp_cur, spread[new],
+            )
+        return (
+            f"pins {new[0]}psi'{new[1]:+d}delta' (spread {spread[new]:.2f}"
+            f" vs {spread[(0, 1)]:.2f} delta)"
+            + (" [switched]" if new != cur else "")
+        )
+
     @torch.no_grad()
     def update(self, canon):
         if canon.shape[0] < self.min_points:
@@ -1943,9 +2046,14 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
                 new_phase = False
         switched = new_phase != phase
 
+        torus_before = self._torus_mn()
+        torus_note = ""
         if getattr(self, "circular_psi_phase", False):
             cpsi = cdel = cphi = 0.0
             dpsi = ddel = dphi = float("nan")
+            new_phase = switched = False
+            if self.allow_phase_mode:
+                torus_note = self._update_torus(z1)
         elif new_phase:
             cphi, dphi, _ = self._choose_seam(
                 phi_n, 0.5, cphi, force=switched or not was_seen
@@ -1969,6 +2077,7 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         changed = (
             after[1] != before[1]
             or any(abs(a - b) > 1e-12 for a, b in zip(after[0], before[0]))
+            or self._torus_mn() != torus_before
         )
         logger.debug(
             "Adaptive domain: %s-folded (phase/delta spread ratio %.3f), seams "
@@ -1983,6 +2092,11 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
              ("delta", cdel, ddel), ("phase", cphi, dphi)],
             changed, prefix="phase-folded; " if new_phase else "",
         )
+        if torus_note:
+            self._retrain_note = (
+                torus_note + "; " + self._retrain_note
+                if self._retrain_note else torus_note
+            )
         if switched:
             logger.info(
                 "Adaptive domain: switched to the %s fold (phase/delta spread "
@@ -3514,7 +3628,10 @@ def make_triangular_group_flow_proposal(
         without seams.  Needs a circular flow (``flow_config['ftype'] =
         'circular'``), ``psi_single``, ``polarisation_quarter``,
         ``phase_reflection``, the ``polarisation-phase`` coordinates and
-        ``polarisation_offset = 0``; incompatible with ``phase_recanon``.
+        ``polarisation_offset = 0``.  With ``phase_recanon`` it needs
+        ``adaptive_domain``, which then picks each expert's basis of the
+        ``(psi_prime, delta_phase)`` torus (e.g. ``phase mod pi/2`` instead
+        of ``delta_phase`` on a phase-pinned plateau).
         With ``adaptive_domain`` only the sky seam moves.  Default ``False``.
     circular_standardisation : bool, optional
         Standardise the circular ``psi_prime`` / ``delta_phase`` as well:
@@ -3758,8 +3875,8 @@ def make_triangular_group_flow_proposal(
                 bad.append(f"phase_coordinates={phase_coordinates!r}")
             if polarisation_offset:
                 bad.append("polarisation_offset != 0")
-            if phase_recanon:
-                bad.append("phase_recanon")
+            if phase_recanon and not adaptive_domain:
+                bad.append("phase_recanon without adaptive_domain")
             if bad:
                 raise RuntimeError(
                     f"circular_psi_phase is incompatible with {', '.join(bad)}."
