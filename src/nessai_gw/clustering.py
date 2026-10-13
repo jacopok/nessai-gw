@@ -57,6 +57,7 @@ import logging
 
 import numpy as np
 import torch
+from scipy.special import ndtri
 from nessai.flowmodel.group_mixture import (
     ClusteredGroupMixtureFlowModel,
     ClusteredGroupMixtureFlowWrapper,
@@ -72,6 +73,7 @@ __all__ = [
     "DiagonalSplitClusterWrapper",
     "fit_live_diagonal_split",
     "gaussian_split_gain",
+    "rank_gaussianise",
     "make_diagonal_split_cluster_flow",
     "ConstrainedTwoModeWrapper",
     "ConstrainedClusteredModel",
@@ -100,6 +102,15 @@ def split_coordinates(canon, param_names):
 def _half_logdet(cov):
     sign, ld = np.linalg.slogdet(cov)
     return 0.5 * ld if sign > 0 else np.inf
+
+
+def rank_gaussianise(x):
+    """Each column of ``x`` mapped to standard-normal scores by rank,
+    ``ndtri(rank / (n + 1))``: the same ordering with an exactly Gaussian
+    marginal, so a heavy tail no longer dominates a covariance."""
+    x = np.asarray(x, dtype=float)
+    ranks = np.argsort(np.argsort(x, axis=0, kind="stable"), axis=0) + 1
+    return ndtri(ranks / (x.shape[0] + 1.0))
 
 
 def gaussian_split_gain(t, labels, min_count=2):
@@ -232,10 +243,21 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     Tunables are class attributes, set by :func:`make_diagonal_split_cluster_flow`.
     """
 
-    #: Gain (nats per training point) needed to activate the split.
-    gain_on = 0.8
-    #: Once active, the split collapses when the gain falls below this.
-    gain_off = 0.2
+    #: Gain (nats per training point) needed to activate the split.  With
+    #: ``chirp_distance`` rank-Gaussianised the gain stays below ~0.4 up to
+    #: -ln X ~ 13 on the replicate_Delta_v7x runs, and the real split rises
+    #: through 0.6 at -ln X ~ 15-25 (0.8 when the raw chirp distance's tail
+    #: alone gave ~1.3 at -ln X ~ 1-4).
+    gain_on = 0.6
+    #: Once active, the split collapses when the gain falls below this
+    #: (above the ~0.05-0.35 mid-run level, so a split cannot linger there).
+    gain_off = 0.4
+    #: Base-frame coordinates rank-Gaussianised (:func:`rank_gaussianise`)
+    #: before the gain: the chirp distance diverges where the reference
+    #: detector is blind (a band in ``sky_v``), and that tail alone made a
+    #: line along it worth ~1.3 nat/pt early in the run, while the live
+    #: points still reach those sky regions.
+    rank_gaussian_params = ("chirp_distance",)
     #: A new line replaces the active one only if it beats it by this much.
     refit_margin = 0.05
     #: Minimum fraction of points on each side to activate.
@@ -392,7 +414,8 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         :meth:`_fold_to_base` sets circular dims (e.g. ``circular-psi-phase``)
         to zero for nearest-centroid routing; left in, those constant columns
         make every covariance singular, the gain ``-inf`` and the split
-        impossible.  Any other zero-variance column is dropped too.
+        impossible.  Any other zero-variance column is dropped too.  The
+        :attr:`rank_gaussian_params` columns are rank-Gaussianised.
         """
         t = np.asarray(t, dtype=float)
         keep = np.ones(t.shape[1], dtype=bool)
@@ -401,6 +424,15 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         if idx is not None and idx.numel():
             keep[idx.cpu().numpy()] = False
         keep &= t.std(axis=0) > 0
+        names = list(experts[0].param_names) if experts else []
+        rank = [
+            i
+            for i, name in enumerate(names)
+            if name in self.rank_gaussian_params and keep[i]
+        ]
+        if rank:
+            t = t.copy()
+            t[:, rank] = rank_gaussianise(t[:, rank])
         return t[:, keep]
 
     def _split_labels(self, c, v):
@@ -573,7 +605,7 @@ def make_diagonal_split_cluster_flow(
     ----------
     gain_on, gain_off : float, optional
         Activation / collapse thresholds on :func:`gaussian_split_gain`
-        (nats per point).  ``None`` keeps the class defaults (0.8 / 0.2).
+        (nats per point).  ``None`` keeps the class defaults (0.6 / 0.4).
     activate_fraction : float, optional
         Minimum fraction of points on each side to activate (and to consider
         a candidate line).  ``None`` keeps :data:`MIN_BRANCH_FRACTION`.
