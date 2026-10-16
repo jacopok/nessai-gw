@@ -1,7 +1,7 @@
 """Clustering strategies for the ET-Delta triangle's plateau/clump split,
 plugged into nessai's clustered group-mixture flow.
 
-Both are ``flow_model_factory`` callables for
+:func:`make_diagonal_split_cluster_flow` is a ``flow_model_factory`` callable for
 :func:`nessai_gw.group_mixture.make_et_group_flow_proposal` (with
 ``n_clusters_max=2``), e.g.::
 
@@ -10,17 +10,11 @@ Both are ``flow_model_factory`` callables for
         flow_model_factory=functools.partial(
             make_diagonal_split_cluster_flow, activate_min_round=3))
 
-Two alternatives to the free-GMM clustering in ``nessai.flowmodel.group_mixture``
-live here:
-
-* :func:`make_diagonal_split_cluster_flow` -- a straight-line split in the
-  canonical ``(cos theta_jn, sky_v)`` plane, re-fit from the live points every
-  training round (:func:`fit_live_diagonal_split`) and switched on/off by how
-  much a two-expert representation improves on one
-  (:func:`gaussian_split_gain`).
-* :func:`make_constrained_group_flow` -- a tuned fixed threshold on the
-  folded ``theta_jn_prime`` coordinate, validated on the finished v70 run
-  (see ``ConstrainedTwoModeWrapper``'s docstring below).
+It replaces the free-GMM clustering in ``nessai.flowmodel.group_mixture``
+with a straight-line split in the canonical ``(cos theta_jn, sky_v)`` plane,
+re-fit from the live points every training round
+(:func:`fit_live_diagonal_split`) and switched on/off by how much a two-expert
+representation improves on one (:func:`gaussian_split_gain`).
 
 Background
 ----------
@@ -36,10 +30,10 @@ neural flows, per-expert canonical standardisation, closed-form mixture
 weights, importance-weight-correct ``log_prob``/``sample_and_log_prob``,
 warm-starting, hysteresis across training rounds -- driven by two overridable
 hooks, ``_k_want`` (how many clusters this round) and ``_labels_for_k``
-(which cluster each point belongs to).  The default hooks fit a GMM; both
-strategies below replace them with a deterministic split instead.
+(which cluster each point belongs to).  The default hooks fit a GMM; the
+split here replaces them with a deterministic split instead.
 
-One thing neither strategy attempts: the plateau and clump branches also want
+One thing the split does not attempt: the plateau and clump branches also want
 different **phase coordinates** (plateau: plain, independent ``psi``/
 ``phase``; clump: ``arg_alpha``/``arg_beta`` with a fitted
 ``polarisation_offset`` -- see :mod:`nessai_gw._polarisation_branch`'s module
@@ -59,10 +53,8 @@ import numpy as np
 import torch
 from scipy.special import ndtri
 from nessai.flowmodel.group_mixture import (
-    ClusteredGroupMixtureFlowModel,
     ClusteredGroupMixtureFlowWrapper,
     make_clustered_group_mixture_flow,
-    make_group_mixture_flow,
 )
 from nessai.flows import reset_permutations, reset_weights
 
@@ -75,9 +67,6 @@ __all__ = [
     "gaussian_split_gain",
     "rank_gaussianise",
     "make_diagonal_split_cluster_flow",
-    "ConstrainedTwoModeWrapper",
-    "ConstrainedClusteredModel",
-    "make_constrained_group_flow",
 ]
 
 #: Default minimum fraction of the training points on each side of the line
@@ -642,157 +631,3 @@ def make_diagonal_split_cluster_flow(
         attrs,
     )
     return DiagonalSplitCustom
-
-
-class ConstrainedTwoModeWrapper(ClusteredGroupMixtureFlowWrapper):
-    """``k=2`` wrapper whose split is a fixed threshold on one folded prime
-    coordinate instead of a GMM.  ``n_experts`` must be 2.
-
-    A *tuned, not general* alternative to the free-GMM clustering: the free
-    GMM at ``k=2`` splits the two compact localised inclination sub-modes
-    into the two experts and orphans the diffuse **edge-on / broad-sky**
-    mode -- neither compact-sheet-shaped expert proposes there, so it starves
-    and the run drops a co-equal posterior peak (v26 / v27; see the
-    ``v27-dropped-edge-on-mode`` note).  ``k=3`` works but uses a third
-    expert.
-
-    This wrapper pins the two clusters to the *known* regions the two modes
-    occupy:
-
-      * expert 0 -- "localised": face-on OR face-off inclination, tight sky
-      * expert 1 -- "broad": edge-on inclination, sky opens up
-
-    Routing is a fixed threshold on the folded ``theta_jn_prime`` coordinate
-    (``angle-sine`` folds face-on <-> face-off, so edge-on is the coordinate's
-    extreme near 0).  Threshold ``-0.30`` was picked on the finished v70 run
-    (``compare_runs_at_compression`` / the threshold sweep): completeness 1.00
-    (no edge-on point ever mis-routed), purity 0.999, and the broad cluster
-    never drops below ~330 live points across the whole ``-lnX`` window where
-    the mode exists, then empties cleanly when it dies.
-
-    Overrides the strategy hooks added to
-    :class:`ClusteredGroupMixtureFlowWrapper` (``_k_want`` / ``_labels_for_k``)
-    and ``_route``; every other piece -- the expert warm-start on activation,
-    ``_pending_split_train``, the per-cluster training loss, the background
-    expert -- is inherited unchanged.
-    """
-
-    #: folded base-frame coordinate the rule reads
-    split_coord = "theta_jn_prime"
-    #: ``t[:, i] > split_threshold`` -> expert 1 ("broad" / edge-on)
-    split_threshold = -0.30
-    #: both sides must clear this many live points to *activate* the split
-    split_min_size = 100
-    #: once active (``sticky``), the split only collapses when a side drops
-    #: below this (i.e. the mode has genuinely died)
-    split_empty_floor = 10
-    sticky = True
-
-    # -- geometry --------------------------------------------------------
-    def _split_index(self):
-        return list(self.param_names).index(self.split_coord)
-
-    def _broad_mask(self, t):
-        """Boolean mask (numpy): rows that belong to expert 1."""
-        return np.asarray(t)[:, self._split_index()] > self.split_threshold
-
-    # -- strategy hooks -------------------------------------------------
-    def _k_want(self, t, ts, mu, sd):
-        broad = self._broad_mask(t)
-        n1 = int(broad.sum())
-        n0 = int(broad.size - n1)
-        active = (
-            self.sticky
-            and bool(self._clustering_seen)
-            and int(self._n_active.item()) == 2
-        )
-        floor = self.split_empty_floor if active else self.split_min_size
-        return 2 if (n0 >= floor and n1 >= floor) else 1
-
-    def _labels_for_k(self, t, ts, mu, sd, k, k_cur, prev_raw):
-        if k < 2:
-            return np.zeros(ts.shape[0], dtype=int), ts.mean(0, keepdims=True)
-        labels = self._broad_mask(t).astype(int)  # 0 localised, 1 broad
-        cent = np.stack(
-            [
-                ts[labels == c].mean(0) if np.any(labels == c) else ts.mean(0)
-                for c in range(2)
-            ]
-        )
-        # EMA the stored routing centroids for continuity (labels are
-        # rule-based, so this only smooths diagnostics / the _route fallback).
-        if (
-            prev_raw is not None
-            and k == k_cur
-            and prev_raw.shape[0] == 2
-            and 0.0 <= self.centroid_ema < 1.0
-        ):
-            b = self.centroid_ema
-            cent = ((1.0 - b) * prev_raw + b * (cent * sd + mu) - mu) / sd
-        return labels, cent
-
-    @torch.no_grad()
-    def _route(self, x):
-        """Route training points by the same fixed rule (not nearest-centroid),
-        so the per-cluster training loss and the clustering agree exactly."""
-        act = int(self._n_active.item())
-        if act <= 1 or not bool(self._clustering_seen):
-            return torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-        t = self._fold_to_base(x)
-        i = self._split_index()
-        return (t[:, i] > self.split_threshold).long()
-
-
-class ConstrainedClusteredModel(ClusteredGroupMixtureFlowModel):
-    """:class:`ClusteredGroupMixtureFlowModel` that builds a
-    :class:`ConstrainedTwoModeWrapper` (fixed ``n_clusters_max = 2``)."""
-
-    n_clusters_max = 2
-    wrapper_cls = ConstrainedTwoModeWrapper
-
-
-def make_constrained_group_flow(
-    *,
-    split_coord="theta_jn_prime",
-    split_threshold=-0.30,
-    split_min_size=100,
-    split_empty_floor=10,
-    sticky=True,
-    bg_weight=0.2,
-    k_shrink_patience=3,
-    k_grow_patience=1,
-    centroid_ema=None,
-    **kwargs,
-):
-    """A clustered group-mixture ``FlowModel`` class with the constrained
-    two-mode split.  ``**kwargs`` are forwarded to
-    :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow` (the group
-    action, ``param_names``, ``canonical_transform``, ``mode_factor_sizes``,
-    ...), exactly as :func:`make_clustered_group_mixture_flow` forwards them --
-    so this drops in as a ``flow_model_factory`` for
-    :func:`nessai_gw.group_mixture.make_et_group_flow_proposal`.
-    """
-    base_cls = make_group_mixture_flow(**kwargs)
-
-    class _Wrapper(ConstrainedTwoModeWrapper):
-        pass
-
-    _Wrapper.split_coord = str(split_coord)
-    _Wrapper.split_threshold = float(split_threshold)
-    _Wrapper.split_min_size = int(split_min_size)
-    _Wrapper.split_empty_floor = int(split_empty_floor)
-    _Wrapper.sticky = bool(sticky)
-
-    class ConstrainedCustom(ConstrainedClusteredModel, base_cls):
-        pass
-
-    ConstrainedCustom.n_clusters_max = 2
-    ConstrainedCustom.wrapper_cls = _Wrapper
-    ConstrainedCustom.bg_weight = float(bg_weight)
-    ConstrainedCustom.min_cluster_size = int(split_min_size)
-    ConstrainedCustom.k_shrink_patience = int(k_shrink_patience)
-    ConstrainedCustom.k_grow_patience = int(k_grow_patience)
-    ConstrainedCustom.centroid_ema = (
-        None if centroid_ema is None else float(centroid_ema)
-    )
-    return ConstrainedCustom

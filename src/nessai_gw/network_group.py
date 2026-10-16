@@ -853,12 +853,6 @@ def make_network_group_flow_proposal(
     psi_offset=0.0,
     delta_offset=0.0,
     n_clusters_max=1,
-    cluster_method="gmm",
-    cluster_max_overlap=0.05,
-    cluster_min_size=200,
-    cluster_bg_weight=0.0,
-    cluster_k_grow_patience=2,
-    cluster_centroid_ema=None,
     flow_model_factory=None,
     chirp_distance=True,
     effective_spin=True,
@@ -909,7 +903,7 @@ def make_network_group_flow_proposal(
     psi_offset, delta_offset : float, optional
         Fixed seams (radians) of the base fundamental domain; see
         :class:`PrimeSpacePolarisationPhaseAction`.
-    n_clusters_max, cluster_*, flow_model_factory
+    n_clusters_max, flow_model_factory
         Clustered base flow, as in
         :func:`~nessai_gw.group_mixture.make_triangular_group_flow_proposal`.
     chirp_distance : bool, optional
@@ -990,12 +984,6 @@ def make_network_group_flow_proposal(
     make_flow = _select_flow_model_factory(
         n_clusters_max,
         flow_model_factory,
-        cluster_method=cluster_method,
-        cluster_max_overlap=cluster_max_overlap,
-        cluster_min_size=cluster_min_size,
-        cluster_bg_weight=cluster_bg_weight,
-        cluster_k_grow_patience=cluster_k_grow_patience,
-        cluster_centroid_ema=cluster_centroid_ema,
     )
     prime_names = _prime_parameter_names(
         names, geometry.reference_time, vertex=geometry.timing_vertex,

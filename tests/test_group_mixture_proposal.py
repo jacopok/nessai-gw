@@ -904,7 +904,6 @@ def test_gaussianise_sky_requires_prime_space():
 # ---------------------------------------------------------------------------
 from nessai_gw.group_mixture import (  # noqa: E402
     SkyOctantProbit,
-    SkyOctantPullback,
 )
 from nessai_gw.reparameterisations.sky import EqualAreaSky  # noqa: E402
 
@@ -994,68 +993,6 @@ def test_sky_octant_probit_round_trip_and_jacobian():
             jac[:, :, j] += s * fp[:, [iu, iv]] / (2 * eps)
     logdet = torch.log(torch.linalg.det(jac).abs())
     assert torch.allclose(ljf, logdet, atol=1e-4)
-
-
-def _bumpy_q_grid(nu=48, nv=48):
-    u = (np.arange(nu) + 0.5) / nu
-    v = (np.arange(nv) + 0.5) / nv
-    U, V = np.meshgrid(u, v, indexing="ij")
-    return 0.3 + np.exp(-((U - 0.6) ** 2 + (V - 0.35) ** 2) / 0.02)
-
-
-def test_sky_octant_pullback_round_trip_and_jacobian():
-    t = SkyOctantPullback(_bumpy_q_grid(), PRIME_NAMES_2D)
-    canon = _folded_sub_square(256)
-    base, ljf = t.forward(canon)
-    back, lji = t.inverse(base)
-    assert torch.allclose(back, canon, atol=1e-6)
-    assert torch.allclose(ljf, -lji, atol=1e-6)
-    for i, name in enumerate(PRIME_NAMES_2D):
-        if name not in ("sky_u", "sky_v"):
-            assert torch.allclose(base[:, i], canon[:, i])
-    iu, iv = PRIME_NAMES_2D.index("sky_u"), PRIME_NAMES_2D.index("sky_v")
-    eps = 1e-6
-    jac = torch.zeros(canon.shape[0], 2, 2, dtype=torch.float64)
-    for j, col in enumerate((iu, iv)):
-        for s in (+1, -1):
-            pert = canon.clone()
-            pert[:, col] += s * eps
-            fp, _ = t.forward(pert)
-            jac[:, :, j] += s * fp[:, [iu, iv]] / (2 * eps)
-    logdet = torch.log(torch.linalg.det(jac).abs())
-    # piecewise-constant density vs finite-diff of a piecewise-linear map:
-    # agree except for the ~1/nu fraction of points straddling a cell wall.
-    assert (torch.abs(ljf - logdet) < 1e-3).float().mean() > 0.9
-
-
-def test_sky_octant_pullback_uniform_q_matches_probit():
-    """A flat q_grid must reduce to SkyOctantProbit."""
-    canon = _folded_sub_square(512)
-    flat = SkyOctantPullback(np.ones((32, 32)), PRIME_NAMES_2D)
-    ref = SkyOctantProbit(PRIME_NAMES_2D)
-    bf, ljf = flat.forward(canon.clone())
-    br, ljr = ref.forward(canon.clone())
-    assert torch.allclose(bf, br, atol=1e-6)
-    assert torch.allclose(ljf, ljr, atol=1e-6)
-
-
-def test_sky_octant_pullback_gaussianises_its_own_q():
-    """Sampling proportional to q_grid, the pullback yields ~N(0, 1)^2."""
-    q = _bumpy_q_grid(64, 64)
-    nu, nv = q.shape
-    rng = np.random.default_rng(1)
-    flat_p = (q / q.sum()).ravel()
-    idx = rng.choice(flat_p.size, size=150_000, p=flat_p)
-    iu, iv = np.unravel_index(idx, (nu, nv))
-    su = (iu + rng.uniform(size=idx.size)) * 0.25 / nu
-    sv = (iv + rng.uniform(size=idx.size)) * 0.5 / nv
-    canon = torch.zeros(idx.size, len(PRIME_NAMES_2D), dtype=torch.float64)
-    canon[:, 0] = torch.as_tensor(su)
-    canon[:, 1] = torch.as_tensor(sv)
-    base, _ = SkyOctantPullback(q, PRIME_NAMES_2D).forward(canon)
-    a, b = base[:, 0].numpy(), base[:, 1].numpy()
-    assert abs(a.mean()) < 0.03 and abs(b.mean()) < 0.03
-    assert abs(a.std() - 1.0) < 0.03 and abs(b.std() - 1.0) < 0.03
 
 
 def test_sky_octant_probit_gaussianises_folded_prior():
@@ -1327,29 +1264,17 @@ def test_make_et_group_flow_proposal_polarisation_quarter():
 
 @requires_group_mixture
 def test_make_et_group_flow_proposal_clustered():
-    """n_clusters_max > 1 wires the clustered flow model; default is off."""
-    from nessai.flowmodel.group_mixture import (
-        ClusteredGroupMixtureFlowModel,
-        GroupMixtureFlowModel,
-    )
+    """Default is a single flow; n_clusters_max > 1 needs a factory."""
+    from nessai.flowmodel.group_mixture import ClusteredGroupMixtureFlowModel
 
     dflt = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
     assert not issubclass(
         dflt._FlowModelClass, ClusteredGroupMixtureFlowModel
     )
 
-    clustered = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, n_clusters_max=3,
-        cluster_max_overlap=0.05, cluster_min_size=150,
-    )
-    fm = clustered._FlowModelClass
-    assert issubclass(fm, ClusteredGroupMixtureFlowModel)
-    assert issubclass(fm, GroupMixtureFlowModel)
-    assert fm.n_clusters_max == 3
-    assert fm.max_cluster_overlap == 0.05
-    assert fm.min_cluster_size == 150
-    # group geometry unchanged
-    assert fm.group_size == 32
+    with pytest.raises(RuntimeError, match="flow_model_factory"):
+        make_et_group_flow_proposal(
+            BNS_PARAMETERS, REFERENCE_TIME, n_clusters_max=3)
 
 
 @requires_group_mixture

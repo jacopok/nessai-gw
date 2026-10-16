@@ -2225,178 +2225,6 @@ def _seam_note(seams, changed, prefix=""):
     return prefix + ", ".join(parts) + (" [moved]" if changed else "")
 
 
-def _lerp_cdf(x, edges, cdf):
-    """Piecewise-linear CDF value at ``x`` (``edges``/``cdf`` 1-D, monotone)."""
-    n = edges.numel() - 1
-    du = edges[1] - edges[0]
-    i = torch.clamp(((x - edges[0]) / du).floor().long(), 0, n - 1)
-    frac = (x - edges[i]) / du
-    return cdf[i] + frac * (cdf[i + 1] - cdf[i]), i
-
-
-def _invert_cdf(y, edges, cdf):
-    """Inverse of :func:`_lerp_cdf`: ``x`` such that ``lerp_cdf(x) == y``."""
-    i = torch.clamp(torch.searchsorted(cdf, y, right=True) - 1, 0, cdf.numel() - 2)
-    span = cdf[i + 1] - cdf[i]
-    frac = torch.where(span > 0, (y - cdf[i]) / span, torch.zeros_like(y))
-    return edges[i] + frac * (edges[i + 1] - edges[i]), i
-
-
-class SkyOctantPullback:
-    r"""Prior-pullback PIT of the folded equal-area sky sub-square.
-
-    Drop-in replacement for :class:`SkyOctantProbit` (same
-    ``canonical_transform`` contract, same ``sky_u`` / ``sky_v`` prime
-    coordinates) that maps the fundamental sub-square
-    ``sky_u in [0, 1/4), sky_v in [0, 1/2)`` to two standard normals through the
-    **exact 2-D probability-integral transform of a supplied density**
-    ``q(sky_u, sky_v)`` rather than the uniform one::
-
-        u1 = F_u(sky_u)            (marginal CDF of q in sky_u)
-        u2 = F_{v|u}(sky_v)        (conditional CDF of q in sky_v given the
-                                    sky_u cell)
-        a  = Phi^-1(u1),   b = Phi^-1(u2)
-
-    The intended ``q`` is the note's analytic prior-pullback sky density
-    (arXiv:.../triangle_degeneracy; the frozen-(2, 2) marginal likelihood
-    ``exp(sky_density.lnp)``, weighted by the volumetric prior, then **folded to
-    the fundamental domain** -- sum of the eight group images).  On the octomodal
-    ET BNS posterior the folded ``q`` predicts the folded sky posterior to
-    KL ~= 0.5 nat (vs ~2.2 nat for the uniform sub-square), so the base flow only
-    has to learn the small residual + the true (weak) localisation on top.
-
-    ``q`` is passed in as a dense grid of **cell-centre densities**
-    ``q_grid[i, j]`` over ``sky_u in [0, 1/4)`` x ``sky_v in [0, 1/2)`` (uniform
-    cells).  It need not be normalised.  The Jacobian uses the piecewise-constant
-    density that is *exactly* the derivative of the piecewise-linear CDFs built
-    from the same grid, so the map and ``log_j`` are consistent::
-
-        log|d(a, b)/d(sky_u, sky_v)| = log q_hat(sky_u, sky_v)
-                                       - log phi(a) - log phi(b)
-
-    with ``q_hat`` the (normalised) piecewise-constant density.
-
-    Parameters
-    ----------
-    q_grid : array_like
-        ``(Nu, Nv)`` non-negative folded-``q`` density at the centres of a
-        uniform grid over ``sky_u in [0, 1/4)`` x ``sky_v in [0, 1/2)``.
-    param_names : list of str, optional
-        Prime-parameter names; must contain ``sky_u`` and ``sky_v``.  Bind later
-        with :meth:`bind` if not given.
-    """
-
-    def __init__(self, q_grid, param_names=None):
-        q = np.asarray(q_grid, dtype=float)
-        if q.ndim != 2:
-            raise ValueError(f"q_grid must be 2-D, got shape {q.shape}")
-        nu, nv = q.shape
-        du, dv = 0.25 / nu, 0.5 / nv
-        q = np.clip(q, 0.0, None)
-        norm = q.sum() * du * dv
-        if not norm > 0:
-            raise ValueError("q_grid integrates to zero.")
-        q = q / norm
-
-        m_u = q.sum(axis=1) * dv                      # marginal density in sky_u
-        C_u = np.concatenate([[0.0], np.cumsum(m_u) * du])
-        C_u /= C_u[-1]
-        cond = q / np.clip(q.sum(axis=1, keepdims=True) * dv, 1e-300, None)
-        C_v = np.concatenate(
-            [np.zeros((nu, 1)), np.cumsum(cond, axis=1) * dv], axis=1
-        )
-        C_v /= C_v[:, -1:]
-
-        self._nu, self._nv = nu, nv
-        self._u_edges = torch.as_tensor(
-            np.linspace(0.0, 0.25, nu + 1), dtype=torch.float64
-        )
-        self._v_edges = torch.as_tensor(
-            np.linspace(0.0, 0.5, nv + 1), dtype=torch.float64
-        )
-        self._C_u = torch.as_tensor(C_u, dtype=torch.float64)
-        self._C_v = torch.as_tensor(C_v, dtype=torch.float64)
-        self._log_m_u = torch.as_tensor(np.log(m_u), dtype=torch.float64)
-        self._log_cond = torch.as_tensor(
-            np.log(np.clip(cond, 1e-300, None)), dtype=torch.float64
-        )
-        self._iu = self._iv = None
-        if param_names is not None:
-            self.bind(param_names)
-
-    def bind(self, param_names):
-        names = list(param_names)
-        if "sky_u" not in names or "sky_v" not in names:
-            raise RuntimeError(
-                "SkyOctantPullback needs sky_u / sky_v in the prime "
-                f"parameters; got {names}."
-            )
-        self._iu = names.index("sky_u")
-        self._iv = names.index("sky_v")
-
-    def _dtype_cast(self, ref):
-        return (
-            self._u_edges.to(ref.dtype), self._v_edges.to(ref.dtype),
-            self._C_u.to(ref.dtype), self._C_v.to(ref.dtype),
-            self._log_m_u.to(ref.dtype), self._log_cond.to(ref.dtype),
-        )
-
-    def forward(self, canon):
-        iu, iv = self._iu, self._iv
-        ue, ve, Cu, Cv, log_mu, log_cond = self._dtype_cast(canon)
-        su = torch.clamp(canon[:, iu], _SKY_PROBIT_EPS, 0.25 - _SKY_PROBIT_EPS)
-        sv = torch.clamp(canon[:, iv], _SKY_PROBIT_EPS, 0.5 - _SKY_PROBIT_EPS)
-
-        u1, iu_cell = _lerp_cdf(su, ue, Cu)
-        dvv = ve[1] - ve[0]
-        jv = torch.clamp(((sv - ve[0]) / dvv).floor().long(), 0, self._nv - 1)
-        frac_v = (sv - ve[jv]) / dvv
-        row = Cv[iu_cell]
-        u2 = torch.gather(row, 1, jv[:, None])[:, 0] + frac_v * (
-            torch.gather(row, 1, (jv + 1)[:, None])[:, 0]
-            - torch.gather(row, 1, jv[:, None])[:, 0]
-        )
-
-        a = torch.special.ndtri(torch.clamp(u1, _SKY_PROBIT_EPS, 1 - _SKY_PROBIT_EPS))
-        b = torch.special.ndtri(torch.clamp(u2, _SKY_PROBIT_EPS, 1 - _SKY_PROBIT_EPS))
-        t = canon.clone()
-        t[:, iu] = a
-        t[:, iv] = b
-        log_q = log_mu[iu_cell] + torch.gather(
-            log_cond[iu_cell], 1, jv[:, None]
-        )[:, 0]
-        log_j = log_q - _log_std_normal_pdf(a) - _log_std_normal_pdf(b)
-        return t, log_j
-
-    def inverse(self, t):
-        iu, iv = self._iu, self._iv
-        ue, ve, Cu, Cv, log_mu, log_cond = self._dtype_cast(t)
-        a, b = t[:, iu], t[:, iv]
-        u1 = torch.clamp(torch.special.ndtr(a), _SKY_PROBIT_EPS, 1 - _SKY_PROBIT_EPS)
-        u2 = torch.clamp(torch.special.ndtr(b), _SKY_PROBIT_EPS, 1 - _SKY_PROBIT_EPS)
-
-        su, iu_cell = _invert_cdf(u1, ue, Cu)
-        row = Cv[iu_cell]
-        jv = torch.clamp(
-            torch.searchsorted(row, u2[:, None], right=True)[:, 0] - 1,
-            0, self._nv - 2,
-        )
-        c0 = torch.gather(row, 1, jv[:, None])[:, 0]
-        c1 = torch.gather(row, 1, (jv + 1)[:, None])[:, 0]
-        span = c1 - c0
-        frac = torch.where(span > 0, (u2 - c0) / span, torch.zeros_like(u2))
-        sv = ve[jv] + frac * (ve[jv + 1] - ve[jv])
-
-        canon = t.clone()
-        canon[:, iu] = su
-        canon[:, iv] = sv
-        log_q = log_mu[iu_cell] + torch.gather(
-            log_cond[iu_cell], 1, jv[:, None]
-        )[:, 0]
-        log_j = -log_q + _log_std_normal_pdf(a) + _log_std_normal_pdf(b)
-        return canon, log_j
-
-
 #: Parameters the ``chirp-distance`` coordinate is a function of, besides
 #: ``luminosity_distance`` itself.
 CHIRP_DISTANCE_REQUIRES = ("chirp_mass", "theta_jn", "ra", "dec", "psi")
@@ -3178,57 +3006,21 @@ def recommended_polarisation_offset(psi):
     }
 
 
-def _select_flow_model_factory(
-    n_clusters_max,
-    flow_model_factory=None,
-    cluster_method="gmm",
-    cluster_max_overlap=0.05,
-    cluster_min_size=200,
-    cluster_bg_weight=0.0,
-    cluster_k_grow_patience=2,
-    cluster_centroid_ema=None,
-):
+def _select_flow_model_factory(n_clusters_max, flow_model_factory=None):
     """The ``make_*_group_mixture_flow`` callable a group proposal factory uses:
-    nessai's single-flow factory, its clustered one (``n_clusters_max > 1``), or
-    a user ``flow_model_factory`` (only with ``n_clusters_max > 1``)."""
+    nessai's single-flow factory, or a user ``flow_model_factory`` (needed for
+    ``n_clusters_max > 1``, e.g.
+    :func:`~nessai_gw.clustering.make_diagonal_split_cluster_flow`)."""
     from nessai.flowmodel.group_mixture import make_group_mixture_flow
 
-    if int(n_clusters_max) > 1 and flow_model_factory is not None:
-        _make_flow_model = flow_model_factory
-    elif int(n_clusters_max) > 1:
-        try:
-            from nessai.flowmodel.group_mixture import (
-                make_clustered_group_mixture_flow,
-            )
-        except ImportError as exc:  # pragma: no cover
+    if int(n_clusters_max) > 1:
+        if flow_model_factory is None:
             raise RuntimeError(
-                "n_clusters_max > 1 requires a version of nessai whose "
-                "nessai.flowmodel.group_mixture ships "
-                "make_clustered_group_mixture_flow."
-            ) from exc
-
-        def _make_flow_model(**gm):
-            extra = {}
-            _sig = inspect.signature(make_clustered_group_mixture_flow)
-            if "k_grow_patience" in _sig.parameters:
-                extra["k_grow_patience"] = int(cluster_k_grow_patience)
-            if "centroid_ema" in _sig.parameters:
-                extra["centroid_ema"] = (
-                    None if cluster_centroid_ema is None
-                    else float(cluster_centroid_ema)
-                )
-            return make_clustered_group_mixture_flow(
-                n_clusters_max=int(n_clusters_max),
-                cluster_method=cluster_method,
-                max_cluster_overlap=float(cluster_max_overlap),
-                min_cluster_size=int(cluster_min_size),
-                bg_weight=float(cluster_bg_weight),
-                **extra,
-                **gm,
+                "n_clusters_max > 1 needs a flow_model_factory (e.g. "
+                "nessai_gw.clustering.make_diagonal_split_cluster_flow)."
             )
-    else:
-        _make_flow_model = make_group_mixture_flow
-    return _make_flow_model
+        return flow_model_factory
+    return make_group_mixture_flow
 
 
 class ReferenceEpoch:
@@ -3544,18 +3336,11 @@ def make_triangular_group_flow_proposal(
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
     sky_2d="auto",
-    sky_pullback=None,
     psi_single=True,
     polarisation_quarter=True,
     polarisation_offset=0.0,
     phase_coordinates="polarisation-phase",
     n_clusters_max=1,
-    cluster_method="gmm",
-    cluster_max_overlap=0.05,
-    cluster_min_size=200,
-    cluster_bg_weight=0.0,
-    cluster_k_grow_patience=2,
-    cluster_centroid_ema=None,
     flow_model_factory=None,
     polarisation_ellipse=None,
     polarisation_ellipse_scale=1.0,
@@ -3596,15 +3381,13 @@ def make_triangular_group_flow_proposal(
     epoch chosen before every training, instead of the merger's.  Needs
     ``prime_space`` and ``chirp_distance``.
 
-    ``flow_model_factory`` (optional): a callable used *instead of*
-    :func:`nessai.flowmodel.group_mixture.make_clustered_group_mixture_flow`
-    when ``n_clusters_max > 1``.  It is called with the group keyword arguments
-    (``group_action_fn`` / ``prime_space_action`` / ``param_names`` /
-    ``group_size`` / ``mode_factor_sizes`` / ``canonical_transform`` / ...) and
-    must return a ``FlowModel`` subclass.  Use it to plug in a bespoke
-    clustering strategy (e.g. a fixed rule-based split); pre-bind its own
-    configuration with :func:`functools.partial`.  The ``cluster_*`` arguments
-    above are then ignored.
+    ``flow_model_factory`` (needed when ``n_clusters_max > 1``): a callable
+    called with the group keyword arguments (``group_action_fn`` /
+    ``prime_space_action`` / ``param_names`` / ``group_size`` /
+    ``mode_factor_sizes`` / ``canonical_transform`` / ...) that returns a
+    ``FlowModel`` subclass, e.g.
+    :func:`nessai_gw.clustering.make_diagonal_split_cluster_flow`; pre-bind its
+    own configuration with :func:`functools.partial`.
 
     The returned class combines :class:`nessai_gw.proposals.GWReparamMixin`
     (GW reparameterisations by parameter name),
@@ -3668,16 +3451,6 @@ def make_triangular_group_flow_proposal(
         :class:`SkyOctantProbit`).  Default ``"auto"`` -- on whenever
         ``prime_space`` and ``gaussianise_sky`` are both active (the machinery
         it needs), off otherwise.  Requires the prime-space path.
-    sky_pullback : array_like or None, optional
-        ``(Nu, Nv)`` grid of the analytic prior-pullback sky density ``q``,
-        **folded to the fundamental sub-square** ``sky_u in [0, 1/4)`` x
-        ``sky_v in [0, 1/2)`` (see
-        :class:`SkyOctantPullback` and :func:`folded_sky_pullback_grid`).  When
-        given, :class:`SkyOctantPullback` replaces :class:`SkyOctantProbit` as
-        the group-mixture ``canonical_transform``: the base flow then sees the
-        folded sky posterior mapped (exact 2-D PIT of ``q``) to ~two standard
-        normals rather than the uniform sub-square, so it need only learn the
-        small residual.  Requires ``sky_2d``.  Default ``None`` (uniform PIT).
     psi_single : bool, optional
         Carry ``psi`` as a single ``psi_prime`` coordinate
         (:class:`~nessai_gw.reparameterisations.phase.SingleAngleReparameterisation`)
@@ -3722,26 +3495,8 @@ def make_triangular_group_flow_proposal(
         ``phase_coordinates`` passed to
         :func:`triangular_group_reparameterisations`.
     n_clusters_max : int
-        If ``> 1``, use a *clustered* base flow: up to ``n_clusters_max``
-        independent group-mixture experts, one per data cluster (found each
-        training round by GMM + BIC, ``k`` in ``[1, n_clusters_max]``), each
-        with its own per-branch canonical standardisation and latent ball.
-        ``k`` collapses to 1 -- byte identical to the single-flow behaviour --
-        whenever the data is not decisively multi-modal.  Default ``1`` (off).
-    cluster_method : {"gmm", "kmeans"}
-        Clustering algorithm on the standardised folded base frame.
-    cluster_max_overlap : float
-        A ``k``-way split is accepted only if at most this fraction of points
-        are ambiguous between clusters (GMM responsibility < 0.8).  Smaller =
-        more conservative; ``k`` collapses to 1 when no split is clean.
-    cluster_min_size : int
-        Smallest allowed cluster (a split producing a smaller cluster is
-        rejected).
-    cluster_bg_weight : float
-        Weight of an always-on background expert (a group-mixture flow trained
-        on all live points, blended into the mixture at ``k >= 2`` so the
-        density never craters where the per-cluster experts leave off).  ``0``
-        (default) -> no background expert.
+        If ``> 1``, use a *clustered* base flow built by
+        ``flow_model_factory``.  Default ``1`` (off).
     polarisation_ellipse : nessai_gw._ellipse.PolarisationEllipse, optional
         Sample the inclination *relative to the value the sky position forces*
         (the ``polarisation-ellipse`` reparameterisation) instead of with
@@ -3850,12 +3605,6 @@ def make_triangular_group_flow_proposal(
     _make_flow_model = _select_flow_model_factory(
         n_clusters_max,
         flow_model_factory,
-        cluster_method=cluster_method,
-        cluster_max_overlap=cluster_max_overlap,
-        cluster_min_size=cluster_min_size,
-        cluster_bg_weight=cluster_bg_weight,
-        cluster_k_grow_patience=cluster_k_grow_patience,
-        cluster_centroid_ema=cluster_centroid_ema,
     )
 
     if gaussianise_sky == "auto":
@@ -3888,18 +3637,6 @@ def make_triangular_group_flow_proposal(
             "so PrimeSpaceTriangularGroupAction has no fast-path support for "
             "it."
         )
-    if sky_pullback is not None:
-        if not sky_2d:
-            raise RuntimeError(
-                "sky_pullback needs sky_2d (it replaces the SkyOctantProbit "
-                "PIT of the (sky_u, sky_v) sub-square)."
-            )
-        sky_pullback = np.asarray(sky_pullback, dtype=float)
-        if sky_pullback.ndim != 2:
-            raise ValueError(
-                f"sky_pullback must be a 2-D grid; got shape {sky_pullback.shape}"
-            )
-
     names = list(sampling_parameters)
     missing = sorted(
         {"ra", "dec", "theta_jn", "psi", "phase", "geocent_time"} - set(names)
@@ -3969,10 +3706,6 @@ def make_triangular_group_flow_proposal(
             if not sky_2d:
                 gm_kwargs["canonical_transform"] = SkyOctantGaussianiser(
                     prime_names
-                )
-            elif sky_pullback is not None:
-                gm_kwargs["canonical_transform"] = SkyOctantPullback(
-                    sky_pullback, prime_names
                 )
             else:
                 # The sky sub-square is 1/wedge of sky_u wide: 1/8 for a
@@ -4241,18 +3974,11 @@ def make_et_group_flow_proposal(
     sky_radial_sigma=0.15,
     gaussianise_sky="auto",
     sky_2d="auto",
-    sky_pullback=None,
     psi_single=True,
     polarisation_quarter=True,
     polarisation_offset=0.0,
     phase_coordinates="polarisation-phase",
     n_clusters_max=1,
-    cluster_method="gmm",
-    cluster_max_overlap=0.05,
-    cluster_min_size=200,
-    cluster_bg_weight=0.0,
-    cluster_k_grow_patience=2,
-    cluster_centroid_ema=None,
     flow_model_factory=None,
     polarisation_ellipse=None,
     polarisation_ellipse_scale=1.0,
@@ -4292,18 +4018,11 @@ def make_et_group_flow_proposal(
         gaussianise_sky=gaussianise_sky,
         sky_radial_sigma=sky_radial_sigma,
         sky_2d=sky_2d,
-        sky_pullback=sky_pullback,
         psi_single=psi_single,
         polarisation_quarter=polarisation_quarter,
         polarisation_offset=polarisation_offset,
         phase_coordinates=phase_coordinates,
         n_clusters_max=n_clusters_max,
-        cluster_method=cluster_method,
-        cluster_max_overlap=cluster_max_overlap,
-        cluster_min_size=cluster_min_size,
-        cluster_bg_weight=cluster_bg_weight,
-        cluster_k_grow_patience=cluster_k_grow_patience,
-        cluster_centroid_ema=cluster_centroid_ema,
         flow_model_factory=flow_model_factory,
         polarisation_ellipse=polarisation_ellipse,
         polarisation_ellipse_scale=polarisation_ellipse_scale,
