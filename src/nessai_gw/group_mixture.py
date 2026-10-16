@@ -1761,6 +1761,23 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         if param_names is not None:
             self.bind(param_names)
 
+    # -- sky domain of the underlying group ---------------------------------
+    @property
+    def _base(self):
+        return getattr(self._action, "_action", self._action)
+
+    @property
+    def _sky_wedge(self):
+        """Fraction of ``sky_u`` the sky domain spans: 1/4 for the
+        triangle's Z4, 1/8 for a single interferometer's D4h."""
+        return float(getattr(self._base, "sky_wedge", 0.25))
+
+    @property
+    def _sky_seam_fixed(self):
+        """The sky domain's walls are mirror lines (single interferometer):
+        a shifted wedge is not a fundamental domain, so the sky seam stays 0."""
+        return bool(getattr(self._base, "sky_seam_fixed", False))
+
     def bind(self, param_names):
         names = list(param_names)
         need = ("sky_u", "sky_v", "psi_prime", "delta_phase", "theta_jn_prime")
@@ -1843,7 +1860,7 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
 
     def _in_target(self, z, seams, phase_mode):
         cu, cpsi, cdel, cphi = seams
-        ok = torch.remainder(z[:, self._iu] - cu, 1.0) < 0.25
+        ok = torch.remainder(z[:, self._iu] - cu, 1.0) < self._sky_wedge
         ok = ok & (z[:, self._iv] <= 0.5)
         if phase_mode:
             ok = ok & (torch.remainder(self._phi_n(z) - cphi, 2.0) < 0.5)
@@ -1878,21 +1895,23 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         found = torch.zeros(z.shape[0], dtype=torch.bool, device=z.device)
         if z.shape[0] == 0:
             return out, found
-        cu = seams[0]
-        k = torch.remainder(
-            -torch.floor(4.0 * torch.remainder(z[:, self._iu] - cu, 1.0)), 4
-        ).long()
-        cand, found = self._first_in_target(
-            z, [k + 8 * j for j in range(4)], seams, phase_mode
-        )
-        out[found] = cand[found]
+        if not self._sky_seam_fixed:
+            # triangle: the sky Z4 element from sky_u in closed form
+            cu = seams[0]
+            k = torch.remainder(
+                -torch.floor(4.0 * torch.remainder(z[:, self._iu] - cu, 1.0)), 4
+            ).long()
+            cand, found = self._first_in_target(
+                z, [k + 8 * j for j in range(4)], seams, phase_mode
+            )
+            out[found] = cand[found]
         if not bool(found.all()):
             rest = (~found).nonzero(as_tuple=True)[0]
             cand, fr = self._first_in_target(
                 z[rest],
                 [
                     torch.full_like(rest, g)
-                    for g in range(self._action._action.group_size)
+                    for g in range(self._base.group_size)
                 ],
                 seams,
                 phase_mode,
@@ -1905,7 +1924,8 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         cu, cpsi, cdel, cphi = seams
         y = z.clone()
         y[:, self._iu] = torch.clamp(
-            torch.remainder(z[:, self._iu] - cu, 1.0), max=0.25 * (1 - 1e-7)
+            torch.remainder(z[:, self._iu] - cu, 1.0),
+            max=self._sky_wedge * (1 - 1e-7),
         )
         y[:, self._ipsi] = torch.remainder(z[:, self._ipsi] + 1 - cpsi, 2.0) - 1
         if phase_mode:
@@ -1917,7 +1937,7 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     def _box_valid(self, y, phase_mode):
         u, v = y[:, self._iu], y[:, self._iv]
         a, b = y[:, self._ipsi], y[:, self._idp]
-        ok = (u >= 0) & (u < 0.25) & (v >= 0) & (v <= 0.5)
+        ok = (u >= 0) & (u < self._sky_wedge) & (v >= 0) & (v <= 0.5)
         if phase_mode:
             return ok & (a >= -1) & (a < 1) & (b >= 0) & (b < 0.5)
         return ok & (a >= -1) & (a < 0) & (b >= -1) & (b < 0)
@@ -2028,9 +2048,12 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         (cu, cpsi, cdel, cphi), phase = before
         was_seen = bool(self._seen)
 
-        u = canon[:, self._iu].double().cpu().numpy()
-        cu, du, _ = self._choose_seam(4.0 * u, 1.0, 4.0 * cu)
-        cu = cu / 4.0
+        if self._sky_seam_fixed:
+            cu, du = 0.0, float("nan")
+        else:
+            u = canon[:, self._iu].double().cpu().numpy()
+            cu, du, _ = self._choose_seam(4.0 * u, 1.0, 4.0 * cu)
+            cu = cu / 4.0
 
         z1, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
         phi_n = self._phi_n(z1).double().cpu().numpy()
@@ -3427,8 +3450,15 @@ def make_triangular_group_flow_proposal(
     chirp_distance_inversion=False,
     waveform_phase=None,
     reference_epoch=None,
+    base_action=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
+
+    ``base_action`` (optional): the physical-space group action to use instead
+    of a :class:`TriangularDetectorGroupAction` built from ``plane_normal``
+    (which is then ignored), e.g. a
+    :class:`~nessai_gw.single_detector.SingleInterferometerGroupAction`.  It
+    must carry the same ``phase_reflection`` / ``polarisation_quarter``.
 
     ``reference_epoch`` (optional): a dict of :class:`ReferenceEpoch`
     arguments (``max_hours``, and optionally ``n_grid`` and ``tolerance``).
@@ -3751,15 +3781,16 @@ def make_triangular_group_flow_proposal(
             "is chosen on the chirp distance)."
         )
 
-    base_action = TriangularDetectorGroupAction(
-        reference_time=reference_time,
-        plane_normal=plane_normal,
-        vertex=vertex,
-        phase_reflection=phase_reflection,
-        azimuth_offset=azimuth_offset,
-        polarisation_quarter=polarisation_quarter,
-        polarisation_offset=polarisation_offset,
-    )
+    if base_action is None:
+        base_action = TriangularDetectorGroupAction(
+            reference_time=reference_time,
+            plane_normal=plane_normal,
+            vertex=vertex,
+            phase_reflection=phase_reflection,
+            azimuth_offset=azimuth_offset,
+            polarisation_quarter=polarisation_quarter,
+            polarisation_offset=polarisation_offset,
+        )
 
     if prime_space:
         prime_names = _prime_parameter_names(
