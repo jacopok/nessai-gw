@@ -1208,6 +1208,11 @@ class PrimeSpaceTriangularGroupAction:
 
     def in_fundamental_domain(self, point_dict):
         acted, aux = self._decode(point_dict)
+        # _decode carries a dummy cos(theta_jn) (the action only flips it);
+        # a predicate on it (the inclination reflection's cos >= 0) needs
+        # its sign
+        acted = dict(acted)
+        acted["cos_theta_jn"] = aux["sign_ct"]
         if self._arg_ab is not None:
             # (arg_alpha, arg_beta) are a bijective image of (psi, phase), so the
             # base predicate's raw psi / phase cuts (psi in [0, pi/2), phase in
@@ -1381,10 +1386,17 @@ class SkyOctantProbit:
     ``1``, the probit of the whole unit square.  ``u_scale=None`` leaves
     ``sky_u`` alone (it is then an angle of a
     :class:`CircularCanonicalTransform`) and probits ``sky_v`` only.
+
+    ``theta_half=True`` (a group that folds ``cos theta_jn >= 0``, i.e. the
+    single interferometer's inclination reflection) also maps the canonical
+    ``theta_jn_prime in [-1, 0]`` to ``Phi^-1(1 + theta_jn_prime)``, so the
+    base flow sees no wall at edge-on either.
     """
 
-    def __init__(self, param_names=None, u_scale=4.0, v_scale=2.0):
-        self._iu = self._iv = None
+    def __init__(self, param_names=None, u_scale=4.0, v_scale=2.0,
+                 theta_half=False):
+        self._iu = self._iv = self._ith = None
+        self.theta_half = bool(theta_half)
         self.u_scale = None if u_scale is None else float(u_scale)
         self.v_scale = float(v_scale)
         self._log_scale = float(
@@ -1403,9 +1415,33 @@ class SkyOctantProbit:
             )
         self._iu = names.index("sky_u")
         self._iv = names.index("sky_v")
+        if self.theta_half:
+            if "theta_jn_prime" not in names:
+                raise RuntimeError(
+                    "SkyOctantProbit(theta_half=True) needs theta_jn_prime "
+                    f"in the prime parameters; got {names}.")
+            self._ith = names.index("theta_jn_prime")
 
     def forward(self, canon):
         """``canon -> (t, log|det dt/dcanon|)`` (sky block probit-mapped)."""
+        t, log_j = self._forward_sky(canon)
+        if self._ith is None:
+            return t, log_j
+        c = torch.clamp(1.0 + canon[:, self._ith], _SKY_PROBIT_EPS,
+                        1.0 - _SKY_PROBIT_EPS)
+        t[:, self._ith] = torch.special.ndtri(c)
+        return t, log_j - _log_std_normal_pdf(t[:, self._ith])
+
+    def inverse(self, t):
+        """``t -> (canon, log|det dcanon/dt|)``."""
+        canon, log_j = self._inverse_sky(t)
+        if self._ith is None:
+            return canon, log_j
+        b = t[:, self._ith]
+        canon[:, self._ith] = torch.special.ndtr(b) - 1.0
+        return canon, log_j + _log_std_normal_pdf(b)
+
+    def _forward_sky(self, canon):
         iu, iv = self._iu, self._iv
         if self.u_scale is None:
             v = torch.clamp(
@@ -1434,8 +1470,7 @@ class SkyOctantProbit:
         )
         return t, log_j
 
-    def inverse(self, t):
-        """``t -> (canon, log|det dcanon/dt|)``."""
+    def _inverse_sky(self, t):
         iu, iv = self._iu, self._iv
         if self.u_scale is None:
             b = t[:, iv]
@@ -1809,6 +1844,12 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         return float(getattr(self._base, "sky_wedge", 0.25))
 
     @property
+    def _theta_half(self):
+        """The group folds ``cos theta_jn >= 0`` (single interferometer with
+        the inclination reflection): ``theta_jn_prime <= 0``."""
+        return bool(getattr(self._base, "inclination_reflection", False))
+
+    @property
     def _sky_seam_fixed(self):
         """The sky domain's walls are mirror lines (single interferometer):
         a shifted wedge is not a fundamental domain, so the sky seam stays 0."""
@@ -1898,6 +1939,8 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         cu, cpsi, cdel, cphi = seams
         ok = torch.remainder(z[:, self._iu] - cu, 1.0) < self._sky_wedge
         ok = ok & (z[:, self._iv] <= 0.5)
+        if self._theta_half:
+            ok = ok & (z[:, self._ith] <= 0)
         if phase_mode:
             ok = ok & (torch.remainder(self._phi_n(z) - cphi, 2.0) < 0.5)
         else:
@@ -1974,6 +2017,8 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         u, v = y[:, self._iu], y[:, self._iv]
         a, b = y[:, self._ipsi], y[:, self._idp]
         ok = (u >= 0) & (u < self._sky_wedge) & (v >= 0) & (v <= 0.5)
+        if self._theta_half:
+            ok = ok & (y[:, self._ith] <= 0)
         if phase_mode:
             return ok & (a >= -1) & (a < 1) & (b >= 0) & (b < 0.5)
         return ok & (a >= -1) & (a < 0) & (b >= -1) & (b < 0)
@@ -3930,7 +3975,16 @@ def make_triangular_group_flow_proposal(
                     sky_pullback, prime_names
                 )
             else:
-                gm_kwargs["canonical_transform"] = SkyOctantProbit(prime_names)
+                # The sky sub-square is 1/wedge of sky_u wide: 1/8 for a
+                # single interferometer. Runs before the inclination
+                # reflection probit 4 sky_u there (a wall at the mirror line
+                # in the base flow), kept so that they resume unchanged.
+                theta_half = bool(getattr(
+                    base_action, "inclination_reflection", False))
+                wedge = (float(getattr(base_action, "sky_wedge", 0.25))
+                         if theta_half else 0.25)
+                gm_kwargs["canonical_transform"] = SkyOctantProbit(
+                    prime_names, u_scale=1.0 / wedge, theta_half=theta_half)
             if boundary_reflection:
                 logger.warning(
                     "gaussianise_sky pushes the octant walls to +/-inf; "

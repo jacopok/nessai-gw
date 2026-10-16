@@ -37,8 +37,21 @@ The detector-centre arrival time is invariant under the whole group, and in
 the measure-preserving coordinates (``ra``, ``sin_dec``, ``cos_theta_jn``,
 ``psi``, ``phase``) every element has unit Jacobian.
 
+A lone interferometer also measures a single complex amplitude per mode,
+``A = F_+ (1 + cos^2 theta_jn) / 2 - i F_x cos theta_jn``, so at a *fixed*
+sky position ``theta_jn -> pi - theta_jn`` with ``psi -> 2 beta - psi``
+leaves it unchanged, ``beta`` the polarisation angle at which ``F_x`` vanishes
+(the reflection keeps ``F_+`` and flips ``F_x``); with ``phi_jl -> phi_jl +
+pi`` for precessing spins, as for the improper elements.  It is exact for the
+(2, 2) mode at frozen Earth orientation, commutes with the sky group (which
+maps ``D`` to ``+-D`` and so keeps its principal axes) and with the
+polarisation/phase steps, and is the optional third factor
+(``inclination_reflection``): 64 -> 128 elements.  None of the sky elements
+can stand in for it: they all move the sky.
+
 Mode index: ``g = k + 4 r + 8 v`` for the sky element ``C4^k sigma_h^r
-sigma_v^v`` (``sigma_v`` applied first) and ``phase_step = mode // 16``.
+sigma_v^v`` (``sigma_v`` applied first), ``phase_step = (mode // 16) % n_phase``
+and the inclination reflection ``mode // (16 n_phase)``.
 """
 
 from __future__ import annotations
@@ -162,6 +175,10 @@ class SingleInterferometerGroupAction(TriangularDetectorGroupAction):
     azimuth_offset : float, optional
         Must be 0: the sky domain's walls are mirror lines of the group, so
         they cannot be moved.
+    inclination_reflection : bool, optional
+        Add the fixed-sky ``theta_jn -> pi - theta_jn``, ``psi -> 2 beta -
+        psi`` element (module docstring); the fundamental domain then also
+        has ``cos theta_jn >= 0``.
     """
 
     #: The sky fundamental domain spans this fraction of ``sky_u`` and its
@@ -181,6 +198,7 @@ class SingleInterferometerGroupAction(TriangularDetectorGroupAction):
         azimuth_offset=0.0,
         polarisation_quarter=False,
         polarisation_offset=0.0,
+        inclination_reflection=False,
     ):
         if azimuth_offset:
             raise ValueError(
@@ -211,7 +229,13 @@ class SingleInterferometerGroupAction(TriangularDetectorGroupAction):
         self.set_gmst(self.gmst)
         n_phase = 4 if self.polarisation_quarter else (
             2 if self.phase_reflection else 1)
-        self.group_size = SINGLE_INTERFEROMETER_SKY_GROUP_SIZE * n_phase
+        self._n_phase = n_phase
+        self.inclination_reflection = bool(inclination_reflection)
+        self.group_size = (SINGLE_INTERFEROMETER_SKY_GROUP_SIZE * n_phase
+                           * (2 if self.inclination_reflection else 1))
+        # detector tensor, up to scale: the effective arms' e1 e1 - e2 e2
+        self._D = torch.as_tensor(
+            basis.T @ np.diag([1.0, -1.0, 0.0]) @ basis, dtype=torch.float64)
         self._mats = torch.as_tensor(_SKY_MATRICES, dtype=torch.float64)
         self._signs = torch.as_tensor(_SKY_SIGNS, dtype=torch.float64)
         self._improper = torch.as_tensor(_SKY_DETS < 0)
@@ -248,41 +272,72 @@ class SingleInterferometerGroupAction(TriangularDetectorGroupAction):
 
     # -- modes ---------------------------------------------------------------
 
-    def _split(self, modes):
+    def _split3(self, modes):
+        """``(sky, phase_step, tau)`` of the mode index."""
         modes = torch.as_tensor(modes)
         n = SINGLE_INTERFEROMETER_SKY_GROUP_SIZE
-        return torch.remainder(modes, n), torch.div(
-            modes, n, rounding_mode="floor")
+        n_phase = getattr(self, "_n_phase", None) or (
+            4 if self.polarisation_quarter else (
+                2 if self.phase_reflection else 1))
+        rest = torch.div(modes, n, rounding_mode="floor")
+        return (torch.remainder(modes, n), torch.remainder(rest, n_phase),
+                torch.div(rest, n_phase, rounding_mode="floor") == 1)
+
+    def _split(self, modes):
+        sky, step, _ = self._split3(modes)
+        return sky, step
 
     def _decode(self, modes: torch.Tensor):
-        """``(k, improper, phase_step)``: the sky quarter-turn count, whether
-        the sky element flips ``cos theta_jn``, and the phase-sector element
-        (bool for the ``Z2``, int ``0..3`` for the quarter turn)."""
-        sky, step = self._split(modes)
+        """``(k, reflected, phase_step)``: the sky quarter-turn count, whether
+        the element flips ``cos theta_jn`` (an improper sky element or,
+        exclusively, the inclination reflection), and the phase-sector
+        element (bool for the ``Z2``, int ``0..3`` for the quarter turn)."""
+        sky, step, tau = self._split3(modes)
         k = torch.remainder(sky, 4).to(torch.float64)
-        improper = self._improper.to(sky.device)[sky]
+        reflected = self._improper.to(sky.device)[sky] ^ tau
         if self.polarisation_quarter:
-            return k, improper, torch.remainder(step, 4)
-        return k, improper, step == 1
+            return k, reflected, step
+        return k, reflected, step == 1
 
     def _invert_modes(self, modes: torch.Tensor) -> torch.Tensor:
-        sky, step = self._split(modes)
+        sky, step, tau = self._split3(modes)
         if self.polarisation_quarter:
             step = torch.remainder(-step, 4)
+        n = SINGLE_INTERFEROMETER_SKY_GROUP_SIZE
         return (
-            step * SINGLE_INTERFEROMETER_SKY_GROUP_SIZE
-            + self._sky_inverse.to(sky.device)[sky]
+            self._sky_inverse.to(sky.device)[sky]
+            + n * step + n * self._n_phase * tau.to(step.dtype)
         )
 
     @property
     def mode_factor_sizes(self):
-        """The sky ``D4h`` as one factor, the phase sector as another."""
+        """The sky ``D4h`` as one factor, the phase sector as another, the
+        inclination reflection as a third."""
         n = SINGLE_INTERFEROMETER_SKY_GROUP_SIZE
         if self.polarisation_quarter:
-            return [n, 4]
-        if self.phase_reflection:
-            return [n, 2]
-        return [n]
+            sizes = [n, 4]
+        elif self.phase_reflection:
+            sizes = [n, 2]
+        else:
+            sizes = [n]
+        if getattr(self, "inclination_reflection", False):
+            sizes = (sizes if len(sizes) > 1 else sizes + [1]) + [2]
+        return sizes
+
+    def _null_cross_angle(self, u, v, w):
+        """``beta``, the polarisation angle at which ``F_x`` vanishes (mod
+        ``pi/2``), for the direction with polarisation basis ``u, v`` (as
+        ``m = -u sin psi - v cos psi``) and propagation axis ``w``:
+        ``F_+(psi) = a cos 2 psi + b sin 2 psi`` is extremal there."""
+        D = self._D.to(u.dtype)
+
+        def f_plus(m):
+            n = torch.linalg.cross(w, m, dim=-1)
+            return ((m @ D) * m).sum(-1) - ((n @ D) * n).sum(-1)
+
+        a = f_plus(-v)
+        b = f_plus(-(u + v) / np.sqrt(2.0))
+        return 0.5 * torch.atan2(b, a)
 
     # -- action ----------------------------------------------------------------
 
@@ -297,7 +352,7 @@ class SingleInterferometerGroupAction(TriangularDetectorGroupAction):
         modes = torch.as_tensor(modes, device=ra.device)
         if inverse:
             modes = self._invert_modes(modes)
-        sky, phase_step = self._split(modes)
+        sky, phase_step, tau = self._split3(modes)
         if not self.polarisation_quarter:
             phase_step = phase_step == 1
 
@@ -320,6 +375,11 @@ class SingleInterferometerGroupAction(TriangularDetectorGroupAction):
             self._signs.to(dtype)[sky] < 0, 0.5 * np.pi, 0.0
         )
         improper = self._improper.to(sky.device)[sky]
+        if getattr(self, "inclination_reflection", False):
+            # fixed sky, F_x -> -F_x: psi reflected about F_x's zero
+            beta = self._null_cross_angle(u_t, v_t, w_t)
+            psi_t = torch.where(tau, 2.0 * beta - psi_t, psi_t)
+            improper = improper ^ tau
         cos_theta_jn = torch.where(improper, -cos_theta_jn, cos_theta_jn)
 
         if self.polarisation_quarter:
@@ -364,6 +424,8 @@ class SingleInterferometerGroupAction(TriangularDetectorGroupAction):
         )
         mask = (torch.remainder(lam_f, _TWO_PI) < 0.25 * np.pi) & (
             beta_f >= 0.0)
+        if getattr(self, "inclination_reflection", False):
+            mask = mask & (point_dict["cos_theta_jn"] >= 0.0)
         if self.phase_reflection:
             mask = mask & (
                 torch.remainder(point_dict["phase"], _TWO_PI) < np.pi
@@ -386,6 +448,7 @@ def make_single_interferometer_group_flow_proposal(
     phase_reflection=False,
     polarisation_quarter=True,
     polarisation_offset=0.0,
+    inclination_reflection=False,
     **kwargs,
 ):
     """:func:`~nessai_gw.group_mixture.make_triangular_group_flow_proposal`
@@ -404,6 +467,7 @@ def make_single_interferometer_group_flow_proposal(
         phase_reflection=phase_reflection,
         polarisation_quarter=polarisation_quarter,
         polarisation_offset=polarisation_offset,
+        inclination_reflection=inclination_reflection,
     )
     return make_triangular_group_flow_proposal(
         sampling_parameters,

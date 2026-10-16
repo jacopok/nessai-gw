@@ -9,6 +9,7 @@ bilby = pytest.importorskip("bilby")
 from nessai_gw.group_mixture import (  # noqa: E402
     AdaptiveFundamentalDomain,
     PrimeSpaceTriangularGroupAction,
+    SkyOctantProbit,
     _prime_parameter_names,
 )
 from nessai_gw.single_detector import (  # noqa: E402
@@ -92,13 +93,16 @@ def test_matches_bilby_arms(alpha):
     assert np.allclose(ifo.geometry.x, x) and np.allclose(ifo.geometry.y, y)
 
 
+@pytest.mark.parametrize("tau", [False, True])
 @pytest.mark.parametrize("alpha", [0.5 * np.pi, np.pi / 3])
-def test_response_invariant_and_inverse(alpha):
+def test_response_invariant_and_inverse(alpha, tau):
     ifo = _interferometer(alpha)
     action = SingleInterferometerGroupAction.from_interferometer(
-        ifo, REFERENCE_TIME, polarisation_quarter=True
+        ifo, REFERENCE_TIME, polarisation_quarter=True,
+        inclination_reflection=tau,
     )
-    assert action.group_size == 64
+    assert action.group_size == (128 if tau else 64)
+    assert int(np.prod(action.mode_factor_sizes)) == action.group_size
     assert np.isclose(action.opening_angle, alpha)
     p = _points()
     n = len(p["ra"])
@@ -127,10 +131,11 @@ def names():
     )
 
 
-@pytest.fixture(scope="module")
-def prime_action(names):
+@pytest.fixture(scope="module", params=[False, True], ids=["D4h", "D4h+tau"])
+def prime_action(names, request):
     base = SingleInterferometerGroupAction.from_geodetic(
-        REFERENCE_TIME, LAT, LON, BISECTOR, polarisation_quarter=True
+        REFERENCE_TIME, LAT, LON, BISECTOR, polarisation_quarter=True,
+        inclination_reflection=request.param,
     )
     return PrimeSpaceTriangularGroupAction(base, names)
 
@@ -181,6 +186,8 @@ def test_adaptive_domain_round_trip(prime_action, names, prime_points, seams):
         found |= ok
     assert found.all()
     afd = AdaptiveFundamentalDomain(prime_action, names)
+    if prime_action._action.inclination_reflection:
+        assert (canon[:, names.index("theta_jn_prime")] <= 0).all()
     afd._seams.copy_(torch.tensor(seams, dtype=torch.float64))
     afd._seen.fill_(True)
     y = afd.forward(canon)
@@ -191,15 +198,17 @@ def test_adaptive_domain_round_trip(prime_action, names, prime_points, seams):
     assert float(afd._seams[0]) == 0.0
 
 
+@pytest.mark.parametrize("tau", [False, True])
 @pytest.mark.parametrize("shift_phi_jl", [True, False])
-def test_precessing_response_invariance(shift_phi_jl):
+def test_precessing_response_invariance(shift_phi_jl, tau):
     """The response to a precessing binary (IMRPhenomPv2) is invariant under
     every element, the polarisation/phase quarter turn included, with the
     improper ones shifting phi_jl by pi -- and not without the shift."""
     pytest.importorskip("lalsimulation")
     ifo = _interferometer(0.5 * np.pi)
     action = SingleInterferometerGroupAction.from_interferometer(
-        ifo, REFERENCE_TIME, polarisation_quarter=True
+        ifo, REFERENCE_TIME, polarisation_quarter=True,
+        inclination_reflection=tau,
     )
     frequencies = np.arange(20.0, 200.0, 0.25)
     intrinsic = dict(mass_1=30.0, mass_2=20.0, a_1=0.8, a_2=0.5, tilt_1=1.3,
@@ -242,3 +251,50 @@ def test_precessing_response_invariance(shift_phi_jl):
         assert worst_improper < 1e-6
     else:
         assert worst_improper > 0.2
+
+
+def test_commutes_with_the_sky_group():
+    """The inclination reflection commutes with every element (the product
+    of the factors is a direct product)."""
+    action = SingleInterferometerGroupAction.from_geodetic(
+        REFERENCE_TIME, LAT, LON, BISECTOR, polarisation_quarter=True,
+        inclination_reflection=True,
+    )
+    p = _points(n=50)
+    n = 50
+    tau = torch.full((n,), 64)
+    for g in range(64):
+        modes = torch.full((n,), g)
+        a = action(action(p, modes), tau)
+        b = action(action(p, tau), modes)
+        for k in ("ra", "sin_dec", "cos_theta_jn", "phase"):
+            assert torch.allclose(a[k], b[k], atol=1e-8), (g, k)
+        dpsi = torch.remainder(a["psi"] - b["psi"] + 0.5 * np.pi, np.pi)
+        assert torch.allclose(dpsi, torch.full_like(dpsi, 0.5 * np.pi),
+                              atol=1e-8), g
+
+
+def test_half_theta_probit_round_trip(names):
+    rng = np.random.default_rng(5)
+    n = 400
+    cols = [rng.uniform(0.0, 0.125, n) if nm == "sky_u"
+            else rng.uniform(0.0, 0.5, n) if nm == "sky_v"
+            else rng.uniform(-0.99, -0.01, n) if nm == "theta_jn_prime"
+            else rng.uniform(-1.0, 1.0, n) for nm in names]
+    canon = torch.as_tensor(np.stack(cols, axis=1), dtype=torch.float64)
+    tr = SkyOctantProbit(names, u_scale=8.0, theta_half=True)
+    t, log_j = tr.forward(canon)
+    back, log_j_inv = tr.inverse(t)
+    assert torch.allclose(back, canon, atol=1e-9)
+    assert torch.allclose(log_j, -log_j_inv, atol=1e-9)
+    # numerical Jacobian of the theta block
+    i = names.index("theta_jn_prime")
+    h = 1e-6
+    up, down = canon.clone(), canon.clone()
+    up[:, i] += h
+    down[:, i] -= h
+    j_num = torch.log((tr.forward(up)[0][:, i] - tr.forward(down)[0][:, i])
+                      / (2 * h))
+    tr0 = SkyOctantProbit(names, u_scale=8.0)
+    _, log_j0 = tr0.forward(canon)
+    assert torch.allclose(log_j - log_j0, j_num, atol=1e-5)
