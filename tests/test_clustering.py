@@ -10,6 +10,7 @@ from nessai_gw.clustering import (
     fit_live_diagonal_split,
     gaussian_split_gain,
     make_diagonal_split_cluster_flow,
+    rank_gaussianise,
     split_coordinates,
 )
 
@@ -115,9 +116,60 @@ def test_k_want_activates_on_heteroscedastic_split():
     assert np.mean(w._split_labels(t[:, 0], t[:, 1]) == truth) > 0.97
 
 
+def test_k_want_ignores_zeroed_circular_columns():
+    """The routing frame zeroes circular dims (``circular-psi-phase``): the
+    constant columns must not make the gain -inf and block the split."""
+    _, _, t, truth = _two_populations()
+    t = np.column_stack([t[:, :4], np.zeros(len(t)), t[:, 4:], np.zeros(len(t))])
+    w = _FakeWrapper()
+    assert w._k_want(t, None, None, None) == 2
+    assert np.isfinite(float(w._split_gain)) and float(w._split_gain) > 1.0
+    assert np.mean(w._split_labels(t[:, 0], t[:, 1]) == truth) > 0.97
+
+
 def test_k_want_stays_one_on_single_gaussian():
     t = np.random.default_rng(4).normal(size=(6000, 6))
     assert _FakeWrapper()._k_want(t, None, None, None) == 1
+
+
+def test_rank_gaussianise_keeps_order_with_normal_marginal():
+    x = np.random.default_rng(5).standard_cauchy((4001, 2))
+    z = rank_gaussianise(x)
+    assert np.array_equal(np.argsort(z, axis=0), np.argsort(x, axis=0))
+    assert np.allclose(z.mean(0), 0.0, atol=1e-12)
+    assert np.allclose(z.std(0), 1.0, atol=0.01)
+
+
+def _blind_band(n=6000, seed=6):
+    """(c, v) uniform plus Gaussian coordinates, and a chirp distance
+    ``d / |response|`` (``d`` uniform in volume) whose response vanishes in
+    a band of ``v``: the heavy tail there is the only structure."""
+    rng = np.random.default_rng(seed)
+    c, v = rng.uniform(size=n), rng.uniform(size=n)
+    d = rng.uniform(size=n) ** (1 / 3)
+    response = np.abs(v - 0.8) + 0.01 * rng.uniform(size=n)
+    t = np.column_stack([c, v, d / response, rng.normal(size=(n, 4))])
+    return t
+
+
+class _NamedFakeWrapper(_FakeWrapper):
+    def __init__(self, names, **kwargs):
+        super().__init__(**kwargs)
+        self.experts = [type("Expert", (), {"param_names": names})()]
+
+
+def test_k_want_ignores_heavy_chirp_distance_tail():
+    """A line through the band where the chirp distance diverges must not
+    activate the split on the raw tail alone."""
+    t = _blind_band()
+    names = ["theta_jn_prime", "sky_v", "chirp_distance", "a", "b", "c", "d"]
+    raw = _NamedFakeWrapper(names)
+    raw.rank_gaussian_params = ()
+    assert raw._k_want(t, None, None, None) == 2
+    assert float(raw._split_gain) > 1.0
+    w = _NamedFakeWrapper(names)
+    assert w._k_want(t, None, None, None) == 1
+    assert float(w._split_gain) < w.gain_on
 
 
 def test_k_want_respects_activate_min_round():

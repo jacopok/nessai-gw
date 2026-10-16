@@ -165,6 +165,7 @@ import torch
 from . import nessai_logger
 from ._geometry import SPEED_OF_LIGHT as _SPEED_OF_LIGHT
 from ._geometry import greenwich_mean_sidereal_time as _greenwich_mean_sidereal_time
+from ._geometry import gmst_hours_before
 
 logger = nessai_logger.getChild(__name__)
 
@@ -445,7 +446,6 @@ class TriangularDetectorGroupAction:
             if self.phase_reflection
             else TRIANGULAR_DETECTOR_GROUP_SIZE
         )
-        self.gmst = _greenwich_mean_sidereal_time(self.reference_time)
         self.plane_normal = np.asarray(plane_normal, dtype=float)
         self._basis_np = _detector_frame_basis(
             self.plane_normal, self.azimuth_offset
@@ -453,7 +453,20 @@ class TriangularDetectorGroupAction:
         self._basis = torch.as_tensor(self._basis_np, dtype=torch.float64)
         self.vertex = np.asarray(vertex, dtype=float)
         self._vertex = torch.as_tensor(self.vertex, dtype=torch.float64)
+        #: GMST at the merger; :meth:`set_gmst` moves the frame away from it
+        self.merger_gmst = _greenwich_mean_sidereal_time(self.reference_time)
+        self.set_gmst(self.merger_gmst)
 
+    def set_gmst(self, gmst):
+        """Place the detector frame at the Earth's orientation ``gmst``.
+
+        The group acts in the frame of the detector at one instant (by
+        default the merger).  For a signal that lasts hours the response
+        rotates with the Earth, and the near-degeneracies are those of the
+        frame at the epoch the data constrain the most
+        (:class:`ReferenceEpoch`).
+        """
+        self.gmst = float(gmst)
         # Equatorial (ra-based) Cartesian sky vector -> detector-frame vector,
         # with GMST folded in: ``w_f = R @ w_eq`` where
         # ``w_eq = (cos dec cos ra, cos dec sin ra, sin dec)`` and ``w_f`` is
@@ -839,6 +852,26 @@ class PrimeSpaceTriangularGroupAction:
             action.sky_frame_rotation, dtype=torch.float64
         )
         self.bind(prime_names)
+
+    def set_gmst(self, gmst):
+        """Move the group's detector frame (and the flow's sky frame it
+        decodes) to the Earth's orientation ``gmst``."""
+        if self._ellipse is not None:
+            raise NotImplementedError(
+                "a movable frame is not supported with the polarisation "
+                "ellipse")
+        self._action.set_gmst(gmst)
+        self._sky_R = torch.as_tensor(
+            self._action.sky_frame_rotation, dtype=torch.float64
+        )
+
+    @property
+    def sky_frame_rotation(self):
+        return self._action.sky_frame_rotation
+
+    @property
+    def sky_frame_merger_gmst(self):
+        return self._action.merger_gmst
 
     # -- binding -----------------------------------------------------------
 
@@ -1345,14 +1378,19 @@ class SkyOctantProbit:
     ``u_scale`` / ``v_scale`` (default ``4`` / ``2``, the triangular fold) are
     the reciprocal widths of the sub-square; a sky that no group folds (e.g.
     the baseline-aligned sky of :mod:`nessai_gw.network_group`) uses ``1`` /
-    ``1``, the probit of the whole unit square.
+    ``1``, the probit of the whole unit square.  ``u_scale=None`` leaves
+    ``sky_u`` alone (it is then an angle of a
+    :class:`CircularCanonicalTransform`) and probits ``sky_v`` only.
     """
 
     def __init__(self, param_names=None, u_scale=4.0, v_scale=2.0):
         self._iu = self._iv = None
-        self.u_scale = float(u_scale)
+        self.u_scale = None if u_scale is None else float(u_scale)
         self.v_scale = float(v_scale)
-        self._log_scale = float(np.log(self.u_scale * self.v_scale))
+        self._log_scale = float(
+            np.log((1.0 if self.u_scale is None else self.u_scale)
+                   * self.v_scale)
+        )
         if param_names is not None:
             self.bind(param_names)
 
@@ -1369,6 +1407,15 @@ class SkyOctantProbit:
     def forward(self, canon):
         """``canon -> (t, log|det dt/dcanon|)`` (sky block probit-mapped)."""
         iu, iv = self._iu, self._iv
+        if self.u_scale is None:
+            v = torch.clamp(
+                self.v_scale * canon[:, iv], _SKY_PROBIT_EPS,
+                1.0 - _SKY_PROBIT_EPS,
+            )
+            b = torch.special.ndtri(v)
+            t = canon.clone()
+            t[:, iv] = b
+            return t, self._log_scale - _log_std_normal_pdf(b)
         u = torch.clamp(
             self.u_scale * canon[:, iu], _SKY_PROBIT_EPS, 1.0 - _SKY_PROBIT_EPS
         )
@@ -1390,6 +1437,11 @@ class SkyOctantProbit:
     def inverse(self, t):
         """``t -> (canon, log|det dcanon/dt|)``."""
         iu, iv = self._iu, self._iv
+        if self.u_scale is None:
+            b = t[:, iv]
+            canon = t.clone()
+            canon[:, iv] = torch.special.ndtr(b) / self.v_scale
+            return canon, -self._log_scale + _log_std_normal_pdf(b)
         a, b = t[:, iu], t[:, iv]
         canon = t.clone()
         canon[:, iu] = torch.special.ndtr(a) / self.u_scale
@@ -1400,6 +1452,108 @@ class SkyOctantProbit:
             + _log_std_normal_pdf(b)
         )
         return canon, log_j
+
+
+def _wrap_angle(t):
+    """Wrap to ``[-pi, pi)``, also when rounding hits ``pi``."""
+    y = torch.remainder(t + np.pi, _TWO_PI)
+    return torch.where(y >= _TWO_PI, y - _TWO_PI, y) - np.pi
+
+
+class CircularCanonicalTransform:
+    """Periodic canonical coordinates as angles for a circular base flow.
+
+    ``canonical_transform`` for
+    :class:`nessai.flowmodel.group_mixture.DiscreteGroupMixtureFlowWrapper`,
+    to be used with its ``circular_parameters`` and a circular base flow
+    (:class:`nessai.flows.circular.CircularNeuralSplineFlow`).  Each
+    coordinate ``c`` in ``circles`` maps to the angle
+
+        t = 2 pi (c - start) / length - pi   (mod 2 pi, in [-pi, pi))
+
+    so that ``[start, start + length)`` -- in the network and triangular
+    groups the fundamental-domain interval of ``psi_prime`` or
+    ``delta_phase``, whose ends the polarisation/phase quarter turn glues --
+    goes once round the circle, and the base flow sees no seam.  The inverse
+    returns the representative in ``[start, start + length)`` wrapped into
+    the coordinate's range.  Any other coordinate goes through ``inner`` (e.g.
+    :class:`SkyOctantProbit` for the sky), which must leave the circular ones
+    untouched.
+
+    Parameters
+    ----------
+    circles : dict
+        ``{name: (start, length, (low, high))}`` in prime units: the interval
+        that wraps once round the circle and the coordinate's full range.
+    param_names : list of str, optional
+        The prime-parameter names (re-bind with :meth:`bind`).
+    inner : canonical transform, optional
+        Applied to the remaining coordinates.
+    """
+
+    def __init__(self, circles, param_names=None, inner=None):
+        self.circles = {
+            str(n): (float(a), float(b), (float(r[0]), float(r[1])))
+            for n, (a, b, r) in circles.items()
+        }
+        self.inner = inner
+        self._idx = None
+        self._log_scale = float(
+            sum(np.log(_TWO_PI / b) for _, b, _ in self.circles.values())
+        )
+        if param_names is not None:
+            self.bind(param_names)
+
+    @property
+    def circular_parameters(self):
+        """Names of the coordinates mapped to angles."""
+        return list(self.circles)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        missing = [n for n in self.circles if n not in names]
+        if missing:
+            raise RuntimeError(
+                f"CircularCanonicalTransform needs {missing} in the prime "
+                f"parameters; got {names}."
+            )
+        self._idx = {n: names.index(n) for n in self.circles}
+        if self.inner is not None and hasattr(self.inner, "bind"):
+            self.inner.bind(names)
+
+    def forward(self, canon):
+        """``canon -> (t, log|det dt/dcanon|)``."""
+        if self.inner is None:
+            t, log_j = canon.clone(), canon.new_zeros(canon.shape[0])
+        else:
+            t, log_j = self.inner.forward(canon)
+            t = t.clone()
+        for name, (start, length, _) in self.circles.items():
+            i = self._idx[name]
+            t[:, i] = _wrap_angle(
+                _TWO_PI * (canon[:, i] - start) / length - np.pi
+            )
+        return t, log_j + self._log_scale
+
+    def inverse(self, t):
+        """``t -> (canon, log|det dcanon/dt|)``."""
+        if self.inner is None:
+            canon, log_j = t.clone(), t.new_zeros(t.shape[0])
+        else:
+            canon, log_j = self.inner.inverse(t)
+            canon = canon.clone()
+        for name, (start, length, (low, high)) in self.circles.items():
+            i = self._idx[name]
+            c = start + (_wrap_angle(t[:, i]) + np.pi) * (length / _TWO_PI)
+            c = low + torch.remainder(c - low, high - low)
+            canon[:, i] = torch.where(c >= high, c - (high - low), c)
+        return canon, log_j - self._log_scale
+
+
+#: ``circles`` entry of the ``psi_prime`` / ``delta_phase`` coordinates in a
+#: fundamental domain folded by the polarisation/phase quarter turn (and the
+#: (2, 2) reflection) with zero offsets: ``[-1, 0)`` of the range ``[-1, 1)``.
+POLARISATION_PHASE_CIRCLE = (-1.0, 1.0, (-1.0, 1.0))
 
 
 class PhaseQuarterRecanonicaliser(torch.nn.Module):
@@ -1534,7 +1688,7 @@ class PhaseQuarterRecanonicaliser(torch.nn.Module):
             if abs(off - 0.25) > self.recentre_tol:
                 self._cbar.fill_(float(np.mod(centre - 0.25, 0.5)))
                 changed = True
-        logger.info(
+        (logger.info if was != self.enabled else logger.debug)(
             "Phase-quarter recanon: spread(phase mod pi/2)/spread(delta_phase)"
             " = %.3f/%.3f = %.3f (on < %.2f, off > %.2f), n=%d, %s%s",
             sp_phase, sp_delta, ratio, self.on_ratio, self.off_ratio,
@@ -1591,6 +1745,24 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     position exceeds ``move_density`` (relative to uniform) *and*
     ``move_factor`` times the minimum -- a seam in an empty or flat region is
     left alone, so the base-flow frame stays fixed between rounds.
+
+    With ``circular_psi_phase`` the base flow sees ``(psi', delta')`` as a
+    torus (each of ``[-1, 0)`` once round a circle), which needs no seams;
+    there, ``allow_phase_mode`` instead picks the torus' basis.  Writing
+    ``x = psi' + 1`` and ``y = s (delta' + 1)`` (mod 1), the ``psi_prime``
+    and ``delta_phase`` slots carry
+
+        a = p x + q y,   b = m x + n y   (mod 1, then shifted to [-1, 0))
+
+    for an integer matrix ``[[p, q], [m, n]]`` of determinant +-1 (exactly
+    the linear maps of the torus onto itself: unit Jacobian, bijective).
+    ``b`` is the combination the expert pins: ``(m, n) = (0, 1)`` is
+    ``delta_phase`` (the identity), ``(1, -2)`` is ``-2 phase/pi``, i.e.
+    ``phase mod pi/2`` (the plateau: two ``delta``-vs-``psi`` ridges half a
+    period apart become one band).  :meth:`update` takes the ``(m, n)`` of
+    :attr:`torus_candidates` whose ``b`` has the least wrapped spread over the
+    expert's points, moving off the current one only when that spread is
+    below ``torus_switch_ratio`` times the current one's.
     """
 
     on_ratio = 0.5
@@ -1600,18 +1772,47 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     move_density = 0.25
     move_factor = 2.0
     min_points = 50
+    #: ``(m, n)``, the pinned torus combination ``m x + n y`` (circular mode).
+    torus_candidates = (
+        (0, 1), (1, 0), (1, 1), (1, -1), (1, 2), (1, -2), (2, 1), (2, -1),
+    )
+    torus_switch_ratio = 0.6
 
-    def __init__(self, action, param_names=None, allow_phase_mode=False):
+    def __init__(self, action, param_names=None, allow_phase_mode=False,
+                 circular_psi_phase=False):
         super().__init__()
         self._action = action
+        #: ``psi_prime`` / ``delta_phase`` are angles of a circular base flow
+        #: (:class:`CircularCanonicalTransform`), which needs no seams there:
+        #: keep them at zero and only move the sky seam.
+        self.circular_psi_phase = bool(circular_psi_phase)
         self.allow_phase_mode = bool(allow_phase_mode)
         # (c_u, c_psi, c_delta, c_phase) in prime units
         self.register_buffer("_seams", torch.zeros(4, dtype=torch.float64))
         self.register_buffer("_phase_mode", torch.zeros((), dtype=torch.bool))
         self.register_buffer("_seen", torch.zeros((), dtype=torch.bool))
+        # (m, n) of the torus basis (circular mode); (0, 1) is the identity
+        self.register_buffer("_torus", torch.tensor([0, 1], dtype=torch.int64))
         self._names = None
         if param_names is not None:
             self.bind(param_names)
+
+    # -- sky domain of the underlying group ---------------------------------
+    @property
+    def _base(self):
+        return getattr(self._action, "_action", self._action)
+
+    @property
+    def _sky_wedge(self):
+        """Fraction of ``sky_u`` the sky domain spans: 1/4 for the
+        triangle's Z4, 1/8 for a single interferometer's D4h."""
+        return float(getattr(self._base, "sky_wedge", 0.25))
+
+    @property
+    def _sky_seam_fixed(self):
+        """The sky domain's walls are mirror lines (single interferometer):
+        a shifted wedge is not a fundamental domain, so the sky seam stays 0."""
+        return bool(getattr(self._base, "sky_seam_fixed", False))
 
     def bind(self, param_names):
         names = list(param_names)
@@ -1631,9 +1832,57 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     def _state(self):
         return tuple(float(c) for c in self._seams), bool(self._phase_mode)
 
+    def _torus_mn(self):
+        t = getattr(self, "_torus", None)
+        return (0, 1) if t is None else (int(t[0]), int(t[1]))
+
     def _identity(self):
         seams, phase = self._state()
-        return not phase and not any(seams)
+        return not phase and not any(seams) and self._torus_mn() == (0, 1)
+
+    # -- torus basis (circular mode) ---------------------------------------
+    @staticmethod
+    def _torus_matrix(m, n):
+        """``[[p, q], [m, n]]`` of determinant +-1 (identity for (0, 1))."""
+        if m == 0:
+            return ((1, 0), (0, 1)) if n == 1 else ((-1, 0), (0, -1))
+        if m == 1:
+            return ((0, 1), (1, n))
+        if m == 2 and n % 2:
+            return ((1, (n - 1) // 2), (2, n))
+        raise ValueError(f"no unimodular completion coded for (m, n)={(m, n)}")
+
+    def _torus_xy(self, z):
+        """``(x, y)`` in ``[0, 1)`` from the prime ``(psi', delta')``."""
+        x = torch.remainder(z[:, self._ipsi] + 1, 1.0)
+        y = torch.remainder(self._s(z) * (z[:, self._idp] + 1), 1.0)
+        return x, y
+
+    def _torus_forward(self, y_box):
+        mn = self._torus_mn()
+        if mn == (0, 1):
+            return y_box
+        (p, q), (m, n) = self._torus_matrix(*mn)
+        x, yy = self._torus_xy(y_box)
+        out = y_box.clone()
+        out[:, self._ipsi] = torch.remainder(p * x + q * yy, 1.0) - 1
+        out[:, self._idp] = torch.remainder(m * x + n * yy, 1.0) - 1
+        return out
+
+    def _torus_inverse(self, t):
+        mn = self._torus_mn()
+        if mn == (0, 1):
+            return t
+        (p, q), (m, n) = self._torus_matrix(*mn)
+        det = p * n - q * m
+        a = torch.remainder(t[:, self._ipsi] + 1, 1.0)
+        b = torch.remainder(t[:, self._idp] + 1, 1.0)
+        x = torch.remainder(det * (n * a - q * b), 1.0)
+        yy = torch.remainder(det * (-m * a + p * b), 1.0)
+        out = t.clone()
+        out[:, self._ipsi] = x - 1
+        out[:, self._idp] = torch.remainder(self._s(t) * yy, 1.0) - 1
+        return out
 
     # -- geometry ------------------------------------------------------------
     def _s(self, z):
@@ -1647,7 +1896,7 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
 
     def _in_target(self, z, seams, phase_mode):
         cu, cpsi, cdel, cphi = seams
-        ok = torch.remainder(z[:, self._iu] - cu, 1.0) < 0.25
+        ok = torch.remainder(z[:, self._iu] - cu, 1.0) < self._sky_wedge
         ok = ok & (z[:, self._iv] <= 0.5)
         if phase_mode:
             ok = ok & (torch.remainder(self._phi_n(z) - cphi, 2.0) < 0.5)
@@ -1682,21 +1931,23 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         found = torch.zeros(z.shape[0], dtype=torch.bool, device=z.device)
         if z.shape[0] == 0:
             return out, found
-        cu = seams[0]
-        k = torch.remainder(
-            -torch.floor(4.0 * torch.remainder(z[:, self._iu] - cu, 1.0)), 4
-        ).long()
-        cand, found = self._first_in_target(
-            z, [k + 8 * j for j in range(4)], seams, phase_mode
-        )
-        out[found] = cand[found]
+        if not self._sky_seam_fixed:
+            # triangle: the sky Z4 element from sky_u in closed form
+            cu = seams[0]
+            k = torch.remainder(
+                -torch.floor(4.0 * torch.remainder(z[:, self._iu] - cu, 1.0)), 4
+            ).long()
+            cand, found = self._first_in_target(
+                z, [k + 8 * j for j in range(4)], seams, phase_mode
+            )
+            out[found] = cand[found]
         if not bool(found.all()):
             rest = (~found).nonzero(as_tuple=True)[0]
             cand, fr = self._first_in_target(
                 z[rest],
                 [
                     torch.full_like(rest, g)
-                    for g in range(self._action._action.group_size)
+                    for g in range(self._base.group_size)
                 ],
                 seams,
                 phase_mode,
@@ -1709,7 +1960,8 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         cu, cpsi, cdel, cphi = seams
         y = z.clone()
         y[:, self._iu] = torch.clamp(
-            torch.remainder(z[:, self._iu] - cu, 1.0), max=0.25 * (1 - 1e-7)
+            torch.remainder(z[:, self._iu] - cu, 1.0),
+            max=self._sky_wedge * (1 - 1e-7),
         )
         y[:, self._ipsi] = torch.remainder(z[:, self._ipsi] + 1 - cpsi, 2.0) - 1
         if phase_mode:
@@ -1721,7 +1973,7 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
     def _box_valid(self, y, phase_mode):
         u, v = y[:, self._iu], y[:, self._iv]
         a, b = y[:, self._ipsi], y[:, self._idp]
-        ok = (u >= 0) & (u < 0.25) & (v >= 0) & (v <= 0.5)
+        ok = (u >= 0) & (u < self._sky_wedge) & (v >= 0) & (v <= 0.5)
         if phase_mode:
             return ok & (a >= -1) & (a < 1) & (b >= 0) & (b < 0.5)
         return ok & (a >= -1) & (a < 0) & (b >= -1) & (b < 0)
@@ -1746,12 +1998,13 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
             return canon
         seams, phase = self._state()
         z, _ = self._map_to(canon, seams, phase)
-        return self._to_box(z, seams, phase)
+        return self._torus_forward(self._to_box(z, seams, phase))
 
     def inverse(self, y):
         if self._identity():
             return y
         seams, phase = self._state()
+        y = self._torus_inverse(y)
         valid = self._box_valid(y, phase)
         z = self._from_box(y, seams, phase)
         canon, found = self._map_to(z, (0.0, 0.0, 0.0, 0.0), False)
@@ -1790,6 +2043,39 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
             return best, d_cur, float(dens[i_min])
         return float(current), d_cur, float(dens[i_min])
 
+    def _update_torus(self, z):
+        """Pick the torus basis off the expert's points ``z`` (canonical,
+        in the current sky domain); return a note for the retrain summary."""
+        x, y = (v.double().cpu().numpy() for v in self._torus_xy(z))
+        spread = {
+            mn: self._circ_spread(mn[0] * x + mn[1] * y, 1.0)
+            for mn in self.torus_candidates
+        }
+        cur = self._torus_mn()
+        sp_cur = spread.get(cur)
+        if sp_cur is None:
+            sp_cur = self._circ_spread(cur[0] * x + cur[1] * y, 1.0)
+        best = min(spread, key=spread.get)
+        new = cur
+        if best != cur and spread[best] < self.torus_switch_ratio * sp_cur:
+            new = best
+        self._torus.copy_(torch.tensor(new, dtype=torch.int64))
+        logger.debug(
+            "Adaptive domain: torus spreads %s; current %s, now %s, n=%d",
+            ", ".join(f"{k}: {v:.3f}" for k, v in spread.items()),
+            cur, new, z.shape[0],
+        )
+        if new != cur:
+            logger.info(
+                "Adaptive domain: torus basis %s -> %s (spread %.3f -> %.3f)",
+                cur, new, sp_cur, spread[new],
+            )
+        return (
+            f"pins {new[0]}psi'{new[1]:+d}delta' (spread {spread[new]:.2f}"
+            f" vs {spread[(0, 1)]:.2f} delta)"
+            + (" [switched]" if new != cur else "")
+        )
+
     @torch.no_grad()
     def update(self, canon):
         if canon.shape[0] < self.min_points:
@@ -1798,9 +2084,12 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         (cu, cpsi, cdel, cphi), phase = before
         was_seen = bool(self._seen)
 
-        u = canon[:, self._iu].double().cpu().numpy()
-        cu, du, _ = self._choose_seam(4.0 * u, 1.0, 4.0 * cu)
-        cu = cu / 4.0
+        if self._sky_seam_fixed:
+            cu, du = 0.0, float("nan")
+        else:
+            u = canon[:, self._iu].double().cpu().numpy()
+            cu, du, _ = self._choose_seam(4.0 * u, 1.0, 4.0 * cu)
+            cu = cu / 4.0
 
         z1, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
         phi_n = self._phi_n(z1).double().cpu().numpy()
@@ -1816,7 +2105,15 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
                 new_phase = False
         switched = new_phase != phase
 
-        if new_phase:
+        torus_before = self._torus_mn()
+        torus_note = ""
+        if getattr(self, "circular_psi_phase", False):
+            cpsi = cdel = cphi = 0.0
+            dpsi = ddel = dphi = float("nan")
+            new_phase = switched = False
+            if self.allow_phase_mode:
+                torus_note = self._update_torus(z1)
+        elif new_phase:
             cphi, dphi, _ = self._choose_seam(
                 phi_n, 0.5, cphi, force=switched or not was_seen
             )
@@ -1839,8 +2136,9 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
         changed = (
             after[1] != before[1]
             or any(abs(a - b) > 1e-12 for a, b in zip(after[0], before[0]))
+            or self._torus_mn() != torus_before
         )
-        logger.info(
+        logger.debug(
             "Adaptive domain: %s-folded (phase/delta spread ratio %.3f), seams "
             "sky_u %.4f psi %.4f delta %.4f phase %.4f; density at old seams "
             "sky %.2f psi %.2f delta %.2f phase %.2f (x uniform), n=%d%s",
@@ -1848,7 +2146,38 @@ class AdaptiveFundamentalDomain(torch.nn.Module):
             du, dpsi, ddel, dphi, canon.shape[0],
             " [changed]" if changed else "",
         )
+        self._retrain_note = _seam_note(
+            [("sky_u", cu, du), ("psi", cpsi, dpsi),
+             ("delta", cdel, ddel), ("phase", cphi, dphi)],
+            changed, prefix="phase-folded; " if new_phase else "",
+        )
+        if torus_note:
+            self._retrain_note = (
+                torus_note + "; " + self._retrain_note
+                if self._retrain_note else torus_note
+            )
+        if switched:
+            logger.info(
+                "Adaptive domain: switched to the %s fold (phase/delta spread "
+                "ratio %.3f)", "phase" if new_phase else "delta", ratio,
+            )
         return changed
+
+
+def _seam_note(seams, changed, prefix=""):
+    """The adaptive domain's part of the retrain summary (see
+    :meth:`nessai.flowmodel.group_mixture.GroupFlowProposalMixin._log_retrain_summary`):
+    each seam it moved this round (``(name, position, density)``, with a
+    NaN density for a seam it does not adapt) and the density at its old
+    position, relative to uniform."""
+    parts = [
+        f"{name} seam {pos:.3f} (density {dens:.2f})"
+        for name, pos, dens in seams
+        if np.isfinite(dens)
+    ]
+    if not parts:
+        return None
+    return prefix + ", ".join(parts) + (" [moved]" if changed else "")
 
 
 def _lerp_cdf(x, edges, cdf):
@@ -2050,6 +2379,13 @@ def triangular_group_reparameterisations(
     effective_spin=False,
     log_mass_ratio=True,
     precessing_spin=False,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
+    time_reference_frequency=None,
+    time_frequency_range=(8.0, 300.0),
+    time_to_merger=None,
+    chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2116,6 +2452,21 @@ def triangular_group_reparameterisations(
       unset): ``ln q`` rescaled to its bounds, as Roulet et al. sample it, with
       the ``mass_ratio`` edge detection / boundary inversion (the ``q = 1``
       edge) done in log space.
+    * ``lambda_1``, ``lambda_2`` -> ``effective-tidal-deformability`` (only if
+      ``effective_tidal_deformability`` is set; replaces the per-star ``logit`` above):
+      ``lambda_tilde_prime`` (a monotonic function of the binary
+      deformability at fixed ``q``) and ``lambda_diff_prime`` (the position
+      along the line of constant binary deformability), both ``N(0, 1)``
+      under uniform priors; see
+      :class:`~nessai_gw.reparameterisations.EffectiveTidalDeformabilityReparameterisation`.
+      ``mass_ratio`` is a prerequisite.
+    * ``chirp_mass`` -> ``doppler-chirp-mass`` (only if ``doppler_vector`` is
+      given): the chirp mass in a frame comoving with the Earth,
+      ``chirp_mass * (1 - n . v / c)``, rescaled to its bounds, for runs whose
+      detector response follows the Earth's orbit (the sampled masses are then
+      barycentric, and their posterior a thin ridge along the sky); see
+      :class:`~nessai_gw.reparameterisations.DopplerChirpMassReparameterisation`.
+      ``ra`` / ``dec`` are prerequisites.
 
     Every other parameter is left to
     :meth:`nessai_gw.proposals.GWReparamMixin.add_default_reparameterisations`
@@ -2192,6 +2543,49 @@ def triangular_group_reparameterisations(
         Reparameterise the six precessing spin parameters jointly
         (``precessing-spin``, above).  Needs ``mass_ratio`` to be sampled;
         does nothing unless all six are.  Default ``False``.
+    effective_tidal_deformability : bool, optional
+        Reparameterise ``lambda_1``, ``lambda_2`` jointly as
+        ``(lambda_tilde_prime, lambda_diff_prime)`` (``effective-tidal-deformability``)
+        instead of one ``logit`` coordinate each.  Needs ``mass_ratio``; does
+        nothing without both deformabilities.  Default ``False``.
+    doppler_vector : array_like, optional
+        The Earth's barycentric velocity over ``c`` (3 components, in the axes
+        of ``ra`` / ``dec``) at the coalescence time.  When given, sample the
+        Doppler-corrected chirp mass (``doppler-chirp-mass``).  Only for runs
+        whose detector response includes the orbital motion.  Default
+        ``None``.
+    time_reference_frequency : float or "adaptive", optional
+        Measure the ``t_det`` coordinate at the moment the 22 mode passes this
+        frequency (Hz) instead of at merger, which takes out its degeneracy
+        with the masses and spins (Tissino et al. 2026, Eq. 18); ``"adaptive"``
+        picks the frequency of least spread over the training points before
+        every training.  The 2PN time to merger uses the chirp mass in the
+        Earth's frame when ``doppler_vector`` is given, so ``t_det`` stays
+        invariant under the group.  Needs ``chirp_mass`` and ``mass_ratio``
+        (and reads ``chi_1`` / ``chi_2`` if sampled).  Default ``None`` (merger).
+    time_frequency_range : tuple of float, optional
+        Search range (Hz) for ``time_reference_frequency="adaptive"``, and
+        for the reference frequency of the phase with ``waveform_phase``.
+    chirp_distance_inversion : bool, optional
+        With ``chirp_distance``: reflect the luminosity distance about the
+        prior edge the live points pile up against, training on mirror copies
+        (see
+        :class:`~nessai_gw.reparameterisations.ChirpDistanceReparameterisation`).
+        Default ``False``.
+    time_to_merger : str, optional
+        ``"module:function"`` giving the waveform's time from each frequency to
+        the merger (see
+        :class:`~nessai_gw.reparameterisations.DetectorCenterTimeReparameterisation`):
+        the time is then 2PN plus a correction fitted to the waveform at every
+        training, tides included.  Needs ``time_reference_frequency``.
+        Default ``None`` (2PN).
+    waveform_phase : str, optional
+        ``"module:function"`` giving the phase of the waveform's 22 mode (see
+        :class:`~nessai_gw.reparameterisations.PolarisationPhaseReparameterisation`):
+        ``delta_phase`` is then measured at a reference frequency chosen and
+        fitted at every training, which unwinds its helix around the
+        intrinsic parameters.  Needs ``phase_coordinates="polarisation-phase"``,
+        ``chirp_mass`` and ``mass_ratio``.  Default ``None`` (merger phase).
 
     Returns
     -------
@@ -2234,6 +2628,23 @@ def triangular_group_reparameterisations(
             "precessing_spin needs 'mass_ratio' in the sampling parameters; "
             "pass precessing_spin=False."
         )
+    effective_tidal_deformability = bool(effective_tidal_deformability) and {
+        "lambda_1", "lambda_2"
+    } <= set(sampling_parameters)
+    if effective_tidal_deformability and "mass_ratio" not in sampling_parameters:
+        raise ValueError(
+            "effective_tidal_deformability needs 'mass_ratio' in the sampling "
+            "parameters (lambda_tilde depends on q); pass "
+            "effective_tidal_deformability=False."
+        )
+    doppler_chirp_mass = doppler_vector is not None and (
+        "chirp_mass" in sampling_parameters
+    )
+    if doppler_chirp_mass and not {"ra", "dec"} <= set(sampling_parameters):
+        raise ValueError(
+            "doppler_vector needs 'ra' and 'dec' in the sampling parameters "
+            "(the Doppler factor depends on the sky position)."
+        )
     if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
         raise ValueError(
             "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
@@ -2273,6 +2684,37 @@ def triangular_group_reparameterisations(
     if precessing_spin:
         # likewise
         _rank["a_1"] = -1
+    if effective_tidal_deformability:
+        # Reads mass_ratio on its inverse, as the effective spin.
+        _rank["lambda_1"] = -1
+    # ``doppler-chirp-mass`` reads ra / dec (default-added sky) on its
+    # inverse, and ``chirp-distance`` (rank -1) reads chirp_mass: the default
+    # rank puts it between the two.
+    if time_reference_frequency is not None:
+        missing = {"chirp_mass", "mass_ratio"} - set(sampling_parameters)
+        if missing or "geocent_time" not in sampling_parameters:
+            raise ValueError(
+                "time_reference_frequency needs 'geocent_time', 'chirp_mass' "
+                f"and 'mass_ratio' in the sampling parameters; missing "
+                f"{sorted(missing | ({'geocent_time'} - set(sampling_parameters)))}"
+            )
+        # The time at a frequency reads the chirp mass, mass ratio, spins and
+        # (with time_to_merger) tides on its inverse (effective-spin and
+        # effective-tidal-deformability are rank -1): rank it ahead of them.
+        _rank["geocent_time"] = -2
+    elif time_to_merger is not None:
+        raise ValueError("time_to_merger needs time_reference_frequency")
+    if waveform_phase is not None:
+        missing = {"chirp_mass", "mass_ratio", "phase"} - set(sampling_parameters)
+        if missing or phase_coordinates != "polarisation-phase":
+            raise ValueError(
+                "waveform_phase needs phase_coordinates='polarisation-phase' "
+                "and 'phase', 'chirp_mass' and 'mass_ratio' in the sampling "
+                f"parameters; missing {sorted(missing)}"
+            )
+        # The phase at a frequency reads the chirp mass, mass ratio, spins
+        # and tides on its inverse, as the time at a frequency does.
+        _rank["phase"] = -2
     ordered_names = sorted(
         sampling_parameters, key=lambda n: _rank.get(n, 2)
     )
@@ -2289,6 +2731,8 @@ def triangular_group_reparameterisations(
                 "k0": chirp_distance_k0,
                 "fiducial": chirp_distance_fiducial,
             }
+            if chirp_distance_inversion:
+                reps[name]["boundary_inversion"] = True
         elif name == "chi_1" and effective_spin:
             reps[name] = {
                 "reparameterisation": "effective-spin",
@@ -2309,6 +2753,20 @@ def triangular_group_reparameterisations(
             reps[name] = {"reparameterisation": "aligned-spin"}
         elif name == "mass_ratio" and log_mass_ratio:
             reps[name] = {"reparameterisation": "log-mass-ratio"}
+        elif name == "lambda_1" and effective_tidal_deformability:
+            reps[name] = {
+                "reparameterisation": "effective-tidal-deformability",
+                "parameters": ["lambda_1", "lambda_2"],
+            }
+        elif name == "lambda_2" and effective_tidal_deformability:
+            continue  # covered by the joint ``effective-tidal-deformability`` entry
+        elif name == "chirp_mass" and doppler_chirp_mass:
+            reps[name] = {
+                "reparameterisation": "doppler-chirp-mass",
+                "doppler_vector": [
+                    float(v) for v in np.asarray(doppler_vector, dtype=float)
+                ],
+            }
         elif name in ("lambda_1", "lambda_2"):
             reps[name] = {
                 "reparameterisation": "logit",
@@ -2345,6 +2803,29 @@ def triangular_group_reparameterisations(
                 "reference_time": float(reference_time),
                 "scale": _GEOCENT_SCALE,
             }
+            if time_reference_frequency is not None:
+                reps[name]["reference_frequency"] = (
+                    "adaptive" if time_reference_frequency == "adaptive"
+                    else float(time_reference_frequency)
+                )
+                reps[name]["frequency_range"] = [
+                    float(f) for f in time_frequency_range
+                ]
+                reps[name]["spins"] = (
+                    ["chi_1", "chi_2"]
+                    if {"chi_1", "chi_2"} <= set(sampling_parameters) else None
+                )
+                if doppler_chirp_mass:
+                    reps[name]["doppler_vector"] = [
+                        float(v) for v in np.asarray(doppler_vector, dtype=float)
+                    ]
+                if time_to_merger is not None:
+                    reps[name]["time_to_merger"] = time_to_merger
+                    reps[name]["tides"] = (
+                        ["lambda_1", "lambda_2"]
+                        if {"lambda_1", "lambda_2"} <= set(sampling_parameters)
+                        else None
+                    )
         elif name == "phase":
             if phase_coordinates == "arg-alpha-beta":
                 # arg_alpha = (phase - psi), arg_beta = (phase + psi): both
@@ -2365,6 +2846,26 @@ def triangular_group_reparameterisations(
                 # polarisation/phase combination an explicit flow axis.  ``psi``
                 # (angle-pi) and ``theta_jn`` (angle-sine) are prerequisites.
                 reps[name] = {"reparameterisation": "polarisation-phase"}
+                if waveform_phase is not None:
+                    reps[name]["waveform_phase"] = waveform_phase
+                    reps[name]["frequency_range"] = [
+                        float(f) for f in time_frequency_range
+                    ]
+                    reps[name]["spins"] = (
+                        ["chi_1", "chi_2"]
+                        if {"chi_1", "chi_2"} <= set(sampling_parameters)
+                        else None
+                    )
+                    reps[name]["tides"] = (
+                        ["lambda_1", "lambda_2"]
+                        if {"lambda_1", "lambda_2"} <= set(sampling_parameters)
+                        else None
+                    )
+                    if doppler_chirp_mass:
+                        reps[name]["doppler_vector"] = [
+                            float(v)
+                            for v in np.asarray(doppler_vector, dtype=float)
+                        ]
 
     if phase_coordinates == "arg-alpha-beta" and "phase" in sampling_parameters:
         reps["arg-alpha-beta"] = {"parameters": ["psi", "phase"]}
@@ -2414,6 +2915,12 @@ def _prime_parameter_names(
     effective_spin=False,
     log_mass_ratio=True,
     precessing_spin=False,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
+    time_reference_frequency=None,
+    time_to_merger=None,
+    chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2476,6 +2983,12 @@ def _prime_parameter_names(
                 effective_spin=effective_spin,
                 log_mass_ratio=log_mass_ratio,
                 precessing_spin=precessing_spin,
+                effective_tidal_deformability=effective_tidal_deformability,
+                doppler_vector=doppler_vector,
+                time_reference_frequency=time_reference_frequency,
+                time_to_merger=time_to_merger,
+                chirp_distance_inversion=chirp_distance_inversion,
+                waveform_phase=waveform_phase,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -2551,6 +3064,13 @@ def _prime_parameter_names(
         } <= set(names):
             out.append(
                 "chi_eff_prime" if name == "chi_1" else "chi_diff_prime"
+            )
+        elif name in ("lambda_1", "lambda_2") and effective_tidal_deformability and {
+            "lambda_1", "lambda_2", "mass_ratio"
+        } <= set(names):
+            out.append(
+                "lambda_tilde_prime" if name == "lambda_1"
+                else "lambda_diff_prime"
             )
         else:
             out.append(f"{name}_prime")
@@ -2666,6 +3186,92 @@ def _select_flow_model_factory(
     return _make_flow_model
 
 
+class ReferenceEpoch:
+    """The Earth orientation the frame-dependent coordinates refer to.
+
+    A long signal (hours, for a 3 Hz lower frequency) is seen by a detector
+    that turns with the Earth: the antenna pattern it is measured with
+    changes over the signal, and the epoch whose pattern the data constrain
+    the most moves with the information the live points carry -- in an
+    early-warning mixture, from the first hours of the signal (only the
+    earliest thresholds constrain the first live points) towards the merger.
+    The chirp distance's response, the flow's sky frame, the group's frame
+    and the detector-centre time's delay are all taken at this one epoch, so
+    the chirp distance and the detector-centre time stay invariant under
+    the group.
+
+    :meth:`choose` (before every training, on the training points) moves the
+    epoch to the one that minimises the spread of the log chirp distance,
+    the coordinate that strips the antenna pattern from the amplitude the
+    data measure, searched on a grid of ``n_grid`` epochs from the merger to
+    ``max_hours`` before it and refined between the neighbours of the best.
+    It moves only when that lowers the spread by more than ``tolerance``
+    (relative): every move changes the flow's coordinates, so the flow is
+    trained afresh.
+
+    Parameters
+    ----------
+    merger_gmst : float
+        GMST (rad) at the merger.
+    max_hours : float
+        Earliest epoch searched, in hours before the merger (e.g. the
+        signal's duration from the lower frequency).
+    n_grid : int, optional
+        Grid size of the search (default 97).
+    tolerance : float, optional
+        Relative spread reduction needed to move (default 0.05).
+    """
+
+    def __init__(self, merger_gmst, max_hours, n_grid=97, tolerance=0.05):
+        if max_hours <= 0:
+            raise ValueError("max_hours must be positive")
+        self.merger_gmst = float(merger_gmst)
+        self.max_hours = float(max_hours)
+        self.n_grid = int(n_grid)
+        self.tolerance = float(tolerance)
+        #: the current epoch, hours before the merger
+        self.hours = 0.0
+
+    @property
+    def gmst(self):
+        return gmst_hours_before(self.merger_gmst, self.hours)
+
+    def _gmsts(self, hours):
+        return [gmst_hours_before(self.merger_gmst, h) for h in hours]
+
+    def choose(self, spread):
+        """Move to the epoch of least ``spread(gmsts) -> spreads``; returns
+        whether the epoch moved."""
+        hours = np.linspace(0.0, self.max_hours, self.n_grid)
+        s = np.asarray(spread(self._gmsts(hours)), dtype=float)
+        if not np.isfinite(s).any():
+            return False
+        i = int(np.nanargmin(np.where(np.isfinite(s), s, np.nan)))
+        fine = np.linspace(hours[max(i - 1, 0)],
+                           hours[min(i + 1, len(hours) - 1)], 17)
+        sf = np.asarray(spread(self._gmsts(fine)), dtype=float)
+        j = int(np.nanargmin(np.where(np.isfinite(sf), sf, np.nan)))
+        best_hours, best = float(fine[j]), float(sf[j])
+        current = float(np.asarray(spread([self.gmst]), dtype=float)[0])
+        moved = not current <= (1.0 + self.tolerance) * best
+        if moved:
+            logger.info(
+                "Reference epoch %.2f h before merger (was %.2f h): log "
+                "chirp-distance spread %.3f (%.3f at the previous epoch, "
+                "%.3f at merger)", best_hours, self.hours, best, current,
+                float(s[0]),
+            )
+        else:
+            logger.info(
+                "Reference epoch kept at %.2f h before merger: log "
+                "chirp-distance spread %.3f (best %.3f at %.2f h, %.3f at "
+                "merger)", self.hours, current, best, best_hours, float(s[0]),
+            )
+        if moved:
+            self.hours = best_hours
+        return moved
+
+
 def _make_group_proposal_class(
     class_name,
     flow_model_cls,
@@ -2675,6 +3281,7 @@ def _make_group_proposal_class(
     psi_single,
     phase_coordinates,
     sky_radial_sigma=0.15,
+    reference_epoch=None,
 ):
     """``FlowProposal`` subclass for a nessai-gw group-mixture flow.
 
@@ -2687,6 +3294,13 @@ def _make_group_proposal_class(
     ``action`` (``None`` on the physical-space path) is re-bound to nessai's
     actual prime-parameter order after every (re-)initialisation.  The class is
     published at module scope as ``class_name`` so checkpoints unpickle.
+
+    ``reference_epoch`` (a dict of :class:`ReferenceEpoch` arguments other
+    than ``merger_gmst``) moves the Earth orientation of the sky frame, the
+    group's frame, the chirp distance's response and the detector-centre
+    time's delay before every training (:meth:`check_state`); a move trains
+    the flow afresh.  It needs the prime-space ``action`` and the
+    chirp distance.
     """
     from nessai.flowmodel.group_mixture import GroupFlowProposalMixin
     from nessai.proposal import FlowProposal
@@ -2784,9 +3398,80 @@ def _make_group_proposal_class(
                 else:
                     model.param_names = prime
 
+        def update_flow_config(self):
+            """Also build the flow model in nessai's actual prime order (its
+            ``param_names``), which the configuration keeps for every
+            rebuild (reset, resume): a circular base flow fixes which of
+            its inputs are angles when it is built, so it cannot be
+            realigned afterwards like the rest of the model."""
+            super().update_flow_config()
+            prime = list(getattr(self, "prime_parameters", []) or [])
+            if action is not None and prime:
+                self.flow_config["param_names"] = prime
+
         def initialise(self, *args, **kwargs):
             super().initialise(*args, **kwargs)
             self._realign_prime_space_action()
+            if reference_epoch is not None:
+                if getattr(self, "reference_epoch", None) is None:
+                    self.reference_epoch = ReferenceEpoch(
+                        action.sky_frame_merger_gmst, **reference_epoch
+                    )
+                # a resumed proposal's epoch: the action is rebuilt at the
+                # merger's, and the reparameterisations may be too
+                self._apply_reference_epoch()
+
+        def _apply_reference_epoch(self):
+            """Put every frame-dependent piece at the current epoch."""
+            epoch = getattr(self, "reference_epoch", None)
+            if epoch is None:
+                return
+            action.set_gmst(epoch.gmst)
+            rotation = action.sky_frame_rotation
+            for rep in self._reparameterisation.values():
+                if hasattr(rep, "set_rotation"):
+                    rep.set_rotation(rotation)
+                elif hasattr(rep, "set_gmst"):
+                    rep.set_gmst(epoch.gmst)
+
+        def _reset_for_reference_epoch(self):
+            """A new frame: train every expert afresh (none kept warm or
+            frozen) and re-bootstrap the canonical standardisation, which
+            is an average over rounds in the old frame."""
+            flow = getattr(self, "flow", None)
+            model = getattr(flow, "model", None)
+            if model is None:
+                return
+            frozen = getattr(model, "_frozen", None)
+            with torch.no_grad():
+                if frozen is not None:
+                    frozen.zero_()
+            if hasattr(model, "warm_max_share"):
+                model.warm_max_share = None
+            flow.reset_model(weights=True, permutations=True)
+            with torch.no_grad():
+                for m in flow.model.modules():
+                    if hasattr(m, "_canon_seen"):
+                        m._canon_seen.fill_(False)
+                        m._domain_mass_seen = False
+            self._realign_prime_space_action()
+            logger.info("Reference epoch moved: every expert retrained "
+                        "from scratch")
+
+        def check_state(self, x):
+            """Choose the reference epoch on the training points before the
+            reparameterisations update on them."""
+            epoch = getattr(self, "reference_epoch", None)
+            if epoch is not None and len(x) > 1:
+                cd = next(
+                    (r for r in self._reparameterisation.values()
+                     if hasattr(r, "log_spread")), None)
+                if cd is not None and epoch.choose(
+                    lambda gmsts: cd.log_spread(x, gmsts)
+                ):
+                    self._apply_reference_epoch()
+                    self._reset_for_reference_epoch()
+            super().check_state(x)
 
         def reset_model_weights(self, **kwargs):
             super().reset_model_weights(**kwargs)
@@ -2840,8 +3525,31 @@ def make_triangular_group_flow_proposal(
     effective_spin=False,
     log_mass_ratio=True,
     precessing_spin=False,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
+    circular_psi_phase=False,
+    circular_standardisation=False,
+    time_reference_frequency=None,
+    time_to_merger=None,
+    chirp_distance_inversion=False,
+    waveform_phase=None,
+    reference_epoch=None,
+    base_action=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
+
+    ``base_action`` (optional): the physical-space group action to use instead
+    of a :class:`TriangularDetectorGroupAction` built from ``plane_normal``
+    (which is then ignored), e.g. a
+    :class:`~nessai_gw.single_detector.SingleInterferometerGroupAction`.  It
+    must carry the same ``phase_reflection`` / ``polarisation_quarter``.
+
+    ``reference_epoch`` (optional): a dict of :class:`ReferenceEpoch`
+    arguments (``max_hours``, and optionally ``n_grid`` and ``tolerance``).
+    The sky frame, the group's frame, the chirp distance's response and the
+    detector-centre time's delay then refer to the Earth's orientation at an
+    epoch chosen before every training, instead of the merger's.  Needs
+    ``prime_space`` and ``chirp_distance``.
 
     ``flow_model_factory`` (optional): a callable used *instead of*
     :func:`nessai.flowmodel.group_mixture.make_clustered_group_mixture_flow`
@@ -3027,6 +3735,25 @@ def make_triangular_group_flow_proposal(
         no ``polarisation_ellipse`` and no boundary reflection.  Default
         ``False``.  With ``adaptive_domain`` this instead allows the
         ``"phase"`` family of :class:`AdaptiveFundamentalDomain`.
+    circular_psi_phase : bool, optional
+        Carry ``psi_prime`` and ``delta_phase`` as angles of a circular base
+        flow (:class:`CircularCanonicalTransform`): the quarter turn and the
+        (2, 2) reflection fold them to a torus, which the base flow models
+        without seams.  Needs a circular flow (``flow_config['ftype'] =
+        'circular'``), ``psi_single``, ``polarisation_quarter``,
+        ``phase_reflection``, the ``polarisation-phase`` coordinates and
+        ``polarisation_offset = 0``.  With ``phase_recanon`` it needs
+        ``adaptive_domain``, which then picks each expert's basis of the
+        ``(psi_prime, delta_phase)`` torus (e.g. ``phase mod pi/2`` instead
+        of ``delta_phase`` on a phase-pinned plateau).
+        With ``adaptive_domain`` only the sky seam moves.  Default ``False``.
+    circular_standardisation : bool, optional
+        Standardise the circular ``psi_prime`` / ``delta_phase`` as well:
+        each is rotated to its mean direction and spread over the circle by a
+        Möbius map fitted to the live points (nessai's
+        ``circular_standardisation``), so a tightly measured angle reaches the
+        uniform latent as an O(1) shape rather than a spike.  Needs
+        ``circular_psi_phase``.  Default ``False``.
     adaptive_domain : bool, optional
         Give every group-mixture expert an :class:`AdaptiveFundamentalDomain`
         ``base_reparam``: each expert moves the sky, ``psi`` and
@@ -3055,6 +3782,16 @@ def make_triangular_group_flow_proposal(
         negates ``(s1_x, s1_y)``.  Without it a sampled ``phi_jl`` is still
         shifted by ``pi`` under the reflection (``phi_jl_x``/``_y``).
         Default ``False``.
+    effective_tidal_deformability, doppler_vector : optional
+        Must match :func:`triangular_group_reparameterisations`: the flow sees
+        ``lambda_tilde_prime`` / ``lambda_diff_prime`` in place of
+        ``lambda_1_prime`` / ``lambda_2_prime`` (the Doppler-corrected chirp
+        mass keeps the name ``chirp_mass_prime``).  Both are invariant under
+        the group.  Defaults ``False`` / ``None``.
+    time_reference_frequency : optional
+        As in :func:`triangular_group_reparameterisations` (the prime names do
+        not depend on it; the probe checks the order of the inverse pass with
+        it).  Default ``None``.
     """
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
@@ -3128,16 +3865,22 @@ def make_triangular_group_flow_proposal(
             "group action needs; this proposal only applies to a single-site "
             "triangular-detector run with the standard extrinsic parameters."
         )
+    if reference_epoch is not None and not (prime_space and chirp_distance):
+        raise RuntimeError(
+            "reference_epoch needs prime_space and chirp_distance (the epoch "
+            "is chosen on the chirp distance)."
+        )
 
-    base_action = TriangularDetectorGroupAction(
-        reference_time=reference_time,
-        plane_normal=plane_normal,
-        vertex=vertex,
-        phase_reflection=phase_reflection,
-        azimuth_offset=azimuth_offset,
-        polarisation_quarter=polarisation_quarter,
-        polarisation_offset=polarisation_offset,
-    )
+    if base_action is None:
+        base_action = TriangularDetectorGroupAction(
+            reference_time=reference_time,
+            plane_normal=plane_normal,
+            vertex=vertex,
+            phase_reflection=phase_reflection,
+            azimuth_offset=azimuth_offset,
+            polarisation_quarter=polarisation_quarter,
+            polarisation_offset=polarisation_offset,
+        )
 
     if prime_space:
         prime_names = _prime_parameter_names(
@@ -3154,6 +3897,12 @@ def make_triangular_group_flow_proposal(
             effective_spin=effective_spin,
             log_mass_ratio=log_mass_ratio,
             precessing_spin=precessing_spin,
+            effective_tidal_deformability=effective_tidal_deformability,
+            doppler_vector=doppler_vector,
+            time_reference_frequency=time_reference_frequency,
+            time_to_merger=time_to_merger,
+            chirp_distance_inversion=chirp_distance_inversion,
+            waveform_phase=waveform_phase,
         )
         action = PrimeSpaceTriangularGroupAction(
             base_action, prime_names, ellipse=polarisation_ellipse,
@@ -3230,11 +3979,55 @@ def make_triangular_group_flow_proposal(
                 gm_kwargs["base_reparam_factory"] = _functools.partial(
                     AdaptiveFundamentalDomain, action, list(prime_names),
                     allow_phase_mode=bool(phase_recanon),
+                    circular_psi_phase=bool(circular_psi_phase),
                 )
             else:
                 gm_kwargs["base_reparam_factory"] = _functools.partial(
                     PhaseQuarterRecanonicaliser, list(prime_names)
                 )
+        if circular_psi_phase:
+            bad = []
+            if not psi_single:
+                bad.append("psi_single=False")
+            if not polarisation_quarter:
+                bad.append("polarisation_quarter=False")
+            if not phase_reflection:
+                bad.append("phase_reflection=False")
+            if phase_coordinates != "polarisation-phase":
+                bad.append(f"phase_coordinates={phase_coordinates!r}")
+            if polarisation_offset:
+                bad.append("polarisation_offset != 0")
+            if phase_recanon and not adaptive_domain:
+                bad.append("phase_recanon without adaptive_domain")
+            if bad:
+                raise RuntimeError(
+                    f"circular_psi_phase is incompatible with {', '.join(bad)}."
+                )
+            if "circular_parameters" not in _gm_params:
+                raise RuntimeError(
+                    "circular_psi_phase requires a version of nessai whose "
+                    "make_group_mixture_flow accepts `circular_parameters`."
+                )
+            circles = {
+                "psi_prime": POLARISATION_PHASE_CIRCLE,
+                action._delta_phase: POLARISATION_PHASE_CIRCLE,
+            }
+            gm_kwargs["canonical_transform"] = CircularCanonicalTransform(
+                circles, prime_names,
+                inner=gm_kwargs.get("canonical_transform"),
+            )
+            gm_kwargs["circular_parameters"] = list(circles)
+            if circular_standardisation:
+                if "circular_standardisation" not in _gm_params:
+                    raise RuntimeError(
+                        "circular_standardisation requires a version of "
+                        "nessai whose make_group_mixture_flow accepts it."
+                    )
+                gm_kwargs["circular_standardisation"] = True
+        elif circular_standardisation:
+            raise RuntimeError(
+                "circular_standardisation needs circular_psi_phase."
+            )
         flow_model_cls = _make_flow_model(
             group_action_fn=action,  # ignored on the prime-space path
             group_size=base_action.group_size,
@@ -3245,9 +4038,10 @@ def make_triangular_group_flow_proposal(
             **gm_kwargs,
         )
     else:
-        if phase_recanon or adaptive_domain:
+        if phase_recanon or adaptive_domain or circular_psi_phase:
             raise RuntimeError(
-                "phase_recanon/adaptive_domain needs the prime-space path."
+                "phase_recanon/adaptive_domain/circular_psi_phase needs the "
+                "prime-space path."
             )
         action = None
         import inspect as _inspect
@@ -3279,6 +4073,7 @@ def make_triangular_group_flow_proposal(
         psi_single=psi_single,
         phase_coordinates=phase_coordinates,
         sky_radial_sigma=sky_radial_sigma,
+        reference_epoch=reference_epoch,
     )
 
 
@@ -3418,6 +4213,15 @@ def make_et_group_flow_proposal(
     effective_spin=False,
     log_mass_ratio=True,
     precessing_spin=False,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
+    circular_psi_phase=False,
+    circular_standardisation=False,
+    time_reference_frequency=None,
+    time_to_merger=None,
+    chirp_distance_inversion=False,
+    waveform_phase=None,
+    reference_epoch=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3458,6 +4262,15 @@ def make_et_group_flow_proposal(
         effective_spin=effective_spin,
         log_mass_ratio=log_mass_ratio,
         precessing_spin=precessing_spin,
+        effective_tidal_deformability=effective_tidal_deformability,
+        doppler_vector=doppler_vector,
         phase_recanon=phase_recanon,
         adaptive_domain=adaptive_domain,
+        circular_psi_phase=circular_psi_phase,
+        circular_standardisation=circular_standardisation,
+        time_reference_frequency=time_reference_frequency,
+        time_to_merger=time_to_merger,
+        chirp_distance_inversion=chirp_distance_inversion,
+        waveform_phase=waveform_phase,
+        reference_epoch=reference_epoch,
     )

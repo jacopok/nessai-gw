@@ -73,11 +73,15 @@ from ._geometry import greenwich_mean_sidereal_time
 from .group_mixture import (
     _DELTA_PHASE_SCALE,
     _MIN_CANON_STD,
+    POLARISATION_PHASE_CIRCLE,
     AdaptiveFundamentalDomain,
+    CircularCanonicalTransform,
     SkyOctantProbit,
     _make_group_proposal_class,
     _prime_parameter_names,
+    _seam_note,
     _select_flow_model_factory,
+    _wrap_angle,
     detector_tensors,
     triangular_group_reparameterisations,
 )
@@ -88,6 +92,10 @@ _TWO_PI = 2.0 * np.pi
 
 #: Size of the polarisation/phase group.
 POLARISATION_PHASE_GROUP_SIZE = 4
+
+#: Size of the optional baseline half-turn factor (see
+#: :class:`PrimeSpacePolarisationPhaseAction`, ``baseline_flip``).
+BASELINE_FLIP_GROUP_SIZE = 2
 
 #: Interferometers closer than this (metres) are one site (ET's triangle arms
 #: are ~10 km apart; the closest planned separated sites are ~1000 km).
@@ -363,15 +371,57 @@ class PrimeSpacePolarisationPhaseAction:
     ``psi_offset`` / ``delta_offset`` (radians of ``psi`` / ``delta_phase``);
     prefer :class:`AdaptiveNetworkDomain`, which moves those seams off the
     posterior mass every training round.
+
+    **Baseline half-turn** (``baseline_flip``).  The antipode is an exact
+    degeneracy of every detector's antenna response:
+    ``(n, theta_jn, psi, phase) -> (-n, pi - theta_jn, -psi, phase)`` leaves
+    the response of each detector (all modes of an aligned-spin source)
+    unchanged.  Only the arrival times break it, and with two sites they
+    constrain ``n . b`` alone (``b`` the baseline), which the antipode flips.
+    The image on the same delay ring nearest the antipode is the half-turn
+    about the baseline, ``beta -> beta + pi``: it *is* the antipode at
+    ``alpha = 90 deg`` and departs from it by ``2 |90 deg - alpha|``.  So
+    a 2-site posterior grows a second mode half a turn round the ring with
+    the inclination flipped, exactly degenerate while the ring is wide and
+    dying as the timing pins ``alpha`` away from 90 deg (ET 2L
+    mlgw_bns_2L_v4: two equal modes 180.7 deg apart at ``alpha ~ 80 deg``;
+    v2, ``alpha ~ 55 deg``: the second mode ``Delta ln L ~ 7800`` below).
+    The generator
+
+        h : sky_u -> sky_u + 1/2,  theta_jn_prime -> -theta_jn_prime,
+            psi -> -psi,  phase -> phase + pi
+
+    (the antipodal map times ``g^2``; ``delta_phase`` is then unchanged
+    off the ``psi = 0`` seam) commutes with the quarter turn ``g``, so the
+    group becomes ``Z4 x Z2`` (8 elements, mode ``k + 4 f`` applying
+    ``g^k h^f``) with factor sizes ``(4, 2)``.  The barycentre time is kept
+    (the site offsets from the barycentre lie along ``b``, so both arrival
+    times are kept), as is the chirp distance.  ``h`` is measure preserving
+    (equal-area sky, ``sin theta_jn`` prior); the per-element weights absorb
+    how far the data break it and importance sampling corrects the rest.
+    The domain gains ``(sky_u - sky_u_offset) mod 1 < 1/2``.
     """
 
-    group_size = POLARISATION_PHASE_GROUP_SIZE
-    mode_factor_sizes = (POLARISATION_PHASE_GROUP_SIZE,)
-
-    def __init__(self, prime_names, psi_offset=0.0, delta_offset=0.0):
+    def __init__(self, prime_names, psi_offset=0.0, delta_offset=0.0,
+                 baseline_flip=False, sky_u_offset=0.0):
         self.psi_offset = float(psi_offset)
         self.delta_offset = float(delta_offset)
+        self.baseline_flip = bool(baseline_flip)
+        self.sky_u_offset = float(sky_u_offset)
+        self.group_size = POLARISATION_PHASE_GROUP_SIZE * (
+            BASELINE_FLIP_GROUP_SIZE if self.baseline_flip else 1
+        )
+        self.mode_factor_sizes = (
+            (POLARISATION_PHASE_GROUP_SIZE, BASELINE_FLIP_GROUP_SIZE)
+            if self.baseline_flip
+            else (POLARISATION_PHASE_GROUP_SIZE,)
+        )
         self.bind(prime_names)
+
+    @property
+    def sky_u_period(self):
+        """Width of the fundamental domain in ``sky_u``."""
+        return 0.5 if self.baseline_flip else 1.0
 
     def bind(self, prime_names):
         names = list(prime_names)
@@ -385,15 +435,21 @@ class PrimeSpacePolarisationPhaseAction:
                 ("psi_prime", "psi_prime" in names),
                 ("delta_phase", self._delta is not None),
                 ("theta_jn_prime", "theta_jn_prime" in names),
+                ("sky_u", "sky_u" in names or not self.baseline_flip),
             ) if not ok
         ]
         if missing:
             raise RuntimeError(
                 f"prime space is missing {missing}, which the polarisation/"
                 "phase group action needs (single-angle psi, "
-                "polarisation-phase phase, fixed-bounds angle-sine theta_jn); "
+                "polarisation-phase phase, fixed-bounds angle-sine theta_jn"
+                "; the baseline-frame sky_u with baseline_flip); "
                 f"got {names}."
             )
+
+    @staticmethod
+    def _sign(theta_jn_prime, dtype):
+        return torch.where(theta_jn_prime > 0, -1.0, 1.0).to(dtype)
 
     def _decode(self, point_dict):
         psi = _wrap((point_dict["psi_prime"] + 1.0) * (0.5 * np.pi), np.pi)
@@ -401,17 +457,30 @@ class PrimeSpacePolarisationPhaseAction:
             (point_dict[self._delta] + 1.0) * np.pi / _DELTA_PHASE_SCALE,
             _TWO_PI,
         )
-        sign = torch.where(point_dict["theta_jn_prime"] > 0, -1.0, 1.0).to(
-            psi.dtype
-        )
+        sign = self._sign(point_dict["theta_jn_prime"], psi.dtype)
         return psi, delta - sign * psi, sign
 
     def __call__(self, point_dict, modes, inverse=False):
         psi, phase, sign = self._decode(point_dict)
+        out = dict(point_dict)
+        modes = torch.as_tensor(modes, device=psi.device)
+        if self.baseline_flip:
+            # g and h commute and h is an involution: the inverse of
+            # g^k h^f is g^-k h^f, so h is applied first either way
+            flip = torch.div(
+                modes, POLARISATION_PHASE_GROUP_SIZE, rounding_mode="floor"
+            ) % BASELINE_FLIP_GROUP_SIZE == 1
+            theta = point_dict["theta_jn_prime"]
+            out["theta_jn_prime"] = torch.where(flip, -theta, theta)
+            u = point_dict["sky_u"]
+            out["sky_u"] = torch.where(flip, _wrap(u + 0.5, 1.0), u)
+            psi = torch.where(flip, _wrap(-psi, np.pi), psi)
+            phase = torch.where(flip, _wrap(phase + np.pi, _TWO_PI), phase)
+            sign = self._sign(out["theta_jn_prime"], psi.dtype)
+            modes = torch.remainder(modes, POLARISATION_PHASE_GROUP_SIZE)
         q = _quarter_turns(modes, inverse, psi)
         psi_t = _wrap(psi + q, np.pi)
         delta_t = _wrap((phase - q + sign * psi_t) * _DELTA_PHASE_SCALE, _TWO_PI)
-        out = dict(point_dict)
         out["psi_prime"] = _wrap(2.0 * psi_t, _TWO_PI) / np.pi - 1.0
         out[self._delta] = delta_t / np.pi - 1.0
         return {n: out[n] for n in self._prime_names}
@@ -419,9 +488,12 @@ class PrimeSpacePolarisationPhaseAction:
     def in_fundamental_domain(self, point_dict):
         psi, phase, sign = self._decode(point_dict)
         delta = phase + sign * psi
-        return (_wrap(psi - self.psi_offset, np.pi) < 0.5 * np.pi) & (
+        ok = (_wrap(psi - self.psi_offset, np.pi) < 0.5 * np.pi) & (
             _wrap(delta - self.delta_offset, _TWO_PI) < np.pi
         )
+        if self.baseline_flip:
+            ok = ok & (_wrap(point_dict["sky_u"] - self.sky_u_offset, 1.0) < 0.5)
+        return ok
 
 
 class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
@@ -434,22 +506,46 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
     * the ``psi`` and ``delta_phase`` fold seams (``psi mod pi/2``,
       ``delta_phase mod pi``) by applying the unique group element that takes
       the point into the shifted domain, and
-    * the periodic seam of the baseline azimuth ``sky_u`` by a translation mod
-      1 (no group acts on the sky here; the seam is still a cut through the
-      ring when the posterior wraps round the baseline),
+    * the seam of the baseline azimuth ``sky_u``: with the action's
+      ``baseline_flip`` a fold seam (``sky_u mod 1/2``, chosen on the folded
+      ``sky_u``); without it a translation mod 1 (no group acts on the sky;
+      the seam is still a cut through the ring when the posterior wraps round
+      the baseline),
 
     to where its folded posterior has the least mass.  All pieces are
     translations or group elements, so the map has unit Jacobian.  ``sky_u``
-    stays in ``[0, 1)``, so a :class:`~nessai_gw.group_mixture.SkyOctantProbit`
-    canonical transform still applies after it.
+    stays in ``[0, P)`` (``P = action.sky_u_period``), so a
+    :class:`~nessai_gw.group_mixture.SkyOctantProbit` with ``u_scale = 1/P``
+    still applies after it.
+
+    With ``circular_psi_phase`` the ``psi`` / ``delta_phase`` seams stay at
+    zero and, with ``allow_phase_mode``, each expert picks its basis of the
+    ``(psi_prime, delta_phase)`` torus instead, as in the parent class (e.g.
+    ``phase mod pi/2`` where the phase is pinned rather than ``delta_phase``).
     """
 
-    def __init__(self, action, param_names=None):
-        super().__init__(action, param_names, allow_phase_mode=False)
+    def __init__(self, action, param_names=None, circular_psi_phase=False,
+                 circular_sky_u=False, allow_phase_mode=False):
+        if allow_phase_mode and not circular_psi_phase:
+            raise ValueError(
+                "AdaptiveNetworkDomain: allow_phase_mode needs circular_psi_phase"
+            )
+        super().__init__(
+            action, param_names, allow_phase_mode=allow_phase_mode,
+            circular_psi_phase=circular_psi_phase,
+        )
+        #: ``sky_u`` is an angle of a circular base flow: keep its seam.
+        self.circular_sky_u = bool(circular_sky_u)
+
+    @property
+    def _u_period(self):
+        return getattr(self._action, "sky_u_period", 1.0)
 
     def bind(self, param_names):
         names = list(param_names)
         need = ("psi_prime", "delta_phase", "theta_jn_prime")
+        if self._u_period < 1.0:
+            need = need + ("sky_u",)
         missing = [n for n in need if n not in names]
         if missing:
             raise RuntimeError(
@@ -457,18 +553,21 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
                 f"parameters; got {names}."
             )
         self._names = names
-        self._ipsi, self._idp, self._ith = (names.index(n) for n in need)
+        self._ipsi, self._idp, self._ith = (names.index(n) for n in need[:3])
         self._iu = names.index("sky_u") if "sky_u" in names else None
 
     def _in_target(self, z, seams, phase_mode):
-        _, cpsi, cdel, _ = seams
+        cu, cpsi, cdel, _ = seams
         ok = torch.remainder(z[:, self._ipsi] + 1 - cpsi, 2.0) < 1.0
-        return ok & (torch.remainder(z[:, self._idp] + 1 - cdel, 2.0) < 1.0)
+        ok = ok & (torch.remainder(z[:, self._idp] + 1 - cdel, 2.0) < 1.0)
+        if self._u_period < 1.0:
+            ok = ok & (_wrap(z[:, self._iu] - cu, 1.0) < self._u_period)
+        return ok
 
     def _map_to(self, z, seams, phase_mode):
         out = z.clone()
         found = torch.zeros(z.shape[0], dtype=torch.bool, device=z.device)
-        for k in range(POLARISATION_PHASE_GROUP_SIZE):
+        for k in range(self._action.group_size):
             cand = self._act(z, torch.full((z.shape[0],), k, device=z.device))
             m = self._in_target(cand, seams, phase_mode) & ~found
             out[m] = cand[m]
@@ -479,7 +578,10 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
         cu, cpsi, cdel, _ = seams
         y = z.clone()
         if self._iu is not None:
-            y[:, self._iu] = _wrap(z[:, self._iu] - cu, 1.0)
+            u = _wrap(z[:, self._iu] - cu, 1.0)
+            if self._u_period < 1.0:
+                u = torch.clamp(u, max=self._u_period * (1 - 1e-7))
+            y[:, self._iu] = u
         y[:, self._ipsi] = torch.remainder(z[:, self._ipsi] + 1 - cpsi, 2.0) - 1
         y[:, self._idp] = torch.remainder(z[:, self._idp] + 1 - cdel, 2.0) - 1
         return y
@@ -489,7 +591,7 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
         ok = (a >= -1) & (a < 0) & (b >= -1) & (b < 0)
         if self._iu is not None:
             u = y[:, self._iu]
-            ok = ok & (u >= 0) & (u < 1)
+            ok = ok & (u >= 0) & (u < self._u_period)
         return ok
 
     def _from_box(self, y, seams, phase_mode):
@@ -506,16 +608,27 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
         if canon.shape[0] < self.min_points:
             return False
         before = self._state()
+        torus_before = self._torus_mn()
+        torus_note = ""
         (cu, cpsi, cdel, _), _ = before
-        du = float("nan")
-        if self._iu is not None:
+        du = dpsi = ddel = float("nan")
+        if self._iu is not None and not getattr(self, "circular_sky_u", False):
+            p = self._u_period
             u = canon[:, self._iu].double().cpu().numpy()
-            cu, du, _ = self._choose_seam(u, 1.0, cu)
-        psi = (canon[:, self._ipsi] + 1).double().cpu().numpy()
-        cpsi, dpsi, _ = self._choose_seam(psi, 1.0, cpsi)
-        z, _ = self._map_to(canon, (cu, cpsi, 0.0, 0.0), False)
-        dl = (z[:, self._idp] + 1).double().cpu().numpy()
-        cdel, ddel, _ = self._choose_seam(dl, 1.0, cdel)
+            cu, du, _ = self._choose_seam(u / p, 1.0, cu / p)
+            cu = cu * p
+        if getattr(self, "circular_psi_phase", False):
+            cpsi = cdel = 0.0
+            if self.allow_phase_mode:
+                z, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
+                torus_note = self._update_torus(z)
+        else:
+            z, _ = self._map_to(canon, (cu, 0.0, 0.0, 0.0), False)
+            psi = (z[:, self._ipsi] + 1).double().cpu().numpy()
+            cpsi, dpsi, _ = self._choose_seam(psi, 1.0, cpsi)
+            z, _ = self._map_to(canon, (cu, cpsi, 0.0, 0.0), False)
+            dl = (z[:, self._idp] + 1).double().cpu().numpy()
+            cdel, ddel, _ = self._choose_seam(dl, 1.0, cdel)
 
         self._seams.copy_(
             torch.tensor([cu, cpsi, cdel, 0.0], dtype=torch.float64)
@@ -523,20 +636,96 @@ class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
         self._seen.fill_(True)
         changed = any(
             abs(a - b) > 1e-12 for a, b in zip(self._state()[0], before[0])
-        )
-        logger.info(
+        ) or self._torus_mn() != torus_before
+        logger.debug(
             "Adaptive network domain: seams sky_u %.4f psi %.4f delta %.4f; "
             "density at old seams sky %.2f psi %.2f delta %.2f (x uniform), "
             "n=%d%s",
             cu, cpsi, cdel, du, dpsi, ddel, canon.shape[0],
             " [changed]" if changed else "",
         )
+        self._retrain_note = _seam_note(
+            [("sky_u", cu, du), ("psi", cpsi, dpsi), ("delta", cdel, ddel)],
+            changed,
+        )
+        if torus_note:
+            self._retrain_note = (
+                torus_note + "; " + self._retrain_note
+                if self._retrain_note else torus_note
+            )
         return changed
+
+
+class BaselineFlipSymmetry:
+    """The baseline half-turn ``h`` in the circular base frame (a
+    ``base_symmetry``).
+
+    With ``baseline_flip`` the group folds ``h`` (see
+    :class:`PrimeSpacePolarisationPhaseAction`) onto half the ``sky_u``
+    circle, gluing its two ends with a twist (``theta_jn_prime -> -theta_jn_prime``,
+    ``psi -> -psi``), which a product of circles cannot represent.  The base
+    flow instead models the whole ``sky_u`` circle (a
+    :class:`~nessai_gw.group_mixture.CircularCanonicalTransform` with
+    ``sky_u`` of length 1), the canonical points fill its first half, and the
+    base density is summed over ``h``, which keeps the folded density
+    continuous across the twisted seam.  In the angles of that frame ``h`` is
+
+        t_u -> t_u + pi,   theta_jn_prime -> -theta_jn_prime,
+        t_psi -> -t_psi,   t_delta unchanged
+
+    (``psi -> pi - psi`` is ``psi_prime -> -psi_prime`` mod 2, and
+    ``delta_phase = phase + sign(cos theta_jn) psi`` is invariant).  Unit
+    Jacobian; an involution.  Needs ``psi_prime`` / ``delta_phase`` on the
+    zero-offset polarisation/phase torus and ``sky_u`` starting the circle at
+    the fundamental domain's ``sky_u_offset``.
+    """
+
+    def __init__(self, param_names=None):
+        self._idx = None
+        if param_names is not None:
+            self.bind(param_names)
+
+    def bind(self, param_names):
+        names = list(param_names)
+        need = ("sky_u", "theta_jn_prime", "psi_prime")
+        missing = [n for n in need if n not in names]
+        if missing:
+            raise RuntimeError(
+                f"BaselineFlipSymmetry needs {missing} in the prime "
+                f"parameters; got {names}."
+            )
+        self._idx = tuple(names.index(n) for n in need)
+
+    def _h(self, t):
+        iu, ith, ipsi = self._idx
+        out = t.clone()
+        out[:, iu] = _wrap_angle(t[:, iu] + np.pi)
+        out[:, ith] = -t[:, ith]
+        out[:, ipsi] = _wrap_angle(-t[:, ipsi])
+        return out
+
+    def images(self, t):
+        """The non-identity image of each row."""
+        return [self._h(t)]
+
+    def fold(self, t):
+        """Map each row onto the canonical half circle, ``t_u in [-pi, 0)``."""
+        second = (t[:, self._idx[0]] >= 0)[:, None]
+        return torch.where(second, self._h(t), t)
 
 
 # ---------------------------------------------------------------------------
 # reparameterisations + proposal
 # ---------------------------------------------------------------------------
+def _no_physical_baseline_flip(point_dict, modes, inverse=False):
+    """Placeholder ``group_action_fn`` with ``baseline_flip``: only the
+    prime-space action implements the half-turn."""
+    raise NotImplementedError(
+        "the baseline half-turn is only implemented in the prime space "
+        "(PrimeSpacePolarisationPhaseAction)"
+    )
+
+
 def _chirp_distance_kwargs(geometry, chirp_distance):
     """``triangular_group_reparameterisations`` chirp-distance arguments."""
     if not chirp_distance:
@@ -561,6 +750,12 @@ def network_group_reparameterisations(
     effective_spin=True,
     log_mass_ratio=True,
     precessing_spin=False,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
+    time_reference_frequency=None,
+    time_to_merger=None,
+    chirp_distance_inversion=False,
+    waveform_phase=None,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -600,6 +795,34 @@ def network_group_reparameterisations(
         Carry the six precessing spin parameters as the ``precessing-spin``
         coordinates (needs ``mass_ratio``).  Must match
         :func:`make_network_group_flow_proposal`.  Default ``False``.
+    effective_tidal_deformability : bool, optional
+        Carry ``lambda_1``, ``lambda_2`` as ``(lambda_tilde_prime,
+        lambda_diff_prime)`` (needs ``mass_ratio``).  Must match
+        :func:`make_network_group_flow_proposal`.  Default ``False``.
+    doppler_vector : array_like, optional
+        The Earth's barycentric velocity over ``c`` at the coalescence time:
+        sample the Doppler-corrected chirp mass (runs with the orbital motion
+        only).  Must match :func:`make_network_group_flow_proposal`.  Default
+        ``None``.
+    time_reference_frequency : float or "adaptive", optional
+        Measure the arrival time at the barycentre when the 22 mode passes
+        this frequency instead of at merger (``"adaptive"``: the frequency of
+        least spread over the training points, chosen before every training);
+        see :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``None``.
+    time_to_merger : str, optional
+        The waveform's time to merger, ``"module:function"``, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``None`` (2PN).
+    chirp_distance_inversion : bool, optional
+        Boundary inversion of the luminosity distance under the chirp
+        distance, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``False``.
+    waveform_phase : str, optional
+        The waveform's 22-mode phase, ``"module:function"``, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``None`` (merger phase).
     """
     return triangular_group_reparameterisations(
         sampling_parameters,
@@ -609,6 +832,12 @@ def network_group_reparameterisations(
         effective_spin=effective_spin,
         log_mass_ratio=log_mass_ratio,
         precessing_spin=precessing_spin,
+        effective_tidal_deformability=effective_tidal_deformability,
+        doppler_vector=doppler_vector,
+        time_reference_frequency=time_reference_frequency,
+        time_to_merger=time_to_merger,
+        chirp_distance_inversion=chirp_distance_inversion,
+        waveform_phase=waveform_phase,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
@@ -635,6 +864,18 @@ def make_network_group_flow_proposal(
     effective_spin=True,
     log_mass_ratio=True,
     precessing_spin=False,
+    effective_tidal_deformability=False,
+    doppler_vector=None,
+    baseline_flip=False,
+    sky_u_offset=0.0,
+    circular_psi_phase=False,
+    circular_sky_u=False,
+    circular_standardisation=False,
+    time_reference_frequency=None,
+    time_to_merger=None,
+    chirp_distance_inversion=False,
+    waveform_phase=None,
+    phase_recanon=False,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -646,7 +887,7 @@ def make_network_group_flow_proposal(
     ``(sky_u, sky_v)``, ``psi_prime``, ``delta_phase`` and (by default)
     ``chirp_distance`` and ``chi_eff_prime`` / ``chi_diff_prime``; the group
     mixture folds the polarisation/phase ``Z4``
-    (4 elements) and learns its weights.
+    (4 elements; 8 with ``baseline_flip``) and learns its weights.
 
     Parameters
     ----------
@@ -685,7 +926,51 @@ def make_network_group_flow_proposal(
         Whether precessing spins are carried as the ``precessing-spin``
         coordinates; must match :func:`network_group_reparameterisations`.
         Default ``False``.
+    effective_tidal_deformability, doppler_vector : optional
+        Must match :func:`network_group_reparameterisations`.
+    baseline_flip : bool, optional
+        Also fold the half-turn about the baseline with the inclination
+        flipped (the delay-preserving image of the antipodal degeneracy; see
+        :class:`PrimeSpacePolarisationPhaseAction`), halving the ``sky_u``
+        domain.  Needs the sky.  Default ``False``.
+    sky_u_offset : float, optional
+        Fixed ``sky_u`` seam of the base fundamental domain with
+        ``baseline_flip`` (the adaptive domain moves it per expert).
+    circular_psi_phase : bool, optional
+        Carry ``psi_prime`` and ``delta_phase`` as angles of a circular base
+        flow (:class:`~nessai_gw.group_mixture.CircularCanonicalTransform`):
+        the quarter turn folds them to a torus, which the base flow models
+        without seams, so the adaptive domain leaves their seams alone.
+        Needs a circular flow (``flow_config['ftype'] = 'circular'``) and zero
+        ``psi_offset`` / ``delta_offset``.  Default ``False``.
+    circular_sky_u : bool, optional
+        Also carry the baseline azimuth ``sky_u`` as an angle (the posterior
+        ring about the baseline then has no cut); ``sky_v`` alone is
+        probit-mapped.  With ``baseline_flip`` the base flow models the whole
+        ``sky_u`` circle summed over the half-turn (:class:`BaselineFlipSymmetry`).
+        Needs ``circular_psi_phase``.  Default ``False``.
+    circular_standardisation : bool, optional
+        Standardise the circular angles as well: each is rotated to its mean
+        direction and spread over the circle by a Möbius map fitted to the
+        live points (nessai's ``circular_standardisation``), so a tightly
+        measured angle (``delta_phase``, ``sky_u`` late in a run) reaches the
+        uniform latent as an O(1) shape rather than a spike.  Needs circular
+        angles.  Default ``False``.
+    time_reference_frequency : optional
+        Must match :func:`network_group_reparameterisations` (the prime names
+        do not depend on it; the probe checks the order of the inverse pass
+        with it).  Default ``None``.
+    phase_recanon : bool, optional
+        Let each expert's :class:`AdaptiveNetworkDomain` pick its basis of the
+        ``(psi_prime, delta_phase)`` torus off its live points (``delta_phase``
+        on a clump, ``phase mod pi/2`` where the phase is pinned instead).
+        Needs ``circular_psi_phase`` and ``adaptive_domain``.  Default
+        ``False``.
     """
+    if phase_recanon and not (circular_psi_phase and adaptive_domain):
+        raise ValueError(
+            "phase_recanon needs circular_psi_phase and adaptive_domain."
+        )
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
     except ImportError as exc:  # pragma: no cover - depends on nessai version
@@ -715,40 +1000,109 @@ def make_network_group_flow_proposal(
     prime_names = _prime_parameter_names(
         names, geometry.reference_time, vertex=geometry.timing_vertex,
         sky_2d=True, psi_single=True, effective_spin=effective_spin,
-        log_mass_ratio=log_mass_ratio, precessing_spin=precessing_spin,
+        precessing_spin=precessing_spin,
+        log_mass_ratio=log_mass_ratio,
+        effective_tidal_deformability=effective_tidal_deformability,
+        doppler_vector=doppler_vector,
+        time_reference_frequency=time_reference_frequency,
+        time_to_merger=time_to_merger,
+        chirp_distance_inversion=chirp_distance_inversion,
+        waveform_phase=waveform_phase,
         **_chirp_distance_kwargs(
             geometry, chirp_distance and "luminosity_distance" in names
         ),
     )
+    if baseline_flip and "sky_u" not in prime_names:
+        raise RuntimeError(
+            "baseline_flip needs the sky (ra, dec) in the sampling parameters."
+        )
     action = PrimeSpacePolarisationPhaseAction(
-        prime_names, psi_offset=psi_offset, delta_offset=delta_offset
+        prime_names, psi_offset=psi_offset, delta_offset=delta_offset,
+        baseline_flip=baseline_flip, sky_u_offset=sky_u_offset,
     )
-    physical = PolarisationPhaseGroupAction(psi_offset, delta_offset)
+    if baseline_flip:
+        physical = _no_physical_baseline_flip
+    else:
+        physical = PolarisationPhaseGroupAction(psi_offset, delta_offset)
+
+    if circular_sky_u and not circular_psi_phase:
+        raise ValueError("circular_sky_u needs circular_psi_phase.")
+    if circular_sky_u and "sky_u" not in prime_names:
+        raise RuntimeError(
+            "circular_sky_u needs the sky (ra, dec) in the sampling parameters."
+        )
+    if circular_psi_phase and (psi_offset or delta_offset):
+        raise ValueError(
+            "circular_psi_phase needs psi_offset = delta_offset = 0 (the "
+            "circular base flow has no seams to move)."
+        )
 
     gm_params = inspect.signature(make_group_mixture_flow).parameters
     gm_kwargs = {"mode_factor_sizes": action.mode_factor_sizes}
+    canonical = None
     if gaussianise_sky and "sky_u" in prime_names:
+        canonical = SkyOctantProbit(
+            prime_names,
+            u_scale=None if circular_sky_u else 1.0 / action.sky_u_period,
+            v_scale=1.0,
+        )
+    circles = {}
+    if circular_psi_phase:
+        circles["psi_prime"] = POLARISATION_PHASE_CIRCLE
+        circles[action._delta] = POLARISATION_PHASE_CIRCLE
+    if circular_sky_u:
+        # the whole circle, starting at the fundamental domain's seam
+        start = float(sky_u_offset) if baseline_flip else 0.0
+        circles["sky_u"] = (start, 1.0, (0.0, 1.0))
+    if circles:
+        if "circular_parameters" not in gm_params:
+            raise RuntimeError(
+                "circular_psi_phase requires a version of nessai whose "
+                "make_group_mixture_flow accepts `circular_parameters`."
+            )
+        canonical = CircularCanonicalTransform(
+            circles, prime_names, inner=canonical
+        )
+        gm_kwargs["circular_parameters"] = list(circles)
+        if circular_sky_u and baseline_flip:
+            gm_kwargs["base_symmetry"] = BaselineFlipSymmetry(prime_names)
+        if circular_standardisation:
+            if "circular_standardisation" not in gm_params:
+                raise RuntimeError(
+                    "circular_standardisation requires a version of nessai "
+                    "whose make_group_mixture_flow accepts it."
+                )
+            gm_kwargs["circular_standardisation"] = True
+    elif circular_standardisation:
+        raise ValueError("circular_standardisation needs circular angles.")
+    if canonical is not None:
         if "canonical_transform" not in gm_params:
             raise RuntimeError(
                 "gaussianise_sky requires a version of nessai whose "
                 "make_group_mixture_flow accepts `canonical_transform`."
             )
-        gm_kwargs["canonical_transform"] = SkyOctantProbit(
-            prime_names, u_scale=1.0, v_scale=1.0
-        )
-    if adaptive_domain:
+        gm_kwargs["canonical_transform"] = canonical
+    # with circular angles the adaptive domain only has the sky_u seam left
+    # to move, and none if sky_u is circular too
+    moves_seams = not circular_psi_phase or bool(phase_recanon) or (
+        "sky_u" in prime_names and not circular_sky_u
+    )
+    if adaptive_domain and moves_seams:
         if "base_reparam_factory" not in gm_params:
             raise RuntimeError(
                 "adaptive_domain requires a version of nessai whose "
                 "make_group_mixture_flow accepts `base_reparam_factory`."
             )
         gm_kwargs["base_reparam_factory"] = functools.partial(
-            AdaptiveNetworkDomain, action, list(prime_names)
+            AdaptiveNetworkDomain, action, list(prime_names),
+            circular_psi_phase=bool(circular_psi_phase),
+            circular_sky_u=bool(circular_sky_u),
+            allow_phase_mode=bool(phase_recanon),
         )
 
     flow_model_cls = make_flow(
         group_action_fn=physical,  # ignored on the prime-space path
-        group_size=POLARISATION_PHASE_GROUP_SIZE,
+        group_size=action.group_size,
         param_names=prime_names,
         prime_space_action=action,
         prime_space_in_domain=action.in_fundamental_domain,

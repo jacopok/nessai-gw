@@ -1522,6 +1522,143 @@ def test_et_proposal_with_chirp_distance_and_effective_spin(tmp_path):
     np.testing.assert_allclose(log_j[:n], -log_j_inv[:n], atol=1e-7)
 
 
+@requires_group_mixture
+def test_reference_epoch_moves_every_frame(tmp_path):
+    """With ``reference_epoch``, the epoch moves to where the training
+    points' amplitude is sharpest; the sky frame, the group's frame, the
+    chirp distance and the detector-centre time all follow it, the rescaling
+    still round-trips, and the group's images keep the luminosity distance
+    and the detector-centre time (the coordinates stay invariant) in the new
+    frame."""
+    from nessai.livepoint import numpy_array_to_live_points
+    from nessai.model import Model
+
+    from nessai_gw._effective_distance import response_R
+    from nessai_gw._geometry import geocenter_time_delay, gmst_hours_before
+    from nessai_gw.group_mixture import (
+        ET_EMR_DETECTOR_TENSORS,
+        ET_EMR_VERTEX,
+        triangular_group_reparameterisations,
+    )
+
+    bounds = {
+        "chirp_mass": (1.19, 1.21),
+        "mass_ratio": (0.5, 1.0),
+        "luminosity_distance": (1.0, 1000.0),
+        "theta_jn": (0.0, np.pi),
+        "psi": (0.0, np.pi),
+        "phase": (0.0, 2 * np.pi),
+        "ra": (0.0, 2 * np.pi),
+        "dec": (-np.pi / 2, np.pi / 2),
+        "geocent_time": (REFERENCE_TIME - 0.1, REFERENCE_TIME + 0.1),
+    }
+    names = list(bounds)
+
+    class _StubModel(Model):
+        def __init__(self):
+            self.names = names
+            self.bounds = {k: np.asarray(v) for k, v in bounds.items()}
+
+        def log_prior(self, x):
+            return np.log(self.in_bounds(x), dtype=float)
+
+        def log_likelihood(self, x):
+            return np.zeros(len(np.atleast_1d(x)))
+
+    kwargs = {"chirp_distance": True, "chirp_distance_k0": 0}
+    cls = make_et_group_flow_proposal(
+        names, REFERENCE_TIME, prime_space=True, n_clusters_max=1,
+        reference_epoch={"max_hours": 8.0}, **kwargs
+    )
+    proposal = cls(
+        _StubModel(),
+        output=str(tmp_path),
+        poolsize=100,
+        reparameterisations=triangular_group_reparameterisations(
+            names, REFERENCE_TIME, **kwargs
+        ),
+        flow_config={"n_blocks": 1, "n_neurons": 4, "n_layers": 1},
+    )
+    proposal.initialise()
+    epoch = proposal.reference_epoch
+    assert epoch.hours == 0.0
+    action = proposal.flow.model.prime_space_action
+    merger_gmst = action.sky_frame_merger_gmst
+
+    # live points whose amplitude at 5 h before the merger is fixed
+    rng = np.random.default_rng(5)
+    n = 2000
+    theta = np.column_stack([rng.uniform(*bounds[k], n) for k in names])
+    live = numpy_array_to_live_points(theta, names)
+    live["dec"] = np.arcsin(rng.uniform(-1, 1, n))
+    live["theta_jn"] = np.arccos(rng.uniform(-1, 1, n))
+    target = gmst_hours_before(merger_gmst, 5.0)
+    r = np.abs(response_R(ET_EMR_DETECTOR_TENSORS, live["ra"], live["dec"],
+                          live["psi"], live["theta_jn"], target)[:, 0])
+    live["luminosity_distance"] = (
+        50.0 * live["chirp_mass"] ** (5 / 6) * r
+        * np.exp(0.05 * rng.standard_normal(n))
+    )
+    proposal.check_state(live)
+    assert abs(epoch.hours - 5.0) < 0.1
+    reps = proposal._reparameterisation
+    cd = next(v for v in reps.values() if hasattr(v, "log_spread"))
+    sky = next(v for v in reps.values() if hasattr(v, "set_rotation"))
+    t_rep = next(v for v in reps.values()
+                 if hasattr(v, "set_gmst") and not hasattr(v, "log_spread"))
+    assert action._action.gmst == pytest.approx(epoch.gmst)
+    assert cd.gmst == pytest.approx(epoch.gmst)
+    assert t_rep._gmst == pytest.approx(epoch.gmst)
+    np.testing.assert_allclose(sky._R, action.sky_frame_rotation)
+    # a second call on the same points keeps the epoch
+    hours = epoch.hours
+    proposal.check_state(live)
+    assert epoch.hours == hours
+
+    x_prime, log_j = proposal.rescale(live)
+    back, log_j_inv = proposal.inverse_rescale(x_prime)
+    for k in ("luminosity_distance", "ra", "dec", "geocent_time"):
+        np.testing.assert_allclose(back[k][:n], live[k], rtol=1e-8, atol=1e-9)
+    np.testing.assert_allclose(log_j[:n], -log_j_inv[:n], atol=1e-7)
+
+    prime = list(proposal.prime_parameters)
+    tensors = {k: torch.as_tensor(np.array(x_prime[k][:n], dtype=float))
+               for k in prime}
+    t_det = live["geocent_time"] + geocenter_time_delay(
+        ET_EMR_VERTEX, epoch.gmst, live["ra"], live["dec"])
+    for g in (1, 2, 5, 6):
+        mapped = action(tensors, torch.full((n,), g, dtype=torch.long))
+        image = x_prime[:n].copy()
+        for k in prime:
+            image[k] = mapped[k].numpy()
+        phys, _ = proposal.inverse_rescale(image)
+        # |R_k0| is invariant to ~1e-3 on the real tensors (more near
+        # its zeros)
+        rel = np.abs(phys["luminosity_distance"] / live["luminosity_distance"]
+                     - 1.0)
+        assert np.median(rel) < 1e-3
+        assert np.mean(rel < 2e-2) > 0.99
+        t_img = phys["geocent_time"] + geocenter_time_delay(
+            ET_EMR_VERTEX, epoch.gmst, phys["ra"], phys["dec"])
+        np.testing.assert_allclose(t_img, t_det, atol=1e-9)
+        # the image's sky is a different direction (not the identity)
+        assert np.mean(np.abs(phys["ra"] - live["ra"]) > 1e-3) > 0.5
+
+    # a resumed run: the action is rebuilt at the merger (a new process) and
+    # the pickled proposal puts it back at its epoch
+    import pickle
+
+    resumed = pickle.loads(pickle.dumps(proposal))
+    action.set_gmst(merger_gmst)
+    resumed.resume(_StubModel(), dict(proposal.flow_config))
+    assert resumed.reference_epoch.hours == epoch.hours
+    assert action._action.gmst == pytest.approx(epoch.gmst)
+    x_prime_2, _ = resumed.rescale(live)
+    for k in prime:
+        np.testing.assert_allclose(x_prime_2[k][:n], x_prime[k][:n],
+                                   atol=1e-12)
+
+
 # ---------------------------------------------------------------------------
 # polarisation-ellipse inclination coordinate
 # ---------------------------------------------------------------------------

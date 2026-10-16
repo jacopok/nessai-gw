@@ -17,6 +17,16 @@ SPEED_OF_LIGHT = 299792458.0
 _TWO_PI = 2.0 * np.pi
 
 
+#: Earth's rotation rate (rad/s): one turn per sidereal day.
+EARTH_ROTATION_RATE = 2.0 * np.pi / 86164.0905
+
+
+def gmst_hours_before(gmst: float, hours: float) -> float:
+    """The GMST ``hours`` before the time whose GMST is ``gmst``."""
+    return float(np.remainder(gmst - EARTH_ROTATION_RATE * 3600.0 * hours,
+                              _TWO_PI))
+
+
 def greenwich_mean_sidereal_time(gps_time: float) -> float:
     """GMST in radians at ``gps_time`` (via bilby if it is available)."""
     try:

@@ -10,6 +10,7 @@ from nessai.reparameterisations import (
 from .chirp_distance import ChirpDistanceReparameterisation
 from .distance import DistanceReparameterisation
 from .inclination import PolarisationEllipseReparameterisation
+from .mass import DopplerChirpMassReparameterisation
 from .phase import (
     ArgAlphaBetaReparameterisation,
     DeltaPhaseReparameterisation,
@@ -23,6 +24,7 @@ from .spin import (
     EffectiveSpinReparameterisation,
     PrecessingSpinReparameterisation,
 )
+from .tides import EffectiveTidalDeformabilityReparameterisation
 from .time import DetectorCenterTimeReparameterisation
 
 known_reparameterisations = ReparameterisationDict()
@@ -140,6 +142,17 @@ known_reparameterisations.add_reparameterisation(
     "polarization-ellipse",
     PolarisationEllipseReparameterisation,
     {"scale": 1.0, "adaptive_width": False},
+)
+
+known_reparameterisations.add_reparameterisation(
+    "doppler-chirp-mass",
+    DopplerChirpMassReparameterisation,
+    {},
+)
+known_reparameterisations.add_reparameterisation(
+    "effective-tidal-deformability",
+    EffectiveTidalDeformabilityReparameterisation,
+    {},
 )
 
 known_reparameterisations.add_reparameterisation(

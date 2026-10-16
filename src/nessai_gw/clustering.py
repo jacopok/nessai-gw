@@ -57,6 +57,7 @@ import logging
 
 import numpy as np
 import torch
+from scipy.special import ndtri
 from nessai.flowmodel.group_mixture import (
     ClusteredGroupMixtureFlowModel,
     ClusteredGroupMixtureFlowWrapper,
@@ -72,6 +73,7 @@ __all__ = [
     "DiagonalSplitClusterWrapper",
     "fit_live_diagonal_split",
     "gaussian_split_gain",
+    "rank_gaussianise",
     "make_diagonal_split_cluster_flow",
     "ConstrainedTwoModeWrapper",
     "ConstrainedClusteredModel",
@@ -100,6 +102,15 @@ def split_coordinates(canon, param_names):
 def _half_logdet(cov):
     sign, ld = np.linalg.slogdet(cov)
     return 0.5 * ld if sign > 0 else np.inf
+
+
+def rank_gaussianise(x):
+    """Each column of ``x`` mapped to standard-normal scores by rank,
+    ``ndtri(rank / (n + 1))``: the same ordering with an exactly Gaussian
+    marginal, so a heavy tail no longer dominates a covariance."""
+    x = np.asarray(x, dtype=float)
+    ranks = np.argsort(np.argsort(x, axis=0, kind="stable"), axis=0) + 1
+    return ndtri(ranks / (x.shape[0] + 1.0))
 
 
 def gaussian_split_gain(t, labels, min_count=2):
@@ -232,10 +243,21 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     Tunables are class attributes, set by :func:`make_diagonal_split_cluster_flow`.
     """
 
-    #: Gain (nats per training point) needed to activate the split.
-    gain_on = 0.8
-    #: Once active, the split collapses when the gain falls below this.
-    gain_off = 0.2
+    #: Gain (nats per training point) needed to activate the split.  With
+    #: ``chirp_distance`` rank-Gaussianised the gain stays below ~0.4 up to
+    #: -ln X ~ 13 on the replicate_Delta_v7x runs, and the real split rises
+    #: through 0.6 at -ln X ~ 15-25 (0.8 when the raw chirp distance's tail
+    #: alone gave ~1.3 at -ln X ~ 1-4).
+    gain_on = 0.6
+    #: Once active, the split collapses when the gain falls below this
+    #: (above the ~0.05-0.35 mid-run level, so a split cannot linger there).
+    gain_off = 0.4
+    #: Base-frame coordinates rank-Gaussianised (:func:`rank_gaussianise`)
+    #: before the gain: the chirp distance diverges where the reference
+    #: detector is blind (a band in ``sky_v``), and that tail alone made a
+    #: line along it worth ~1.3 nat/pt early in the run, while the live
+    #: points still reach those sky regions.
+    rank_gaussian_params = ("chirp_distance",)
     #: A new line replaces the active one only if it beats it by this much.
     refit_margin = 0.05
     #: Minimum fraction of points on each side to activate.
@@ -342,8 +364,14 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         )
         for j in range(k):
             n_j = float(counts[j])
-            if n_j <= 0 or self.is_frozen(j):
-                # never rebuild a flow from the few points of a dying mode
+            keeps_warm = getattr(self, "keeps_warm", None)
+            if (
+                n_j <= 0
+                or self.is_frozen(j)
+                or (keeps_warm is not None and keeps_warm(j))
+            ):
+                # never rebuild a flow from the few points of a dying mode:
+                # a small expert (``warm_max_share``) is only warm-started
                 continue
             if ref[j] <= 0:
                 ref[j] = n_j
@@ -380,6 +408,33 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
             canon, _ = e._from_base(t)
         return split_coordinates(canon.cpu().numpy(), list(e.param_names))
 
+    def _gaussian_frame(self, t):
+        """``t`` without the columns the routing frame zeroes.
+
+        :meth:`_fold_to_base` sets circular dims (e.g. ``circular-psi-phase``)
+        to zero for nearest-centroid routing; left in, those constant columns
+        make every covariance singular, the gain ``-inf`` and the split
+        impossible.  Any other zero-variance column is dropped too.  The
+        :attr:`rank_gaussian_params` columns are rank-Gaussianised.
+        """
+        t = np.asarray(t, dtype=float)
+        keep = np.ones(t.shape[1], dtype=bool)
+        experts = getattr(self, "experts", None)
+        idx = getattr(experts[0], "_circular_idx", None) if experts else None
+        if idx is not None and idx.numel():
+            keep[idx.cpu().numpy()] = False
+        keep &= t.std(axis=0) > 0
+        names = list(experts[0].param_names) if experts else []
+        rank = [
+            i
+            for i, name in enumerate(names)
+            if name in self.rank_gaussian_params and keep[i]
+        ]
+        if rank:
+            t = t.copy()
+            t[:, rank] = rank_gaussianise(t[:, rank])
+        return t[:, keep]
+
     def _split_labels(self, c, v):
         """1 on the (higher-``sky_v``) clump side of the stored line, else 0."""
         normal = self._split_normal.cpu().numpy()
@@ -409,6 +464,7 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         docstring)."""
         if self.n_experts < 2:
             return 1
+        self._retrain_note = None
         self._cluster_round_count = (
             getattr(self, "_cluster_round_count", 0) + 1
         )
@@ -417,10 +473,11 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         )
 
         c, v = self._split_coords(t)
+        t_gauss = self._gaussian_frame(t)
         fit = fit_live_diagonal_split(
             c,
             v,
-            t,
+            t_gauss,
             n_angles=self.n_angles,
             n_offsets=self.n_offsets,
             min_fraction=self.activate_fraction,
@@ -429,7 +486,7 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         dying = False
         if bool(self._split_fitted):
             cur_lab = self._split_labels(c, v)
-            cur_gain = gaussian_split_gain(t, cur_lab)
+            cur_gain = gaussian_split_gain(t_gauss, cur_lab)
             n_cur = int(min(cur_lab.sum(), len(cur_lab) - cur_lab.sum()))
             dying = (
                 active
@@ -449,7 +506,12 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         frac = float(self._split_labels(c, v).mean())
         self._split_gain.fill_(cur_gain)
         normal = self._split_normal.cpu().numpy()
-        logger.info(
+        # the summary's header gives k, i.e. whether the split is on
+        self._retrain_note = (
+            f"diagonal split gain {cur_gain:.2f} nat/pt, clump side "
+            f"{frac:.2f}"
+        )
+        logger.debug(
             "Diagonal split (cos theta_jn, sky_v): gain %.3f nat/pt "
             "(on %.2f / off %.2f), clump-side fraction %.3f, line "
             "%.3f*cos + %.3f*sky_v > %.3f, %s",
@@ -543,7 +605,7 @@ def make_diagonal_split_cluster_flow(
     ----------
     gain_on, gain_off : float, optional
         Activation / collapse thresholds on :func:`gaussian_split_gain`
-        (nats per point).  ``None`` keeps the class defaults (0.8 / 0.2).
+        (nats per point).  ``None`` keeps the class defaults (0.6 / 0.4).
     activate_fraction : float, optional
         Minimum fraction of points on each side to activate (and to consider
         a candidate line).  ``None`` keeps :data:`MIN_BRANCH_FRACTION`.
