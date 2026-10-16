@@ -597,11 +597,11 @@ class FittedPhaseRotation(Reparameterisation):
     for one regime and overshoots it for the other, and plain ``(psi,
     phase)`` (a 0-degree "rotation") fares no better.  Measured on the
     ET-Delta v70 plateau/clump split
-    (:func:`nessai_gw._polarisation_branch.fit_distance_floor_split`): raw
+    (``fit_distance_floor_split`` (xG_inference ``studies/nessai_gw/polarisation_branch.py``)): raw
     ``corr(psi, phase)`` is -0.55 (plateau) and +0.76 (clump); a fixed
     45-degree shear leaves correlations of 0.59 and 0.86 respectively.  The
     angle that actually diagonalises each branch's covariance
-    (:func:`nessai_gw._polarisation_branch.fit_phase_rotation`) is 111
+    (``fit_phase_rotation`` (xG_inference ``studies/nessai_gw/polarisation_branch.py``)) is 111
     degrees for the plateau and 73 degrees for the clump -- neither the 0
     nor the 45 built into the other two options, and different from each
     other, which is why one fixed choice cannot serve both branches.
@@ -616,7 +616,7 @@ class FittedPhaseRotation(Reparameterisation):
     and :class:`SingleAngleReparameterisation`, ``p1``/``p2`` are **not**
     wrapped to a period -- ``angle``, ``psi0``, ``phase0`` are fit once from a
     single branch's own live points (via
-    :func:`~nessai_gw._polarisation_branch.fit_phase_rotation`), whose
+    ``fit_phase_rotation`` (xG_inference ``studies/nessai_gw/polarisation_branch.py``)), whose
     ``(psi, phase)`` occupy a bounded sub-region that does not itself wrap, so
     there is nothing to fold.  This is a *branch-local* coordinate: it is
     only meaningful for live points already restricted to the branch it was
@@ -628,7 +628,7 @@ class FittedPhaseRotation(Reparameterisation):
     show two parallel, offset ridges rather than one blob (a real, roughly
     ``phase -> phase + pi/2``-shaped discrete near-degeneracy this
     reparameterisation was not built to fold) -- see the module docstring of
-    :mod:`nessai_gw._polarisation_branch`. Rotating removes the *correlation*
+    xG_inference ``studies/nessai_gw/polarisation_branch.py``. Rotating removes the *correlation*
     a suboptimal linear basis introduces; it does not fold an additional
     discrete symmetry, which is a different problem.
 
@@ -640,7 +640,7 @@ class FittedPhaseRotation(Reparameterisation):
         Unused.
     angle : float
         Rotation angle in radians, e.g. from
-        :func:`~nessai_gw._polarisation_branch.fit_phase_rotation`.
+        ``fit_phase_rotation`` (xG_inference ``studies/nessai_gw/polarisation_branch.py``).
     psi0, phase0 : float
         Centre the rotation is taken about (typically each branch's own
         mean).

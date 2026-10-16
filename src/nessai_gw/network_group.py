@@ -987,7 +987,7 @@ def make_network_group_flow_proposal(
     )
     prime_names = _prime_parameter_names(
         names, geometry.reference_time, vertex=geometry.timing_vertex,
-        sky_2d=True, psi_single=True, effective_spin=effective_spin,
+        psi_single=True, effective_spin=effective_spin,
         precessing_spin=precessing_spin,
         log_mass_ratio=log_mass_ratio,
         effective_tidal_deformability=effective_tidal_deformability,
@@ -1103,7 +1103,6 @@ def make_network_group_flow_proposal(
         flow_model_cls,
         action,
         sky_rotation=geometry.sky_frame_rotation,
-        sky_2d=True,
         psi_single=True,
         phase_coordinates="polarisation-phase",
     )

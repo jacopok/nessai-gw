@@ -18,7 +18,7 @@ from .phase import (
     PolarisationPhaseReparameterisation,
     SingleAngleReparameterisation,
 )
-from .sky import EqualAreaSky, RotatedAnglePair
+from .sky import EqualAreaSky
 from .spin import (
     AlignedSpinReparameterisation,
     EffectiveSpinReparameterisation,

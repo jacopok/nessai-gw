@@ -40,9 +40,8 @@ BNS_PARAMETERS = [
 ]
 
 PRIME_NAMES = [
-    "ra_dec_x",
-    "ra_dec_y",
-    "ra_dec_z",
+    "sky_u",
+    "sky_v",
     "psi_x",
     "psi_y",
     "delta_phase",
@@ -93,18 +92,14 @@ def test_triangular_group_reparameterisations():
 def prime_points():
     rng = np.random.default_rng(2024)
     n = 4000
-    ra = rng.uniform(0, 2 * np.pi, n)
-    dec = np.arcsin(rng.uniform(-1, 1, n))
-    r_sky = rng.uniform(0.5, 1.5, n)
-    cos_dec = np.cos(dec)
     psi = rng.uniform(0, np.pi, n)
     r_psi = rng.uniform(0.5, 1.5, n)
     # single [-1, 1) polarisation-phase coordinate
     delta_phase = rng.uniform(-1.0, 1.0, n)
     return {
-        "ra_dec_x": torch.as_tensor(r_sky * cos_dec * np.cos(ra)),
-        "ra_dec_y": torch.as_tensor(r_sky * cos_dec * np.sin(ra)),
-        "ra_dec_z": torch.as_tensor(r_sky * np.sin(dec)),
+        # equal-area sky, uniform on the unit square under the sky prior
+        "sky_u": torch.as_tensor(rng.uniform(0, 1, n)),
+        "sky_v": torch.as_tensor(rng.uniform(0, 1, n)),
         "psi_x": torch.as_tensor(r_psi * np.cos(2.0 * psi)),
         "psi_y": torch.as_tensor(r_psi * np.sin(2.0 * psi)),
         "delta_phase": torch.as_tensor(delta_phase),
@@ -135,12 +130,12 @@ def prime_action_16():
 def test_prime_space_action_missing_coordinate():
     base = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
     with pytest.raises(RuntimeError, match="prime space is missing"):
-        PrimeSpaceTriangularGroupAction(base, ["ra_dec_x", "ra_dec_y", "ra_dec_z"])
+        PrimeSpaceTriangularGroupAction(base, ["sky_u", "sky_v"])
 
 
 @pytest.mark.parametrize("g", range(ETTriangleGroupAction.group_size))
 def test_prime_space_action_inverse_round_trip(prime_action, prime_points, g):
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     modes = torch.full((n,), g, dtype=torch.long)
     mapped = prime_action(prime_points, modes)
     back = prime_action(mapped, modes, inverse=True)
@@ -151,7 +146,7 @@ def test_prime_space_action_inverse_round_trip(prime_action, prime_points, g):
 
 
 def test_prime_space_action_identity(prime_action, prime_points):
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     modes = torch.zeros(n, dtype=torch.long)
     mapped = prime_action(prime_points, modes)
     for name in PRIME_NAMES:
@@ -163,7 +158,7 @@ def test_prime_space_action_identity(prime_action, prime_points):
 def test_prime_space_action_t_det_invariant(prime_action, prime_points):
     """The detector-centre arrival time is carried through untouched by every
     group element (Tissino et al. 2026, arXiv:2606.04918)."""
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     for g in range(ETTriangleGroupAction.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         mapped = prime_action(prime_points, modes)
@@ -190,8 +185,11 @@ def _to_physical(points):
             reference_time=REFERENCE_TIME
         ).sky_frame_rotation
     )
-    _d = points
-    _dx, _dy, _dz = _d["ra_dec_x"], _d["ra_dec_y"], _d["ra_dec_z"]
+    # EqualAreaSky: (sky_u, sky_v) -> detector-frame unit vector
+    lam_f = 2 * np.pi * points["sky_u"]
+    z_f = torch.clamp(1.0 - 2.0 * points["sky_v"], -1.0, 1.0)
+    rho = torch.sqrt(torch.clamp(1.0 - z_f * z_f, min=0.0))
+    _dx, _dy, _dz = rho * torch.cos(lam_f), rho * torch.sin(lam_f), z_f
     sx = _R[0, 0] * _dx + _R[1, 0] * _dy + _R[2, 0] * _dz
     sy = _R[0, 1] * _dx + _R[1, 1] * _dy + _R[2, 1] * _dz
     sz = _R[0, 2] * _dx + _R[1, 2] * _dy + _R[2, 2] * _dz
@@ -223,7 +221,7 @@ def _delta_phase_from_physical(phys):
 
 def test_prime_space_action_physical_phase_invariant(prime_action, prime_points):
     """The group-invariant physical ``phase`` is unchanged by every element."""
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     phase0 = _to_physical(prime_points)["phase"]
     for g in range(ETTriangleGroupAction.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
@@ -234,21 +232,12 @@ def test_prime_space_action_physical_phase_invariant(prime_action, prime_points)
 
 
 def test_prime_space_action_preserves_radii(prime_action, prime_points):
-    n = len(prime_points["ra_dec_x"])
-    r_sky = torch.hypot(
-        torch.hypot(prime_points["ra_dec_x"], prime_points["ra_dec_y"]),
-        prime_points["ra_dec_z"],
-    )
+    n = len(prime_points["t_det"])
     r_psi = torch.hypot(prime_points["psi_x"], prime_points["psi_y"])
     for g in range(ETTriangleGroupAction.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         mapped = prime_action(prime_points, modes)
-        r_sky_t = torch.hypot(
-            torch.hypot(mapped["ra_dec_x"], mapped["ra_dec_y"]),
-            mapped["ra_dec_z"],
-        )
         r_psi_t = torch.hypot(mapped["psi_x"], mapped["psi_y"])
-        assert torch.allclose(r_sky_t, r_sky, atol=1e-6)
         assert torch.allclose(r_psi_t, r_psi, atol=1e-6)
         # single delta_phase coordinate stays in [-1, 1)
         assert torch.all(mapped["delta_phase"] >= -1.0 - 1e-9)
@@ -260,7 +249,7 @@ def test_prime_space_action_delta_phase_matches_physical(
 ):
     """The adapter's delta_phase == (decode fully -> run the physical action ->
     apply ``phase' + sign(cos theta_jn') * psi'``)."""
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     base = prime_action._action
     phys0 = _to_physical(prime_points)
     for g in range(ETTriangleGroupAction.group_size):
@@ -278,7 +267,7 @@ def test_prime_space_action_delta_phase_matches_physical(
 def test_prime_space_action_16_inverse_round_trip(
     prime_action_16, prime_points, g
 ):
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     modes = torch.full((n,), g, dtype=torch.long)
     mapped = prime_action_16(prime_points, modes)
     back = prime_action_16(mapped, modes, inverse=True)
@@ -291,7 +280,7 @@ def test_prime_space_action_16_inverse_round_trip(
 def test_prime_space_action_16_physical_phase(prime_action_16, prime_points):
     """Physical phase is invariant mod 2pi for modes 0..7 and shifted by pi
     for modes 8..15 (invariant mod pi across all 16)."""
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     phase0 = _to_physical(prime_points)["phase"]
     for g in range(16):
         modes = torch.full((n,), g, dtype=torch.long)
@@ -310,7 +299,7 @@ def test_prime_space_action_16_physical_phase(prime_action_16, prime_points):
 def test_prime_space_action_16_delta_phase_matches_physical(
     prime_action_16, prime_points
 ):
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     base = prime_action_16._action
     phys0 = _to_physical(prime_points)
     for g in range(16):
@@ -327,7 +316,7 @@ def test_prime_space_action_16_delta_phase_matches_physical(
 def _in_domain_count(action, prime_points, group_size):
     """For each point, how many of its ``group_size`` orbit images the adapter
     reports as canonical."""
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     count = torch.zeros(n)
     for g in range(group_size):
         modes = torch.full((n,), g, dtype=torch.long)
@@ -353,7 +342,7 @@ def test_prime_space_16_fundamental_domain_partitions_orbit(
     count = _in_domain_count(prime_action_16, prime_points, 16)
     assert torch.all(count == 1), count.unique(return_counts=True)
 
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     for g in range(16):
         modes = torch.full((n,), g, dtype=torch.long)
         image = prime_action_16(prime_points, modes)
@@ -366,9 +355,8 @@ def test_prime_space_16_fundamental_domain_partitions_orbit(
 # arg-alpha-beta phase coordinates
 # ---------------------------------------------------------------------------
 ARG_AB_PRIME_NAMES = [
-    "ra_dec_x",
-    "ra_dec_y",
-    "ra_dec_z",
+    "sky_u",
+    "sky_v",
     "arg_alpha",
     "arg_beta",
     "theta_jn_prime",
@@ -380,14 +368,9 @@ ARG_AB_PRIME_NAMES = [
 def arg_ab_prime_points():
     rng = np.random.default_rng(7)
     n = 4000
-    ra = rng.uniform(0, 2 * np.pi, n)
-    dec = np.arcsin(rng.uniform(-1, 1, n))
-    r_sky = rng.uniform(0.5, 1.5, n)
-    cd = np.cos(dec)
     return {
-        "ra_dec_x": torch.as_tensor(r_sky * cd * np.cos(ra)),
-        "ra_dec_y": torch.as_tensor(r_sky * cd * np.sin(ra)),
-        "ra_dec_z": torch.as_tensor(r_sky * np.sin(dec)),
+        "sky_u": torch.as_tensor(rng.uniform(0, 1, n)),
+        "sky_v": torch.as_tensor(rng.uniform(0, 1, n)),
         "arg_alpha": torch.as_tensor(rng.uniform(-1.0, 1.0, n)),
         "arg_beta": torch.as_tensor(rng.uniform(-1.0, 1.0, n)),
         "theta_jn_prime": torch.as_tensor(rng.uniform(-1, 1, n)),
@@ -422,34 +405,6 @@ def test_triangular_group_reparameterisations_bad_phase_coordinates():
         )
 
 
-def test_triangular_group_reparameterisations_independent():
-    reps = triangular_group_reparameterisations(
-        BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="independent"
-    )
-    assert reps["phase"] == {"reparameterisation": "single-angle", "scale": 2.0}
-    # psi is untouched here -- left to the default psi_single handling
-    assert "psi" not in reps
-    assert "arg-alpha-beta" not in reps
-
-
-@requires_group_mixture
-def test_make_et_group_flow_proposal_independent_needs_physical_space():
-    with pytest.raises(RuntimeError, match="prime_space=False"):
-        make_et_group_flow_proposal(
-            BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="independent",
-            prime_space=True,
-        )
-
-
-@requires_group_mixture
-def test_make_et_group_flow_proposal_independent_physical_space_builds():
-    cls = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="independent",
-        prime_space=False,
-    )
-    assert cls is not None
-
-
 def test_prime_parameter_names_arg_alpha_beta():
     prime = _prime_parameter_names(
         BNS_PARAMETERS, REFERENCE_TIME, phase_coordinates="arg-alpha-beta"
@@ -475,7 +430,7 @@ def test_arg_ab_action_detected(arg_ab_action):
 
 
 def test_arg_ab_action_inverse_round_trip(arg_ab_action, arg_ab_prime_points):
-    n = len(arg_ab_prime_points["ra_dec_x"])
+    n = len(arg_ab_prime_points["t_det"])
     for g in range(arg_ab_action._action.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         fwd = arg_ab_action(arg_ab_prime_points, modes)
@@ -486,7 +441,7 @@ def test_arg_ab_action_inverse_round_trip(arg_ab_action, arg_ab_prime_points):
 
 
 def test_arg_ab_action_t_det_and_theta_jn(arg_ab_action, arg_ab_prime_points):
-    n = len(arg_ab_prime_points["ra_dec_x"])
+    n = len(arg_ab_prime_points["t_det"])
     for g in range(arg_ab_action._action.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         fwd = arg_ab_action(arg_ab_prime_points, modes)
@@ -511,7 +466,7 @@ def test_arg_ab_action_fundamental_domain_partitions_orbit(
 def test_arg_ab_action_matches_physical(arg_ab_action, arg_ab_prime_points):
     """The prime (arg_alpha, arg_beta) action equals the physical action on
     (psi, phase) mapped through arg-alpha-beta."""
-    n = len(arg_ab_prime_points["ra_dec_x"])
+    n = len(arg_ab_prime_points["t_det"])
     acted, _ = arg_ab_action._decode(arg_ab_prime_points)
     phys0 = {
         "ra": acted["ra"],
@@ -534,9 +489,8 @@ def test_arg_ab_action_matches_physical(arg_ab_action, arg_ab_prime_points):
 
 def test_prime_parameter_names():
     prime = _prime_parameter_names(BNS_PARAMETERS, REFERENCE_TIME)
-    if not any(n.startswith("ra_dec") for n in prime):
-        pytest.skip("probe fell back to the name-order heuristic")
-    assert {"ra_dec_x", "ra_dec_y", "ra_dec_z"} <= set(prime)
+    assert {"sky_u", "sky_v"} <= set(prime)
+    assert not any(n.startswith("ra_dec") for n in prime)
     assert "psi_x" in prime and "psi_y" in prime
     assert "delta_phase" in prime
     assert "delta_phase_x" not in prime and "delta_phase_y" not in prime
@@ -546,13 +500,11 @@ def test_prime_parameter_names():
 
 
 @requires_group_mixture
-@pytest.mark.parametrize("prime_space", [True, False])
 @pytest.mark.parametrize("phase_reflection", [False, True])
-def test_make_et_group_flow_proposal(prime_space, phase_reflection):
+def test_make_et_group_flow_proposal(phase_reflection):
     cls = make_et_group_flow_proposal(
         BNS_PARAMETERS,
         REFERENCE_TIME,
-        prime_space=prime_space,
         phase_reflection=phase_reflection,
         polarisation_quarter=False,
     )
@@ -574,98 +526,17 @@ def test_make_et_group_flow_proposal(prime_space, phase_reflection):
     assert getattr(gm, "TriangularGroupFlowProposal") is cls
 
 
-def test_rotated_anglepair_matches_anglepair_rotated():
-    """RotatedAnglePair's prime output is AnglePair's output rotated by R,
-    and the forward/inverse round trip recovers ra/dec."""
-    from nessai.reparameterisations import AnglePair
-    from nessai_gw.reparameterisations.sky import RotatedAnglePair
-
-    R = ETTriangleGroupAction(reference_time=REFERENCE_TIME).sky_frame_rotation
-    bounds = {"ra": np.array([0.0, 2 * np.pi]), "dec": np.array([-np.pi / 2, np.pi / 2])}
-    rng = np.random.default_rng(0)
-    plain = AnglePair(
-        parameters=["ra", "dec"], prior_bounds=dict(bounds),
-        convention="ra-dec", rng=np.random.default_rng(1),
-    )
-    rot = RotatedAnglePair(
-        parameters=["ra", "dec"], prior_bounds=dict(bounds),
-        convention="ra-dec", rotation=R, radial_sigma=None,
-        rng=np.random.default_rng(1),
-    )
-    n = 500
-    x = np.zeros(
-        n, dtype=[(p, "f8") for p in plain.parameters + plain.auxiliary_parameters]
-    )
-    x["ra"] = rng.uniform(0, 2 * np.pi, n)
-    x["dec"] = np.arcsin(rng.uniform(-1, 1, n))
-    x[plain.auxiliary_parameters[0]] = rng.uniform(0.5, 1.5, n)
-    dt = [(p, "f8") for p in plain.output_parameters]
-    xp_a = np.zeros(n, dtype=dt)
-    xp_b = np.zeros(n, dtype=dt)
-    _, xp_a, _ = plain.reparameterise(x.copy(), xp_a, np.zeros(n))
-    _, xp_b, _ = rot.reparameterise(x.copy(), xp_b, np.zeros(n))
-    va = np.stack([xp_a[p] for p in plain.output_parameters], axis=-1)
-    vb = np.stack([xp_b[p] for p in rot.output_parameters], axis=-1)
-    np.testing.assert_allclose(vb, va @ R.T, atol=1e-9)
-
-    back = np.zeros(
-        n, dtype=[(p, "f8") for p in rot.parameters + rot.auxiliary_parameters]
-    )
-    back, _, _ = rot.inverse_reparameterise(back, xp_b, np.zeros(n))
-    np.testing.assert_allclose(np.cos(back["ra"]), np.cos(x["ra"]), atol=1e-6)
-    np.testing.assert_allclose(np.sin(back["ra"]), np.sin(x["ra"]), atol=1e-6)
-    np.testing.assert_allclose(back["dec"], x["dec"], atol=1e-6)
-
-
-def test_rotated_anglepair_radial_shell():
-    """The default concentrated radius keeps the prime points in a unit shell
-    (no mass tapering toward the origin); ``radial_sigma=None`` restores chi(3).
-    """
-    from nessai_gw.reparameterisations.sky import RotatedAnglePair
-
-    R = ETTriangleGroupAction(reference_time=REFERENCE_TIME).sky_frame_rotation
-    bounds = {
-        "ra": np.array([0.0, 2 * np.pi]),
-        "dec": np.array([-np.pi / 2, np.pi / 2]),
-    }
-    rng = np.random.default_rng(0)
-    n = 20000
-    x = np.zeros(n, dtype=[("ra", "f8"), ("dec", "f8"), ("ra_dec_radial", "f8")])
-    x["ra"] = rng.uniform(0, 2 * np.pi, n)
-    x["dec"] = np.arcsin(rng.uniform(-1, 1, n))
-
-    def radii(radial_sigma):
-        rep = RotatedAnglePair(
-            parameters=["ra", "dec"], prior_bounds=dict(bounds),
-            convention="ra-dec", rotation=R, radial_sigma=radial_sigma,
-            rng=np.random.default_rng(1),
-        )
-        xp = np.zeros(n, dtype=[(p, "f8") for p in rep.output_parameters])
-        _, xp, _ = rep.reparameterise(x.copy(), xp, np.zeros(n))
-        v = np.stack([xp[p] for p in rep.output_parameters], axis=-1)
-        return np.linalg.norm(v, axis=1)
-
-    shell = radii(0.15)
-    assert shell.mean() == pytest.approx(1.0, abs=0.02)
-    assert shell.std() == pytest.approx(0.15, abs=0.02)
-    assert shell.min() > 0.4  # nothing near the origin
-
-    chi3 = radii(None)
-    assert chi3.std() > 0.4  # the wide chi(3) spread
-    assert (chi3 < 0.7).mean() > 0.05  # real mass tapering toward r=0
-
-
-def test_fundamental_domain_is_positive_sky_octant(prime_action, prime_points):
-    """With the detector-frame rotation, the canonical image of each orbit has
-    all three sky prime coordinates non-negative (the axis-aligned octant)."""
-    n = len(prime_points["ra_dec_x"])
+def test_fundamental_domain_is_sky_sub_square(prime_action, prime_points):
+    """With the detector-frame rotation, the canonical image of each orbit is
+    in the equal-area sub-square ``sky_u < 1/4``, ``sky_v < 1/2``."""
+    n = len(prime_points["t_det"])
     seen = torch.zeros(n, dtype=torch.bool)
     for g in range(8):
         modes = torch.full((n,), g, dtype=torch.long)
         image = prime_action(prime_points, modes)
         canon = prime_action.in_fundamental_domain(image)
-        for c in ("ra_dec_x", "ra_dec_y", "ra_dec_z"):
-            assert torch.all(image[c][canon] > -1e-9), (g, c)
+        assert torch.all(image["sky_u"][canon] < 0.25 + 1e-9), g
+        assert torch.all(image["sky_v"][canon] < 0.5 + 1e-9), g
         seen |= canon
     assert torch.all(seen)
 
@@ -753,154 +624,12 @@ def test_polarisation_offset_default_matches_unshifted_behaviour():
 
 
 @requires_group_mixture
-@pytest.mark.parametrize("boundary_reflection", [False, True])
-def test_make_et_group_flow_proposal_reflection_and_offset(boundary_reflection):
-    cls = make_et_group_flow_proposal(
-        BNS_PARAMETERS,
-        REFERENCE_TIME,
-        azimuth_offset=0.3,
-        boundary_reflection=boundary_reflection,
-        gaussianise_sky=False,  # tested in isolation; it supersedes reflection
-    )
-    expect = (
-        ["ra_dec_x", "ra_dec_y", "ra_dec_z"] if boundary_reflection else None
-    )
-    assert (
-        getattr(cls._FlowModelClass, "reflect_parameters", None) == expect
-    )
-
-
-@requires_group_mixture
 def test_make_et_group_flow_proposal_missing_parameter():
     with pytest.raises(RuntimeError, match="missing"):
         make_et_group_flow_proposal(["ra", "dec", "psi"], REFERENCE_TIME)
 
 
-# --------------------------------------------------------------------------
-# SkyOctantGaussianiser (canonical_transform)
-
-from nessai_gw.group_mixture import SkyOctantGaussianiser  # noqa: E402
-
-
-def _octant_canon(n, seed=7):
-    """``[n, len(PRIME_NAMES)]`` canon tensor, sky on the +++ octant shell."""
-    rng = np.random.default_rng(seed)
-    v = np.abs(rng.normal(size=(n, 3)))
-    v /= np.linalg.norm(v, axis=1, keepdims=True)
-    r = rng.uniform(0.7, 1.3, n)
-    v *= r[:, None]
-    cols = {k: torch.zeros(n, dtype=torch.float64) for k in PRIME_NAMES}
-    cols["ra_dec_x"] = torch.as_tensor(v[:, 0])
-    cols["ra_dec_y"] = torch.as_tensor(v[:, 1])
-    cols["ra_dec_z"] = torch.as_tensor(v[:, 2])
-    for k in ("psi_x", "psi_y", "delta_phase", "theta_jn_prime"):
-        cols[k] = torch.as_tensor(rng.normal(size=n))
-    return torch.stack([cols[k] for k in PRIME_NAMES], dim=-1)
-
-
-def test_sky_octant_gaussianiser_roundtrip():
-    t = SkyOctantGaussianiser(PRIME_NAMES)
-    canon = _octant_canon(512)
-    base, ljf = t.forward(canon)
-    back, lji = t.inverse(base)
-    assert torch.allclose(back, canon, atol=1e-6)
-    assert torch.allclose(ljf, -lji, atol=1e-6)
-    # non-sky columns are untouched
-    for i, name in enumerate(PRIME_NAMES):
-        if not name.startswith("ra_dec"):
-            assert torch.allclose(base[:, i], canon[:, i])
-
-
-def test_sky_octant_gaussianiser_jacobian_numeric():
-    t = SkyOctantGaussianiser(PRIME_NAMES)
-    canon = _octant_canon(64, seed=1)
-    _, ljf = t.forward(canon)
-    idx = [PRIME_NAMES.index(f"ra_dec_{c}") for c in ("x", "y", "z")]
-    eps = 1e-6
-    jac = torch.zeros(canon.shape[0], 3, 3, dtype=torch.float64)
-    for j, col in enumerate(idx):
-        for s in (+1, -1):
-            pert = canon.clone()
-            pert[:, col] += s * eps
-            fp, _ = t.forward(pert)
-            jac[:, :, j] += s * fp[:, idx] / (2 * eps)
-    logdet = torch.log(torch.linalg.det(jac).abs())
-    assert torch.allclose(ljf, logdet, atol=1e-4)
-
-
-def test_sky_octant_gaussianiser_gaussianises_uniform_prior():
-    rng = np.random.default_rng(0)
-    v = np.abs(rng.normal(size=(200_000, 3)))
-    v /= np.linalg.norm(v, axis=1, keepdims=True)
-    canon = torch.zeros(v.shape[0], len(PRIME_NAMES), dtype=torch.float64)
-    canon[:, 0] = torch.as_tensor(v[:, 0])
-    canon[:, 1] = torch.as_tensor(v[:, 1])
-    canon[:, 2] = torch.as_tensor(v[:, 2])
-    base, _ = SkyOctantGaussianiser(PRIME_NAMES).forward(canon)
-    a, b = base[:, 0].numpy(), base[:, 1].numpy()
-    assert abs(a.mean()) < 0.02 and abs(b.mean()) < 0.02
-    assert abs(a.std() - 1.0) < 0.02 and abs(b.std() - 1.0) < 0.02
-    # independent
-    assert abs(np.corrcoef(a, b)[0, 1]) < 0.02
-
-
-@requires_group_mixture
-def test_gaussianise_sky_on_by_default_for_prime_space():
-    # default sky_2d="auto" resolves on -> SkyOctantProbit
-    on = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
-    assert isinstance(
-        getattr(on._FlowModelClass, "canonical_transform", None),
-        SkyOctantProbit,
-    )
-    # 3-coordinate sky still uses the Gaussianiser
-    on3 = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=False
-    )
-    assert isinstance(
-        getattr(on3._FlowModelClass, "canonical_transform", None),
-        SkyOctantGaussianiser,
-    )
-    off = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, prime_space=False
-    )
-    assert getattr(off._FlowModelClass, "canonical_transform", None) is None
-    opt_out = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, gaussianise_sky=False
-    )
-    assert getattr(opt_out._FlowModelClass, "canonical_transform", None) is None
-
-
-@requires_group_mixture
-def test_make_et_group_flow_proposal_gaussianise_sky():
-    cls = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, gaussianise_sky=True, sky_2d=False
-    )
-    ct = getattr(cls._FlowModelClass, "canonical_transform", None)
-    assert isinstance(ct, SkyOctantGaussianiser)
-    # supersedes boundary_reflection for the sky
-    cls2 = make_et_group_flow_proposal(
-        BNS_PARAMETERS,
-        REFERENCE_TIME,
-        gaussianise_sky=True,
-        sky_2d=False,
-        boundary_reflection=True,
-    )
-    assert getattr(cls2._FlowModelClass, "reflect_parameters", None) is None
-
-
-@requires_group_mixture
-def test_gaussianise_sky_requires_prime_space():
-    with pytest.raises(RuntimeError, match="prime-space"):
-        make_et_group_flow_proposal(
-            BNS_PARAMETERS,
-            REFERENCE_TIME,
-            prime_space=False,
-            gaussianise_sky=True,
-        )
-
-
-# ---------------------------------------------------------------------------
-# 2-D equal-area sky path (EqualAreaSky + SkyOctantProbit + sky_2d wiring)
+# 2-D equal-area sky path (EqualAreaSky + SkyOctantProbit)
 # ---------------------------------------------------------------------------
 from nessai_gw.group_mixture import (  # noqa: E402
     SkyOctantProbit,
@@ -1008,78 +737,14 @@ def test_sky_octant_probit_gaussianises_folded_prior():
     assert abs(np.corrcoef(a, b)[0, 1]) < 0.02
 
 
-def test_prime_space_action_2d_sky_matches_3d(prime_points):
-    """The 2-D equal-area sky action must be physically identical to the 3-D one."""
-    R = _sky_rotation()
-    base3 = _et_action(phase_reflection=True)
-    a3 = PrimeSpaceTriangularGroupAction(base3, PRIME_NAMES)
-    a2 = PrimeSpaceTriangularGroupAction(base3, PRIME_NAMES_2D)
-    assert a2._sky2d == ("sky_u", "sky_v")
-
-    # recover (ra, sin_dec) that prime_points encodes, then build the 2-D input
-    acted3, _ = a3._decode(prime_points)
-    ra, sin_dec = acted3["ra"], acted3["sin_dec"]
-    dec = torch.asin(torch.clamp(sin_dec, -1.0, 1.0))
-    cd = torch.cos(dec)
-    we = torch.stack([cd * torch.cos(ra), cd * torch.sin(ra), sin_dec])
-    Rt = torch.as_tensor(R)
-    wd = Rt @ we
-    lam = torch.remainder(torch.atan2(wd[1], wd[0]), 2 * np.pi)
-    z = torch.clamp(wd[2], -1.0, 1.0)
-    pts2 = {k: prime_points[k] for k in PRIME_NAMES_2D if k in prime_points}
-    pts2["sky_u"] = lam / (2 * np.pi)
-    pts2["sky_v"] = 0.5 * (1.0 - z)
-
-    for g in range(16):
-        modes = torch.full((ra.shape[0],), g)
-        m3 = a3(prime_points, modes)
-        m2 = a2(pts2, modes)
-        # compare the physical sky the two encodings imply
-        d3, _ = a3._decode(m3)
-        e2, _ = a2._decode(m2)
-        dra = torch.remainder(d3["ra"] - e2["ra"], 2 * np.pi)
-        dra = torch.minimum(dra, 2 * np.pi - dra)
-        assert dra.abs().max() < 1e-6, g
-        assert (d3["sin_dec"] - e2["sin_dec"]).abs().max() < 1e-6, g
-        # delta_phase / psi / theta_jn coordinates must match exactly
-        for c in ("delta_phase", "psi_x", "psi_y", "theta_jn_prime", "t_det"):
-            assert torch.allclose(m3[c], m2[c], atol=1e-6), (g, c)
-
-
 @requires_group_mixture
 def test_make_et_group_flow_proposal_sky_2d():
-    cls = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True
-    )
+    cls = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
     ct = getattr(cls._FlowModelClass, "canonical_transform", None)
     assert isinstance(ct, SkyOctantProbit)
     names = list(cls._FlowModelClass.param_names)
     assert "sky_u" in names and "sky_v" in names
     assert not any(n.startswith("ra_dec") for n in names)
-    # one fewer flow dimension than the 3-coordinate path
-    base = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=False
-    )
-    assert any(n.startswith("ra_dec") for n in base._FlowModelClass.param_names)
-    assert len(names) == len(base._FlowModelClass.param_names) - 1
-    # on by default (prime-space + gaussianise-sky both active)
-    dflt = make_et_group_flow_proposal(BNS_PARAMETERS, REFERENCE_TIME)
-    assert isinstance(
-        getattr(dflt._FlowModelClass, "canonical_transform", None),
-        SkyOctantProbit,
-    )
-
-
-@requires_group_mixture
-def test_sky_2d_requires_gaussianise_and_prime_space():
-    with pytest.raises(RuntimeError, match="prime-space"):
-        make_et_group_flow_proposal(
-            BNS_PARAMETERS, REFERENCE_TIME, prime_space=False, sky_2d=True
-        )
-    with pytest.raises(RuntimeError, match="gaussianise_sky"):
-        make_et_group_flow_proposal(
-            BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True, gaussianise_sky=False
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1090,9 +755,8 @@ from nessai_gw.reparameterisations.phase import (  # noqa: E402
 )
 
 PRIME_NAMES_PSI1 = [
-    "ra_dec_x",
-    "ra_dec_y",
-    "ra_dec_z",
+    "sky_u",
+    "sky_v",
     "psi_prime",
     "delta_phase",
     "theta_jn_prime",
@@ -1153,13 +817,13 @@ def test_prime_space_action_single_psi_matches_pair(prime_points):
 @requires_group_mixture
 def test_make_et_group_flow_proposal_psi_single():
     cls = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True, sky_2d=False
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True
     )
     names = list(cls._FlowModelClass.param_names)
     assert "psi_prime" in names
     assert "psi_x" not in names and "psi_y" not in names
     base = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, psi_single=False, sky_2d=False
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=False
     )
     assert "psi_x" in base._FlowModelClass.param_names
     assert len(names) == len(base._FlowModelClass.param_names) - 1
@@ -1170,13 +834,6 @@ def test_make_et_group_flow_proposal_psi_single():
         )._FlowModelClass.param_names
     )
     assert "psi_prime" in dflt
-    # combines with sky_2d
-    both = make_et_group_flow_proposal(
-        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True, sky_2d=True
-    )
-    bn = list(both._FlowModelClass.param_names)
-    assert "psi_prime" in bn and "sky_u" in bn
-    assert len(bn) == len(base._FlowModelClass.param_names) - 2
 
 
 # ---------------------------------------------------------------------------
@@ -1210,7 +867,7 @@ def _pq_prime_action():
 def test_polarisation_quarter_prime_action_round_trip(prime_points):
     a = _pq_prime_action()
     for g in range(32):
-        modes = torch.full((prime_points["ra_dec_x"].shape[0],), g)
+        modes = torch.full((prime_points["t_det"].shape[0],), g)
         fwd = a(prime_points, modes, inverse=False)
         back = a(fwd, modes, inverse=True)
         for c in PRIME_NAMES:
@@ -1221,7 +878,7 @@ def test_polarisation_quarter_prime_action_round_trip(prime_points):
 
 def test_polarisation_quarter_fundamental_domain_partitions_orbit(prime_points):
     a = _pq_prime_action()
-    n = prime_points["ra_dec_x"].shape[0]
+    n = prime_points["t_det"].shape[0]
     counts = torch.zeros(n)
     for g in range(32):
         modes = torch.full((n,), g)
@@ -1233,7 +890,7 @@ def test_polarisation_quarter_fundamental_domain_partitions_orbit(prime_points):
 def test_polarisation_quarter_preserves_physical_symmetry(prime_points):
     """step==2 must reproduce the phase -> phase + pi flip (delta_phase + pi)."""
     a = _pq_prime_action()
-    n = prime_points["ra_dec_x"].shape[0]
+    n = prime_points["t_det"].shape[0]
     m0 = a(prime_points, torch.zeros(n, dtype=torch.long))
     m2 = a(prime_points, torch.full((n,), 16))  # step = 16 // 8 = 2
     d = torch.remainder(
@@ -1339,7 +996,7 @@ def test_reset_model_weights_realigns_prime_parameter_order(tmp_path):
             return np.zeros(len(np.atleast_1d(x)))
 
     cls = make_et_group_flow_proposal(
-        names, REFERENCE_TIME, prime_space=True, n_clusters_max=1,
+        names, REFERENCE_TIME, n_clusters_max=1,
     )
     from nessai_gw.group_mixture import triangular_group_reparameterisations
 
@@ -1413,7 +1070,7 @@ def test_et_proposal_with_chirp_distance_and_effective_spin(tmp_path):
 
     kwargs = {"chirp_distance": True, "effective_spin": True}
     cls = make_et_group_flow_proposal(
-        names, REFERENCE_TIME, prime_space=True, n_clusters_max=1, **kwargs
+        names, REFERENCE_TIME, n_clusters_max=1, **kwargs
     )
     proposal = cls(
         _StubModel(),
@@ -1492,7 +1149,7 @@ def test_reference_epoch_moves_every_frame(tmp_path):
 
     kwargs = {"chirp_distance": True, "chirp_distance_k0": 0}
     cls = make_et_group_flow_proposal(
-        names, REFERENCE_TIME, prime_space=True, n_clusters_max=1,
+        names, REFERENCE_TIME, n_clusters_max=1,
         reference_epoch={"max_hours": 8.0}, **kwargs
     )
     proposal = cls(
@@ -1645,16 +1302,16 @@ def test_prime_action_recovers_sign_cos_theta_jn(ellipse, coordinate):
     else:
         prime = (theta_jn - np.arccos(np.clip(centre, -1, 1))) * 2.0 / np.pi
     cos_dec = np.cos(dec)
-    # the flow's sky coordinates are detector-frame (RotatedAnglePair), so feed
+    # the flow's sky coordinates are detector-frame (EqualAreaSky), so feed
     # v_det = R v_eq -- _decode rotates back with R^T.
     v_eq = np.stack(
         [cos_dec * np.cos(ra), cos_dec * np.sin(ra), np.sin(dec)], axis=-1
     )
     v_det = v_eq @ np.asarray(action._action.sky_frame_rotation).T
     points = {
-        "ra_dec_x": torch.as_tensor(v_det[:, 0].copy()),
-        "ra_dec_y": torch.as_tensor(v_det[:, 1].copy()),
-        "ra_dec_z": torch.as_tensor(v_det[:, 2].copy()),
+        "sky_u": torch.as_tensor(
+            np.mod(np.arctan2(v_det[:, 1], v_det[:, 0]), 2 * np.pi) / (2 * np.pi)),
+        "sky_v": torch.as_tensor(0.5 * (1.0 - v_det[:, 2])),
         "psi_x": torch.as_tensor(np.cos(2.0 * rng.uniform(0, np.pi, n))),
         "psi_y": torch.as_tensor(np.sin(2.0 * rng.uniform(0, np.pi, n))),
         "delta_phase": torch.as_tensor(rng.uniform(-1.0, 1.0, n)),
@@ -1699,9 +1356,9 @@ def test_prime_action_sign_cos_theta_jn_with_adaptive_width(coordinate):
     )
     v_det = v_eq @ np.asarray(action._action.sky_frame_rotation).T
     points = {
-        "ra_dec_x": torch.as_tensor(v_det[:, 0].copy()),
-        "ra_dec_y": torch.as_tensor(v_det[:, 1].copy()),
-        "ra_dec_z": torch.as_tensor(v_det[:, 2].copy()),
+        "sky_u": torch.as_tensor(
+            np.mod(np.arctan2(v_det[:, 1], v_det[:, 0]), 2 * np.pi) / (2 * np.pi)),
+        "sky_v": torch.as_tensor(0.5 * (1.0 - v_det[:, 2])),
         "psi_x": torch.as_tensor(np.cos(2.0 * rng.uniform(0, np.pi, n))),
         "psi_y": torch.as_tensor(np.sin(2.0 * rng.uniform(0, np.pi, n))),
         "delta_phase": torch.as_tensor(rng.uniform(-1.0, 1.0, n)),
@@ -1808,7 +1465,7 @@ def test_prime_space_action_shifts_phi_jl(prime_points, phi_jl_names):
     names = PRIME_NAMES + list(phi_jl_names) + ["s2_x"]
     action = PrimeSpaceTriangularGroupAction(base, names)
     rng = np.random.default_rng(5)
-    n = len(prime_points["ra_dec_x"])
+    n = len(prime_points["t_det"])
     points = dict(prime_points)
     phi_jl = rng.uniform(0, 2 * np.pi, n)
     if len(phi_jl_names) == 2:

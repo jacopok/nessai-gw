@@ -24,7 +24,7 @@ BNS_PARAMETERS = [
 @pytest.fixture(scope="module")
 def names():
     return _prime_parameter_names(
-        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True, psi_single=True
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True
     )
 
 
@@ -256,7 +256,6 @@ def test_make_et_group_flow_proposal_phase_recanon():
         dict(psi_single=False),
         dict(polarisation_quarter=False),
         dict(phase_coordinates="arg-alpha-beta"),
-        dict(prime_space=False),
     ],
 )
 def test_make_et_group_flow_proposal_phase_recanon_incompatible(kwargs):
@@ -438,7 +437,3 @@ def test_make_et_group_flow_proposal_adaptive_domain():
         BNS_PARAMETERS, REFERENCE_TIME, adaptive_domain=True
     )._FlowModelClass.base_reparam_factory()
     assert not b.allow_phase_mode
-    with pytest.raises(RuntimeError, match="sky_2d"):
-        make_et_group_flow_proposal(
-            BNS_PARAMETERS, REFERENCE_TIME, adaptive_domain=True, sky_2d=False
-        )

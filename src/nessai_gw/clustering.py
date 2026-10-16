@@ -36,7 +36,7 @@ split here replaces them with a deterministic split instead.
 One thing the split does not attempt: the plateau and clump branches also want
 different **phase coordinates** (plateau: plain, independent ``psi``/
 ``phase``; clump: ``arg_alpha``/``arg_beta`` with a fitted
-``polarisation_offset`` -- see :mod:`nessai_gw._polarisation_branch`'s module
+``polarisation_offset`` -- see xG_inference ``studies/nessai_gw/polarisation_branch.py``'s module
 docstring).  The clustered mixture shares one ``param_names``/reparameterisation
 set across every expert (only the per-expert flow weights and canonical
 standardisation differ), so that per-branch difference cannot be expressed

@@ -277,15 +277,14 @@ def test_wiring_errors():
         )
 
 
-@pytest.mark.parametrize("sky_2d", [False, True])
-def test_prime_names_from_nessai(sky_2d):
+def test_prime_names_from_nessai():
     """nessai accepts the order (the probe builds the real
     ``CombinedReparameterisation``, whose ``check_order`` checks every
     inverse input) and reports the new prime names."""
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
         prime = _prime_parameter_names(
-            WIRING, T_REF, sky_2d=sky_2d, effective_spin=True,
+            WIRING, T_REF, effective_spin=True,
             effective_tidal_deformability=True, doppler_vector=K,
         )
     assert {"lambda_tilde_prime", "lambda_diff_prime",

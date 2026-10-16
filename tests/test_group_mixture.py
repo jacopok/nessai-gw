@@ -627,22 +627,6 @@ def test_geocent_time_preserves_detector_arrival_time():
         assert flipped, "reflection should shift geocent_time"
 
 
-def test_make_flow_factory():
-    pytest.importorskip("nessai.flowmodel.group_mixture")
-    from nessai_gw.group_mixture import make_et_triangle_group_mixture_flow
-
-    cls = make_et_triangle_group_mixture_flow(reference_time=REFERENCE_TIME)
-    assert cls.group_size == TRIANGULAR_DETECTOR_GROUP_SIZE
-    assert cls.param_names == TRIANGULAR_DETECTOR_PARAMETERS
-    assert callable(cls.group_action_fn)
-    assert callable(cls.in_fundamental_domain)
-
-    cls16 = make_et_triangle_group_mixture_flow(
-        reference_time=REFERENCE_TIME, phase_reflection=True
-    )
-    assert cls16.group_size == TRIANGULAR_DETECTOR_GROUP_SIZE_PHASE
-
-
 def test_reflection_shifts_phi_jl(action, random_points):
     """With precessing spins the plane reflection also sends phi_jl ->
     phi_jl + pi; inverse and closure still hold."""

@@ -193,7 +193,7 @@ def _et_torus_setup(n=3000, seed=3):
     )
 
     names = _prime_parameter_names(
-        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True, psi_single=True
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True
     )
     action = PrimeSpaceTriangularGroupAction(
         ETTriangleGroupAction(
@@ -410,8 +410,8 @@ def test_et_proposal_circular_end_to_end(
 ):
     cls = make_et_group_flow_proposal(
         BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
-        polarisation_quarter=True, psi_single=True, sky_2d="auto",
-        gaussianise_sky=True, adaptive_domain=adaptive_domain,
+        polarisation_quarter=True, psi_single=True,
+        adaptive_domain=adaptive_domain,
         phase_recanon=recanon,
         circular_psi_phase=True, log_mass_ratio=False,
         circular_standardisation=standardise,

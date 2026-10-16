@@ -125,10 +125,8 @@ element of the frozen-limit group,
 :class:`PrimeSpaceTriangularGroupAction` carries the ``t_det`` prime coordinate
 through **unchanged** -- time need not be acted on at all.
 
-The physical-space :class:`TriangularDetectorGroupAction` (the
-``prime_space=False`` path and standalone
-:func:`make_triangular_group_mixture_flow`) still works in ``geocent_time`` and
-so must carry it along by the change in the geocenter-to-detector delay::
+The physical-space :class:`TriangularDetectorGroupAction` still works in
+``geocent_time`` and so must carry it along by the change in the geocenter-to-detector delay::
 
     geocent_time -> geocent_time + delay(n) - delay(n')
 
@@ -156,8 +154,6 @@ original one.
 """
 
 from __future__ import annotations
-
-import inspect
 
 import numpy as np
 import torch
@@ -474,7 +470,8 @@ class TriangularDetectorGroupAction:
         # same detector-frame direction :meth:`_to_frame` computes.  ``Rz``
         # maps ``ra -> ra - gmst``; ``_basis_np`` (rows e1, e2, e3=normal) then
         # rotates Earth-fixed -> detector frame.  Used by
-        # :class:`RotatedAnglePair` (flow coordinates) and
+        # :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky` (flow
+        # coordinates) and
         # :class:`PrimeSpaceTriangularGroupAction` (prime-space decode/encode).
         _g = self.gmst
         _Rz = np.array(
@@ -709,74 +706,11 @@ class TriangularDetectorGroupAction:
         return mask
 
 
-def make_triangular_group_mixture_flow(
-    reference_time,
-    plane_normal,
-    vertex,
-    parameters=None,
-    phase_reflection=False,
-    azimuth_offset=0.0,
-):
-    """Build a group-mixture ``FlowModel`` class for a triangular detector.
-
-    Thin wrapper around
-    :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow` bound to
-    :class:`TriangularDetectorGroupAction`.
-
-    Parameters
-    ----------
-    reference_time : float
-        Geocentric GPS time of the event (see
-        :class:`TriangularDetectorGroupAction`).
-    plane_normal : array_like
-        Earth-fixed unit normal to the detector plane.
-    vertex : array_like
-        Geocentric detector position (metres).
-    parameters : list of str, optional
-        Override the acted-on parameter names/order (default
-        :data:`TRIANGULAR_DETECTOR_PARAMETERS`).  The flow must be given exactly
-        these inputs, in this order.
-    phase_reflection : bool, optional
-        Fold in the extra ``phase -> phase + pi`` (2, 2)-mode degeneracy
-        (16-element group).  See :class:`TriangularDetectorGroupAction`.
-
-    Returns
-    -------
-    type
-        A ``GroupMixtureFlowModel`` subclass, suitable as ``_FlowModelClass``
-        of a :class:`nessai.flowmodel.group_mixture.GroupFlowProposal` (or the
-        ``flow_class`` of a flow config).
-    """
-    from nessai.flowmodel.group_mixture import make_group_mixture_flow
-
-    action = TriangularDetectorGroupAction(
-        reference_time=reference_time,
-        plane_normal=plane_normal,
-        vertex=vertex,
-        phase_reflection=phase_reflection,
-        azimuth_offset=azimuth_offset,
-    )
-    names = list(parameters) if parameters is not None else action.parameters
-    return make_group_mixture_flow(
-        group_action_fn=action,
-        group_size=action.group_size,
-        param_names=names,
-        in_fundamental_domain=action.in_fundamental_domain,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Prime-space adapter + proposal wiring
 #
-# nessai's :class:`~nessai.flowmodel.group_mixture.GroupFlowProposalMixin` can
-# run :class:`TriangularDetectorGroupAction` directly in the *physical* parameter
-# space and bridge to the flow's *prime* space with a
-# :class:`~nessai.flowmodel.group_mixture.ReparamBridge` (non-affine
-# reparameterisations handled exactly).  That is the ``prime_space=False`` path
-# of :func:`make_triangular_group_flow_proposal` and needs no code here.
-#
-# The ``prime_space=True`` path instead maps the acted physical coordinates out
-# of the nessai-gw prime vector, runs the unchanged group action, and re-encodes
+# :func:`make_triangular_group_flow_proposal` maps the acted physical
+# coordinates out of the nessai-gw prime vector, runs the unchanged group action, and re-encodes
 # onto vectors of the *same* radii -- an exact unit-Jacobian prime-space map with
 # no per-call numpy round-trip through the reparameterisation.  This mirrors the
 # wiring tuned in the ``xG_inference`` ET replay optimisation.
@@ -845,7 +779,7 @@ class PrimeSpaceTriangularGroupAction:
         self._ellipse = ellipse
         self._ellipse_scale = float(ellipse_scale)
         self._ellipse_coordinate = ellipse_coordinate
-        # Flow sky coordinates are detector-frame (see RotatedAnglePair); the
+        # Flow sky coordinates are detector-frame (see EqualAreaSky); the
         # decode/encode below work in equatorial coordinates, so rotate in and
         # out with the action's fixed sky-frame rotation.
         self._sky_R = torch.as_tensor(
@@ -880,18 +814,10 @@ class PrimeSpaceTriangularGroupAction:
         self._prime_names = list(prime_names)
         names = set(self._prime_names)
 
-        # sky: ra_dec_{x,y,z} from the sky-ra-dec AnglePair (3-coord path) or
-        # sky_u / sky_v from EqualAreaSky (2-coord path).
-        self._sky = None
+        # sky: sky_u / sky_v from EqualAreaSky.
         self._sky2d = None
         if "sky_u" in names and "sky_v" in names:
             self._sky2d = ("sky_u", "sky_v")
-        else:
-            for prefix in ("ra_dec", "dec_ra"):
-                trip = [f"{prefix}_{c}" for c in ("x", "y", "z")]
-                if all(t in names for t in trip):
-                    self._sky = tuple(trip)
-                    break
 
         # psi: name_{x,y} from the angle-pi Angle reparam, or a single
         # ``psi_prime`` coordinate from SingleAngleReparameterisation.
@@ -951,8 +877,8 @@ class PrimeSpaceTriangularGroupAction:
                 break
 
         missing = []
-        if self._sky is None and self._sky2d is None:
-            missing.append("sky-ra-dec (ra_dec_x/_y/_z) or sky_u/sky_v")
+        if self._sky2d is None:
+            missing.append("sky_u/sky_v")
         if self._arg_ab is None:
             if "psi" not in self._pair and not self._psi_single:
                 missing.append("psi (psi_x/_y or psi_prime)")
@@ -980,22 +906,16 @@ class PrimeSpaceTriangularGroupAction:
         Returns ``(acted, aux)`` where ``aux`` carries the radii needed to
         re-encode.
         """
-        if self._sky2d is not None:
-            # EqualAreaSky: (sky_u, sky_v) -> detector-frame unit vector.
-            u = point_dict[self._sky2d[0]]
-            v = point_dict[self._sky2d[1]]
-            Rt = self._sky_R.to(u.dtype)
-            lam_f = _TWO_PI * u
-            z_f = torch.clamp(1.0 - 2.0 * v, -1.0, 1.0)
-            rho = torch.sqrt(torch.clamp(1.0 - z_f * z_f, min=0.0))
-            dx = rho * torch.cos(lam_f)
-            dy = rho * torch.sin(lam_f)
-            dz = z_f
-            r_sky = torch.ones_like(u)
-        else:
-            dx, dy, dz = (point_dict[n] for n in self._sky)
-            Rt = self._sky_R.to(dx.dtype)
-            r_sky = torch.sqrt(dx * dx + dy * dy + dz * dz + _EPS)
+        # EqualAreaSky: (sky_u, sky_v) -> detector-frame unit vector.
+        u = point_dict[self._sky2d[0]]
+        v = point_dict[self._sky2d[1]]
+        Rt = self._sky_R.to(u.dtype)
+        lam_f = _TWO_PI * u
+        z_f = torch.clamp(1.0 - 2.0 * v, -1.0, 1.0)
+        rho = torch.sqrt(torch.clamp(1.0 - z_f * z_f, min=0.0))
+        dx = rho * torch.cos(lam_f)
+        dy = rho * torch.sin(lam_f)
+        dz = z_f
         # detector-frame (flow) -> equatorial: v_eq = R^T v_det
         sx = Rt[0, 0] * dx + Rt[1, 0] * dy + Rt[2, 0] * dz
         sy = Rt[0, 1] * dx + Rt[1, 1] * dy + Rt[2, 1] * dz
@@ -1093,7 +1013,6 @@ class PrimeSpaceTriangularGroupAction:
             "phase": phase,
         }
         aux = {
-            "r_sky": r_sky,
             "r_psi": r_psi,
             "phase_inv": phase,
             "sign_ct": sign_ct,
@@ -1114,17 +1033,10 @@ class PrimeSpaceTriangularGroupAction:
         dxf = Rf[0, 0] * ux + Rf[0, 1] * uy + Rf[0, 2] * uz
         dyf = Rf[1, 0] * ux + Rf[1, 1] * uy + Rf[1, 2] * uz
         dzf = Rf[2, 0] * ux + Rf[2, 1] * uy + Rf[2, 2] * uz
-        if self._sky2d is not None:
-            lam_f = torch.remainder(torch.atan2(dyf, dxf), _TWO_PI)
-            z_f = torch.clamp(dzf, -1.0, 1.0)
-            out[self._sky2d[0]] = lam_f / _TWO_PI
-            out[self._sky2d[1]] = 0.5 * (1.0 - z_f)
-        else:
-            r = aux["r_sky"]
-            sx, sy, sz = self._sky
-            out[sx] = r * dxf
-            out[sy] = r * dyf
-            out[sz] = r * dzf
+        lam_f = torch.remainder(torch.atan2(dyf, dxf), _TWO_PI)
+        z_f = torch.clamp(dzf, -1.0, 1.0)
+        out[self._sky2d[0]] = lam_f / _TWO_PI
+        out[self._sky2d[1]] = 0.5 * (1.0 - z_f)
 
         if self._arg_ab is not None:
             pass  # psi is not a flow coordinate on this path
@@ -1243,117 +1155,6 @@ def _log_std_normal_pdf(x):
     return -0.5 * x * x - _HALF_LOG_2PI
 
 
-class SkyOctantGaussianiser:
-    """Cylindrical equal-area + probit map of the canonical sky octant.
-
-    A ``canonical_transform`` for
-    :class:`nessai.flowmodel.group_mixture.DiscreteGroupMixtureFlowWrapper`.
-    Once the triangular-detector group has folded the sky to the axis-aligned
-    detector-frame octant ``x, y, z >= 0`` (see
-    :class:`~nessai_gw.reparameterisations.sky.RotatedAnglePair`), the base
-    flow still sees the *uniform-on-sphere* prior restricted to that octant --
-    a distribution with a hard edge along every octant boundary, which a
-    Gaussian-latent flow fits badly.
-
-    This transform replaces the three canonical Cartesian sky coordinates
-    ``(x, y, z) = r * (sin th cos ph, sin th sin ph, cos th)`` with
-
-    * ``a = Phi^-1( (2/pi) * ph )``      (azimuth ``ph in [0, pi/2)``  -> ``U`` -> ``N(0, 1)``)
-    * ``b = Phi^-1( 1 - z / r )``        (``z/r = cos th in [0, 1]``   -> ``U`` -> ``N(0, 1)``)
-    * ``c = r``                          (the auxiliary radius, passed through)
-
-    ``(ph, z/r)`` are the equal-area (Lambert cylindrical) coordinates of the
-    octant, so under the uniform-on-sphere prior ``a`` and ``b`` are *exactly*
-    independent standard normals and the base flow sees no edge. The group
-    action, the fundamental-domain predicate and every conjugation Jacobian
-    stay in the untouched Cartesian frame -- this map only sits between the
-    canonical representative and the base flow.
-
-    The sky is detector-frame-rotated by ``RotatedAnglePair``, so the octant is
-    already axis-aligned in the flow's ``ra_dec_{x,y,z}`` prime coordinates and
-    no rotation is needed here.  ``reflect_parameters`` for the sky is
-    incompatible with (and made redundant by) this transform: the octant walls
-    are pushed to ``a, b -> -inf``.
-
-    Jacobian (sky block only; all other coordinates are identity)::
-
-        dx dy dz = r**2 dr dph d(z/r)             (spherical volume element)
-        dph      = (pi/2) phi(a) da
-        d(z/r)   = phi(b) db
-        =>  log|d(a, b, c)/d(x, y, z)|
-              = log(2/pi) - 2 log r - log phi(a) - log phi(b)
-    """
-
-    def __init__(self, param_names=None, eps: float = 1e-7):
-        self._eps = float(eps)
-        self._idx = None
-        if param_names is not None:
-            self.bind(param_names)
-
-    def bind(self, param_names):
-        names = list(param_names)
-        trip = None
-        for prefix in ("ra_dec", "dec_ra"):
-            cand = [f"{prefix}_{c}" for c in ("x", "y", "z")]
-            if all(c in names for c in cand):
-                trip = cand
-                break
-        if trip is None:
-            raise RuntimeError(
-                "SkyOctantGaussianiser needs ra_dec_{x,y,z} (or dec_ra_*) in "
-                f"the prime parameters; got {names}."
-            )
-        self._idx = [names.index(c) for c in trip]
-
-    # -- transform ------------------------------------------------------
-
-    def forward(self, canon):
-        """``canon -> (t, log|det dt/dcanon|)`` (sky block gaussianised)."""
-        ix, iy, iz = self._idx
-        x, y, z = canon[:, ix], canon[:, iy], canon[:, iz]
-        r = torch.sqrt(x * x + y * y + z * z + _EPS)
-        lam = torch.atan2(y, x)
-        u = torch.clamp((2.0 / np.pi) * lam, self._eps, 1.0 - self._eps)
-        v = torch.clamp(1.0 - z / r, self._eps, 1.0 - self._eps)
-        a = torch.special.ndtri(u)
-        b = torch.special.ndtri(v)
-
-        t = canon.clone()
-        t[:, ix] = a
-        t[:, iy] = b
-        t[:, iz] = r
-        log_j = (
-            -np.log(np.pi / 2.0)
-            - 2.0 * torch.log(r)
-            - _log_std_normal_pdf(a)
-            - _log_std_normal_pdf(b)
-        )
-        return t, log_j
-
-    def inverse(self, t):
-        """``t -> (canon, log|det dcanon/dt|)``."""
-        ix, iy, iz = self._idx
-        a, b, r = t[:, ix], t[:, iy], t[:, iz]
-        u = torch.special.ndtr(a)
-        v = torch.special.ndtr(b)
-        lam = (np.pi / 2.0) * u
-        cos_th = torch.clamp(1.0 - v, -1.0, 1.0)
-        sin_th = torch.sqrt(torch.clamp(1.0 - cos_th * cos_th, min=0.0))
-        rho = r * sin_th
-
-        canon = t.clone()
-        canon[:, ix] = rho * torch.cos(lam)
-        canon[:, iy] = rho * torch.sin(lam)
-        canon[:, iz] = r * cos_th
-        log_j = (
-            np.log(np.pi / 2.0)
-            + 2.0 * torch.log(r)
-            + _log_std_normal_pdf(a)
-            + _log_std_normal_pdf(b)
-        )
-        return canon, log_j
-
-
 _SKY_PROBIT_EPS = 1e-7
 
 
@@ -1373,8 +1174,8 @@ class SkyOctantProbit:
 
     Under the uniform-on-sphere prior ``4 sky_u`` and ``2 sky_v`` are exactly
     ``U(0, 1)`` so ``a`` and ``b`` are exactly ``N(0, 1)`` and the base flow
-    sees no octant edge.  There is **no radial coordinate**: unlike
-    :class:`SkyOctantGaussianiser` this keeps the base-flow sky block 2-D.
+    sees no octant edge.  There is no radial coordinate: the base-flow sky
+    block is 2-D.
 
     Jacobian (sky block only)::
 
@@ -2361,28 +2162,16 @@ def triangular_group_reparameterisations(
         Earth-fixed detector position (metres) for the ``detector-center-time``
         reparameterisation.  Defaults to :data:`ET_EMR_VERTEX`; pass the value
         from :func:`detector_vertex` for a different geometry.
-    phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "independent"}, optional
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta"}, optional
         ``"polarisation-phase"`` (default): the single ``delta_phase`` coordinate
         described above, ``psi`` carried separately (``angle-pi`` /
         ``SingleAngle``).  ``"arg-alpha-beta"``: replace **both** ``psi`` and
         ``phase`` with the two circular-polarisation phases ``arg_alpha =
         (phase - psi)`` and ``arg_beta = (phase + psi)``
         (:class:`~nessai_gw.reparameterisations.phase.ArgAlphaBetaReparameterisation`),
-        which put the likelihood ridge on a flow axis.  ``"independent"``:
-        ``psi`` and ``phase`` each on their own ``single-angle`` axis, no
-        mixing at all -- the right choice when a branch's discrete structure
-        sits entirely on one of the two (e.g. the ET-Delta plateau branch,
-        where ``phase`` is cleanly bimodal and ``psi`` is a plain, single-
-        valued spread; see :mod:`nessai_gw._polarisation_branch`'s module
-        docstring), so mixing them the way ``arg-alpha-beta`` does only smears
-        that bimodality diagonally across both flow axes instead of confining
-        it to one.  ``"independent"`` only works with ``prime_space=False``
-        (plain ``phase`` is not group-invariant the simple closed-form way
-        ``delta_phase`` is built to be, so :class:`PrimeSpaceTriangularGroupAction`
-        has no fast-path support for it -- passing it with ``prime_space=True``
-        fails loudly, "prime space is missing ... delta_phase", rather than
-        silently doing the wrong thing).  Must match the ``phase_coordinates``
-        passed to :func:`make_triangular_group_flow_proposal`.
+        which put the likelihood ridge on a flow axis.  Must match the
+        ``phase_coordinates`` passed to
+        :func:`make_triangular_group_flow_proposal`.
     chirp_distance : bool, optional
         Reparameterise ``luminosity_distance`` as the Roulet et al. chirp
         distance instead of the default ``distance`` reparameterisation.
@@ -2518,10 +2307,10 @@ def triangular_group_reparameterisations(
             "doppler_vector needs 'ra' and 'dec' in the sampling parameters "
             "(the Doppler factor depends on the sky position)."
         )
-    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
+    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta"):
         raise ValueError(
-            "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
-            f"or 'independent'; got {phase_coordinates!r}"
+            "phase_coordinates must be 'polarisation-phase' or "
+            f"'arg-alpha-beta'; got {phase_coordinates!r}"
         )
 
     # ``polarisation-phase`` reads x-space ``psi`` and ``theta_jn`` on its
@@ -2708,11 +2497,6 @@ def triangular_group_reparameterisations(
                 # thread through verbatim -- keying by "phase" would make one of
                 # them append "phase" a second time.  Added after the loop.
                 continue
-            elif phase_coordinates == "independent":
-                # phase on its own single-angle axis, psi left to the default
-                # psi_single handling -- no mixing at all.  Only valid with
-                # prime_space=False; see this function's docstring.
-                reps[name] = {"reparameterisation": "single-angle", "scale": 2.0}
             else:
                 # delta_phase = phase + sign(cos theta_jn) * psi
                 # (polarisation-phase): makes the likelihood-constrained
@@ -2776,7 +2560,7 @@ _DUMMY_PRIOR_BOUNDS = {
 
 
 def _prime_parameter_names(
-    sampling_parameters, reference_time, vertex=None, sky_2d=False,
+    sampling_parameters, reference_time, vertex=None,
     psi_single=False, phase_coordinates="polarisation-phase",
     polarisation_ellipse=None, polarisation_ellipse_scale=1.0,
     polarisation_ellipse_coordinate="angle",
@@ -2868,12 +2652,11 @@ def _prime_parameter_names(
         probe.set_rescaling()
         prime = list(probe.prime_parameters)
         if prime:
-            if sky_2d:
-                # The probe builds the 3-coordinate ``sky-ra-dec`` AnglePair
-                # (it has no knowledge of the group proposal's EqualAreaSky
-                # override); swap the triple for the 2-coordinate names in
-                # place so the pre-bind placeholder has the right count/order.
-                prime = _swap_sky_triple_for_pair(prime)
+            # The probe builds the 3-coordinate ``sky-ra-dec`` AnglePair
+            # (it has no knowledge of the group proposal's EqualAreaSky
+            # override); swap the triple for the 2-coordinate names in
+            # place so the pre-bind placeholder has the right count/order.
+            prime = _swap_sky_triple_for_pair(prime)
             if (
                 phase_coordinates != "arg-alpha-beta"
                 and psi_single
@@ -2903,9 +2686,7 @@ def _prime_parameter_names(
     if precessing:
         out += ["chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x", "s2_y"]
     if "ra" in names and "dec" in names:
-        out += ["sky_u", "sky_v"] if sky_2d else [
-            "ra_dec_x", "ra_dec_y", "ra_dec_z"
-        ]
+        out += ["sky_u", "sky_v"]
     for name in names:
         if name in ("ra", "dec"):
             continue
@@ -2984,10 +2765,10 @@ def recommended_polarisation_offset(psi):
     psi : array_like
         Live-point ``psi`` values (radians) -- from a canonically-folded,
         reasonably localised run.  Pass a single branch's own ``psi`` (e.g.
-        via :func:`nessai_gw._polarisation_branch.diagonal_split_mask`) if
+        via ``diagonal_split_mask`` (xG_inference ``studies/nessai_gw/polarisation_branch.py``)) if
         splitting into branches; the two branches can end up wanting
         different offsets, exactly as they wanted different phase bases (see
-        :func:`nessai_gw._polarisation_branch.fit_phase_rotation`).
+        ``fit_phase_rotation`` (xG_inference ``studies/nessai_gw/polarisation_branch.py``)).
     """
     psi = np.asarray(psi, dtype=float)
     psi_f = np.mod(psi, 0.5 * np.pi)
@@ -3114,10 +2895,8 @@ def _make_group_proposal_class(
     flow_model_cls,
     action,
     sky_rotation,
-    sky_2d,
     psi_single,
     phase_coordinates,
-    sky_radial_sigma=0.15,
     reference_epoch=None,
 ):
     """``FlowProposal`` subclass for a nessai-gw group-mixture flow.
@@ -3125,10 +2904,9 @@ def _make_group_proposal_class(
     Shared by :func:`make_triangular_group_flow_proposal` and
     :func:`nessai_gw.network_group.make_network_group_flow_proposal`: the sky
     is carried in the frame ``sky_rotation`` (equatorial -> flow frame, GMST
-    folded in) by :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky`
-    (``sky_2d``) or :class:`~nessai_gw.reparameterisations.sky.RotatedAnglePair`,
-    ``psi`` optionally by a single ``psi_prime`` coordinate, and a prime-space
-    ``action`` (``None`` on the physical-space path) is re-bound to nessai's
+    folded in) by :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky`,
+    ``psi`` optionally by a single ``psi_prime`` coordinate, and the prime-space
+    ``action`` is re-bound to nessai's
     actual prime-parameter order after every (re-)initialisation.  The class is
     published at module scope as ``class_name`` so checkpoints unpickle.
 
@@ -3184,30 +2962,16 @@ def _make_group_proposal_class(
                 sky_bounds = {
                     k: self.model.bounds[k] for k in ("ra", "dec")
                 }
-                if sky_2d:
-                    from .reparameterisations.sky import EqualAreaSky
+                from .reparameterisations.sky import EqualAreaSky
 
-                    rep.add_reparameterisation(
-                        EqualAreaSky(
-                            parameters=["ra", "dec"],
-                            prior_bounds=sky_bounds,
-                            rotation=sky_rotation,
-                            rng=self.rng,
-                        )
+                rep.add_reparameterisation(
+                    EqualAreaSky(
+                        parameters=["ra", "dec"],
+                        prior_bounds=sky_bounds,
+                        rotation=sky_rotation,
+                        rng=self.rng,
                     )
-                else:
-                    from .reparameterisations.sky import RotatedAnglePair
-
-                    rep.add_reparameterisation(
-                        RotatedAnglePair(
-                            parameters=["ra", "dec"],
-                            prior_bounds=sky_bounds,
-                            convention="ra-dec",
-                            rotation=sky_rotation,
-                            radial_sigma=sky_radial_sigma,
-                            rng=self.rng,
-                        )
-                    )
+                )
             super().add_default_reparameterisations()
 
         def _realign_prime_space_action(self):
@@ -3224,8 +2988,6 @@ def _make_group_proposal_class(
             (possibly wrong) predicted order, scrambling which physical
             quantity landed in which prime-vector column.
             """
-            if action is None:
-                return
             model = getattr(self.flow, "model", None)
             prime = list(getattr(self, "prime_parameters", []) or [])
             if model is not None and prime:
@@ -3329,13 +3091,8 @@ def make_triangular_group_flow_proposal(
     reference_time,
     plane_normal,
     vertex,
-    prime_space=True,
     phase_reflection=False,
     azimuth_offset=0.0,
-    boundary_reflection=False,
-    sky_radial_sigma=0.15,
-    gaussianise_sky="auto",
-    sky_2d="auto",
     psi_single=True,
     polarisation_quarter=True,
     polarisation_offset=0.0,
@@ -3379,7 +3136,7 @@ def make_triangular_group_flow_proposal(
     The sky frame, the group's frame, the chirp distance's response and the
     detector-centre time's delay then refer to the Earth's orientation at an
     epoch chosen before every training, instead of the merger's.  Needs
-    ``prime_space`` and ``chirp_distance``.
+    ``chirp_distance``.
 
     ``flow_model_factory`` (needed when ``n_clusters_max > 1``): a callable
     called with the group keyword arguments (``group_action_fn`` /
@@ -3408,12 +3165,6 @@ def make_triangular_group_flow_proposal(
         Earth-fixed unit normal to the detector plane.
     vertex : array_like
         Geocentric detector position (metres).
-    prime_space : bool, optional
-        If ``True`` (default) run the action in the flow's prime space via
-        :class:`PrimeSpaceTriangularGroupAction` (exact unit Jacobian, no
-        per-call numpy round-trip).  If ``False`` run it in physical coordinates
-        and let nessai's ``GroupFlowProposalMixin`` bridge to prime space with a
-        ``ReparamBridge``.
     phase_reflection : bool, optional
         Fold in the extra ``phase -> phase + pi`` (2, 2)-mode degeneracy
         (16-element group).  See :class:`TriangularDetectorGroupAction`.
@@ -3422,35 +3173,6 @@ def make_triangular_group_flow_proposal(
         shifting the Z4 fundamental-domain seams by a fixed amount (kept for
         reproducing older runs; ``adaptive_domain`` moves the seams per
         expert from the data instead).  Default ``0.0``.
-    boundary_reflection : bool, optional
-        Only on the prime-space path.  Symmetrise the base flow across the
-        ``ra_dec_{x,y,z} = 0`` octant faces so it need not model the wall
-        cliffs (see ``reflect_parameters`` in
-        :func:`nessai.flowmodel.group_mixture.make_group_mixture_flow`).
-        Default ``False``.
-    sky_radial_sigma : float or None, optional
-        Width of the auxiliary sky radial coordinate (see
-        :class:`~nessai_gw.reparameterisations.sky.RotatedAnglePair`).  The
-        default (``0.15``) confines the sky prime points to a thin unit shell
-        so the base flow never has to taper a cone into the ``r = 0``
-        coordinate singularity; ``None`` restores ``AnglePair``'s ``chi(3)``.
-    gaussianise_sky : bool or "auto", optional
-        Only on the prime-space path.  Install :class:`SkyOctantGaussianiser`
-        as the group-mixture ``canonical_transform``: the base flow then sees
-        the canonical sky octant mapped (cylindrical equal-area + probit) to
-        two independent standard normals plus the pass-through radius, instead
-        of the uniform-on-sphere octant with its hard prior edge.  Supersedes
-        ``boundary_reflection`` for the sky (the octant walls move to
-        ``+/-inf``).  Default ``"auto"`` -- on whenever ``prime_space`` is
-        ``True``.  Pass ``False`` to opt out, or an explicit ``True`` with
-        ``prime_space=False`` to get an error rather than a silent no-op.
-    sky_2d : bool or "auto", optional
-        Drop the auxiliary sky radial coordinate and carry the sky as the two
-        equal-area coordinates ``(sky_u, sky_v)`` (see
-        :class:`~nessai_gw.reparameterisations.sky.EqualAreaSky` +
-        :class:`SkyOctantProbit`).  Default ``"auto"`` -- on whenever
-        ``prime_space`` and ``gaussianise_sky`` are both active (the machinery
-        it needs), off otherwise.  Requires the prime-space path.
     psi_single : bool, optional
         Carry ``psi`` as a single ``psi_prime`` coordinate
         (:class:`~nessai_gw.reparameterisations.phase.SingleAngleReparameterisation`)
@@ -3475,7 +3197,7 @@ def make_triangular_group_flow_proposal(
         posterior straddles it, points fold to different ``phase_step``
         images and the ``(psi, phase)`` corner looks like two offset ridges
         rather than one.  Prefer ``adaptive_domain``.  Default ``0.0``.
-    phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "independent"}, optional
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta"}, optional
         ``"polarisation-phase"`` (default): ``delta_phase = phase + sign(cos
         theta_jn) psi`` + a separate ``psi`` coordinate.  ``"arg-alpha-beta"``:
         carry both circular-polarisation phases ``arg_alpha = (phase - psi)``
@@ -3484,14 +3206,7 @@ def make_triangular_group_flow_proposal(
         NLL by ~1 nat over the equivalently-grouped ``delta_phase`` block.  The
         polarisation-quarter Z4 still acts on ``(arg_alpha, arg_beta)`` and is
         kept as a weight-learned group factor -- keep ``polarisation_quarter``
-        as you would otherwise.  ``"independent"``: no mixing at all, ``psi``
-        and ``phase`` each on their own axis -- for a branch whose discrete
-        structure sits entirely on ``phase`` (mixing in ``psi`` only smears it
-        diagonally across two axes instead of confining it to one; see
-        :mod:`nessai_gw._polarisation_branch`).  Requires
-        ``prime_space=False`` -- raises during proposal construction otherwise
-        (:class:`PrimeSpaceTriangularGroupAction` has no fast-path support for
-        a bare, non-group-invariant ``phase``).  Must match the
+        as you would otherwise.  Must match the
         ``phase_coordinates`` passed to
         :func:`triangular_group_reparameterisations`.
     n_clusters_max : int
@@ -3559,8 +3274,7 @@ def make_triangular_group_flow_proposal(
         ``base_reparam``: each expert moves the sky, ``psi`` and
         ``delta_phase`` fold seams off its own posterior mass every round
         (and, with ``phase_recanon``, may fold the quarter turn on the phase).
-        Same requirements as ``phase_recanon``, plus ``sky_2d``.  Default
-        ``False``.
+        Same requirements as ``phase_recanon``.  Default ``False``.
     chirp_distance, chirp_distance_tensors, chirp_distance_k0, chirp_distance_fiducial : optional
         Must match the ``reparameterisations`` built by
         :func:`triangular_group_reparameterisations`: with ``chirp_distance``
@@ -3607,35 +3321,10 @@ def make_triangular_group_flow_proposal(
         flow_model_factory,
     )
 
-    if gaussianise_sky == "auto":
-        gaussianise_sky = bool(prime_space)
-    elif gaussianise_sky and not prime_space:
-        raise RuntimeError(
-            "gaussianise_sky is only supported on the prime-space path "
-            "(prime_space=True)."
-        )
-    if sky_2d == "auto":
-        # 2-D equal-area sky (no auxiliary radial coord) whenever the
-        # prime-space + gaussianise-sky machinery it needs is available.
-        sky_2d = bool(prime_space) and bool(gaussianise_sky)
-    if sky_2d and not prime_space:
-        raise RuntimeError("sky_2d is only supported on the prime-space path.")
-    if sky_2d and not gaussianise_sky:
-        raise RuntimeError(
-            "sky_2d needs gaussianise_sky (the SkyOctantProbit canonical "
-            "transform turns the folded equal-area sub-square into N(0, 1))."
-        )
-    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta", "independent"):
+    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta"):
         raise ValueError(
-            "phase_coordinates must be 'polarisation-phase', 'arg-alpha-beta' "
-            f"or 'independent'; got {phase_coordinates!r}"
-        )
-    if phase_coordinates == "independent" and prime_space:
-        raise RuntimeError(
-            "phase_coordinates='independent' needs prime_space=False -- plain "
-            "phase is not group-invariant the closed-form way delta_phase is, "
-            "so PrimeSpaceTriangularGroupAction has no fast-path support for "
-            "it."
+            "phase_coordinates must be 'polarisation-phase' or "
+            f"'arg-alpha-beta'; got {phase_coordinates!r}"
         )
     names = list(sampling_parameters)
     missing = sorted(
@@ -3647,9 +3336,9 @@ def make_triangular_group_flow_proposal(
             "group action needs; this proposal only applies to a single-site "
             "triangular-detector run with the standard extrinsic parameters."
         )
-    if reference_epoch is not None and not (prime_space and chirp_distance):
+    if reference_epoch is not None and not chirp_distance:
         raise RuntimeError(
-            "reference_epoch needs prime_space and chirp_distance (the epoch "
+            "reference_epoch needs chirp_distance (the epoch "
             "is chosen on the chirp distance)."
         )
 
@@ -3664,202 +3353,146 @@ def make_triangular_group_flow_proposal(
             polarisation_offset=polarisation_offset,
         )
 
-    if prime_space:
-        prime_names = _prime_parameter_names(
-            names, reference_time, vertex=vertex, sky_2d=sky_2d,
-            psi_single=psi_single, phase_coordinates=phase_coordinates,
-            polarisation_ellipse=polarisation_ellipse,
-            polarisation_ellipse_scale=polarisation_ellipse_scale,
-            polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
-            polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
-            chirp_distance=chirp_distance,
-            chirp_distance_tensors=chirp_distance_tensors,
-            chirp_distance_k0=chirp_distance_k0,
-            chirp_distance_fiducial=chirp_distance_fiducial,
-            effective_spin=effective_spin,
-            log_mass_ratio=log_mass_ratio,
-            precessing_spin=precessing_spin,
-            effective_tidal_deformability=effective_tidal_deformability,
-            doppler_vector=doppler_vector,
-            time_reference_frequency=time_reference_frequency,
-            time_to_merger=time_to_merger,
-            chirp_distance_inversion=chirp_distance_inversion,
-            waveform_phase=waveform_phase,
-        )
-        action = PrimeSpaceTriangularGroupAction(
-            base_action, prime_names, ellipse=polarisation_ellipse,
-            ellipse_scale=polarisation_ellipse_scale,
-            ellipse_coordinate=polarisation_ellipse_coordinate,
-        )
-        gm_kwargs = {}
-        import inspect as _inspect
+    prime_names = _prime_parameter_names(
+        names, reference_time, vertex=vertex,
+        psi_single=psi_single, phase_coordinates=phase_coordinates,
+        polarisation_ellipse=polarisation_ellipse,
+        polarisation_ellipse_scale=polarisation_ellipse_scale,
+        polarisation_ellipse_coordinate=polarisation_ellipse_coordinate,
+        polarisation_ellipse_adaptive_width=polarisation_ellipse_adaptive_width,
+        chirp_distance=chirp_distance,
+        chirp_distance_tensors=chirp_distance_tensors,
+        chirp_distance_k0=chirp_distance_k0,
+        chirp_distance_fiducial=chirp_distance_fiducial,
+        effective_spin=effective_spin,
+        log_mass_ratio=log_mass_ratio,
+        precessing_spin=precessing_spin,
+        effective_tidal_deformability=effective_tidal_deformability,
+        doppler_vector=doppler_vector,
+        time_reference_frequency=time_reference_frequency,
+        time_to_merger=time_to_merger,
+        chirp_distance_inversion=chirp_distance_inversion,
+        waveform_phase=waveform_phase,
+    )
+    action = PrimeSpaceTriangularGroupAction(
+        base_action, prime_names, ellipse=polarisation_ellipse,
+        ellipse_scale=polarisation_ellipse_scale,
+        ellipse_coordinate=polarisation_ellipse_coordinate,
+    )
+    gm_kwargs = {}
+    import inspect as _inspect
 
-        _gm_params = _inspect.signature(make_group_mixture_flow).parameters
-        if "mode_factor_sizes" in _gm_params:
-            gm_kwargs["mode_factor_sizes"] = base_action.mode_factor_sizes
-        if gaussianise_sky:
-            if "canonical_transform" not in _gm_params:
-                raise RuntimeError(
-                    "gaussianise_sky requires a version of nessai whose "
-                    "make_group_mixture_flow accepts `canonical_transform`."
-                )
-            if not sky_2d:
-                gm_kwargs["canonical_transform"] = SkyOctantGaussianiser(
-                    prime_names
-                )
-            else:
-                # The sky sub-square is 1/wedge of sky_u wide: 1/8 for a
-                # single interferometer. Runs before the inclination
-                # reflection probit 4 sky_u there (a wall at the mirror line
-                # in the base flow), kept so that they resume unchanged.
-                theta_half = bool(getattr(
-                    base_action, "inclination_reflection", False))
-                wedge = (float(getattr(base_action, "sky_wedge", 0.25))
-                         if theta_half else 0.25)
-                gm_kwargs["canonical_transform"] = SkyOctantProbit(
-                    prime_names, u_scale=1.0 / wedge, theta_half=theta_half)
-            if boundary_reflection:
-                logger.warning(
-                    "gaussianise_sky pushes the octant walls to +/-inf; "
-                    "ignoring boundary_reflection for the sky coordinates."
-                )
-                boundary_reflection = False
-        if boundary_reflection:
-            if "reflect_parameters" not in _gm_params:
-                raise RuntimeError(
-                    "boundary_reflection requires a version of nessai whose "
-                    "make_group_mixture_flow accepts `reflect_parameters`."
-                )
-            gm_kwargs["reflect_parameters"] = [
-                p
-                for p in ("ra_dec_x", "ra_dec_y", "ra_dec_z")
-                if p in prime_names
-            ]
-        if phase_recanon or adaptive_domain:
-            bad = []
-            if adaptive_domain and not sky_2d:
-                bad.append("sky_2d=False")
-            if not psi_single:
-                bad.append("psi_single=False")
-            if not polarisation_quarter:
-                bad.append("polarisation_quarter=False")
-            if phase_coordinates != "polarisation-phase":
-                bad.append(f"phase_coordinates={phase_coordinates!r}")
-            if polarisation_ellipse is not None:
-                bad.append("polarisation_ellipse")
-            if boundary_reflection:
-                bad.append("boundary_reflection")
-            if bad:
-                raise RuntimeError(
-                    "phase_recanon/adaptive_domain is incompatible with "
-                    f"{', '.join(bad)}."
-                )
-            if "base_reparam_factory" not in _gm_params:
-                raise RuntimeError(
-                    "phase_recanon/adaptive_domain requires a version of "
-                    "nessai whose make_group_mixture_flow accepts "
-                    "`base_reparam_factory`."
-                )
-            import functools as _functools
-
-            if adaptive_domain:
-                gm_kwargs["base_reparam_factory"] = _functools.partial(
-                    AdaptiveFundamentalDomain, action, list(prime_names),
-                    allow_phase_mode=bool(phase_recanon),
-                    circular_psi_phase=bool(circular_psi_phase),
-                )
-            else:
-                gm_kwargs["base_reparam_factory"] = _functools.partial(
-                    PhaseQuarterRecanonicaliser, list(prime_names)
-                )
-        if circular_psi_phase:
-            bad = []
-            if not psi_single:
-                bad.append("psi_single=False")
-            if not polarisation_quarter:
-                bad.append("polarisation_quarter=False")
-            if not phase_reflection:
-                bad.append("phase_reflection=False")
-            if phase_coordinates != "polarisation-phase":
-                bad.append(f"phase_coordinates={phase_coordinates!r}")
-            if polarisation_offset:
-                bad.append("polarisation_offset != 0")
-            if phase_recanon and not adaptive_domain:
-                bad.append("phase_recanon without adaptive_domain")
-            if bad:
-                raise RuntimeError(
-                    f"circular_psi_phase is incompatible with {', '.join(bad)}."
-                )
-            if "circular_parameters" not in _gm_params:
-                raise RuntimeError(
-                    "circular_psi_phase requires a version of nessai whose "
-                    "make_group_mixture_flow accepts `circular_parameters`."
-                )
-            circles = {
-                "psi_prime": POLARISATION_PHASE_CIRCLE,
-                action._delta_phase: POLARISATION_PHASE_CIRCLE,
-            }
-            gm_kwargs["canonical_transform"] = CircularCanonicalTransform(
-                circles, prime_names,
-                inner=gm_kwargs.get("canonical_transform"),
-            )
-            gm_kwargs["circular_parameters"] = list(circles)
-            if circular_standardisation:
-                if "circular_standardisation" not in _gm_params:
-                    raise RuntimeError(
-                        "circular_standardisation requires a version of "
-                        "nessai whose make_group_mixture_flow accepts it."
-                    )
-                gm_kwargs["circular_standardisation"] = True
-        elif circular_standardisation:
+    _gm_params = _inspect.signature(make_group_mixture_flow).parameters
+    if "mode_factor_sizes" in _gm_params:
+        gm_kwargs["mode_factor_sizes"] = base_action.mode_factor_sizes
+    if "canonical_transform" not in _gm_params:
+        raise RuntimeError(
+            "the group proposal requires a version of nessai whose "
+            "make_group_mixture_flow accepts `canonical_transform`."
+        )
+    # The sky sub-square is 1/wedge of sky_u wide: 1/8 for a
+    # single interferometer. Runs before the inclination
+    # reflection probit 4 sky_u there (a wall at the mirror line
+    # in the base flow), kept so that they resume unchanged.
+    theta_half = bool(getattr(
+        base_action, "inclination_reflection", False))
+    wedge = (float(getattr(base_action, "sky_wedge", 0.25))
+             if theta_half else 0.25)
+    gm_kwargs["canonical_transform"] = SkyOctantProbit(
+        prime_names, u_scale=1.0 / wedge, theta_half=theta_half)
+    if phase_recanon or adaptive_domain:
+        bad = []
+        if not psi_single:
+            bad.append("psi_single=False")
+        if not polarisation_quarter:
+            bad.append("polarisation_quarter=False")
+        if phase_coordinates != "polarisation-phase":
+            bad.append(f"phase_coordinates={phase_coordinates!r}")
+        if polarisation_ellipse is not None:
+            bad.append("polarisation_ellipse")
+        if bad:
             raise RuntimeError(
-                "circular_standardisation needs circular_psi_phase."
+                "phase_recanon/adaptive_domain is incompatible with "
+                f"{', '.join(bad)}."
             )
-        flow_model_cls = _make_flow_model(
-            group_action_fn=action,  # ignored on the prime-space path
-            group_size=base_action.group_size,
-            param_names=prime_names,
-            prime_space_action=action,
-            prime_space_in_domain=action.in_fundamental_domain,
-            min_canon_std=_MIN_CANON_STD,
-            **gm_kwargs,
-        )
-    else:
-        if phase_recanon or adaptive_domain or circular_psi_phase:
+        if "base_reparam_factory" not in _gm_params:
             raise RuntimeError(
-                "phase_recanon/adaptive_domain/circular_psi_phase needs the "
-                "prime-space path."
+                "phase_recanon/adaptive_domain requires a version of "
+                "nessai whose make_group_mixture_flow accepts "
+                "`base_reparam_factory`."
             )
-        action = None
-        import inspect as _inspect
+        import functools as _functools
 
-        _extra = {}
-        if (
-            "mode_factor_sizes"
-            in _inspect.signature(make_group_mixture_flow).parameters
-        ):
-            _extra["mode_factor_sizes"] = base_action.mode_factor_sizes
-        flow_model_cls = _make_flow_model(
-            group_action_fn=base_action,
-            group_size=base_action.group_size,
-            # phi_jl is shifted by the reflection when sampled
-            param_names=base_action.parameters + (
-                ["phi_jl"] if "phi_jl" in names else []
-            ),
-            in_fundamental_domain=base_action.in_fundamental_domain,
-            min_canon_std=_MIN_CANON_STD,
-            **_extra,
+        if adaptive_domain:
+            gm_kwargs["base_reparam_factory"] = _functools.partial(
+                AdaptiveFundamentalDomain, action, list(prime_names),
+                allow_phase_mode=bool(phase_recanon),
+                circular_psi_phase=bool(circular_psi_phase),
+            )
+        else:
+            gm_kwargs["base_reparam_factory"] = _functools.partial(
+                PhaseQuarterRecanonicaliser, list(prime_names)
+            )
+    if circular_psi_phase:
+        bad = []
+        if not psi_single:
+            bad.append("psi_single=False")
+        if not polarisation_quarter:
+            bad.append("polarisation_quarter=False")
+        if not phase_reflection:
+            bad.append("phase_reflection=False")
+        if phase_coordinates != "polarisation-phase":
+            bad.append(f"phase_coordinates={phase_coordinates!r}")
+        if polarisation_offset:
+            bad.append("polarisation_offset != 0")
+        if phase_recanon and not adaptive_domain:
+            bad.append("phase_recanon without adaptive_domain")
+        if bad:
+            raise RuntimeError(
+                f"circular_psi_phase is incompatible with {', '.join(bad)}."
+            )
+        if "circular_parameters" not in _gm_params:
+            raise RuntimeError(
+                "circular_psi_phase requires a version of nessai whose "
+                "make_group_mixture_flow accepts `circular_parameters`."
+            )
+        circles = {
+            "psi_prime": POLARISATION_PHASE_CIRCLE,
+            action._delta_phase: POLARISATION_PHASE_CIRCLE,
+        }
+        gm_kwargs["canonical_transform"] = CircularCanonicalTransform(
+            circles, prime_names,
+            inner=gm_kwargs.get("canonical_transform"),
         )
+        gm_kwargs["circular_parameters"] = list(circles)
+        if circular_standardisation:
+            if "circular_standardisation" not in _gm_params:
+                raise RuntimeError(
+                    "circular_standardisation requires a version of "
+                    "nessai whose make_group_mixture_flow accepts it."
+                )
+            gm_kwargs["circular_standardisation"] = True
+    elif circular_standardisation:
+        raise RuntimeError(
+            "circular_standardisation needs circular_psi_phase."
+        )
+    flow_model_cls = _make_flow_model(
+        group_action_fn=action,  # ignored on the prime-space path
+        group_size=base_action.group_size,
+        param_names=prime_names,
+        prime_space_action=action,
+        prime_space_in_domain=action.in_fundamental_domain,
+        min_canon_std=_MIN_CANON_STD,
+        **gm_kwargs,
+    )
 
     return _make_group_proposal_class(
         "TriangularGroupFlowProposal",
         flow_model_cls,
         action,
         sky_rotation=base_action.sky_frame_rotation,
-        sky_2d=sky_2d,
         psi_single=psi_single,
         phase_coordinates=phase_coordinates,
-        sky_radial_sigma=sky_radial_sigma,
         reference_epoch=reference_epoch,
     )
 
@@ -3941,39 +3574,13 @@ class ETTriangleGroupAction(TriangularDetectorGroupAction):
         )
 
 
-def make_et_triangle_group_mixture_flow(
-    reference_time,
-    plane_normal=None,
-    vertex=None,
-    parameters=None,
-    phase_reflection=False,
-    azimuth_offset=0.0,
-):
-    """:func:`make_triangular_group_mixture_flow` with the ET-EMR geometry."""
-    return make_triangular_group_mixture_flow(
-        reference_time,
-        plane_normal=(
-            ET_EMR_PLANE_NORMAL if plane_normal is None else plane_normal
-        ),
-        vertex=ET_EMR_VERTEX if vertex is None else vertex,
-        parameters=parameters,
-        phase_reflection=phase_reflection,
-        azimuth_offset=azimuth_offset,
-    )
-
-
 def make_et_group_flow_proposal(
     sampling_parameters,
     reference_time,
     plane_normal=None,
     vertex=None,
-    prime_space=True,
     phase_reflection=False,
     azimuth_offset=0.0,
-    boundary_reflection=False,
-    sky_radial_sigma=0.15,
-    gaussianise_sky="auto",
-    sky_2d="auto",
     psi_single=True,
     polarisation_quarter=True,
     polarisation_offset=0.0,
@@ -4011,13 +3618,8 @@ def make_et_group_flow_proposal(
             ET_EMR_PLANE_NORMAL if plane_normal is None else plane_normal
         ),
         vertex=ET_EMR_VERTEX if vertex is None else vertex,
-        prime_space=prime_space,
         phase_reflection=phase_reflection,
         azimuth_offset=azimuth_offset,
-        boundary_reflection=boundary_reflection,
-        gaussianise_sky=gaussianise_sky,
-        sky_radial_sigma=sky_radial_sigma,
-        sky_2d=sky_2d,
         psi_single=psi_single,
         polarisation_quarter=polarisation_quarter,
         polarisation_offset=polarisation_offset,

@@ -127,7 +127,7 @@ def test_response_invariant_and_inverse(alpha, tau):
 @pytest.fixture(scope="module")
 def names():
     return _prime_parameter_names(
-        BNS_PARAMETERS, REFERENCE_TIME, sky_2d=True, psi_single=True
+        BNS_PARAMETERS, REFERENCE_TIME, psi_single=True
     )
 
 
