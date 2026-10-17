@@ -707,3 +707,22 @@ def test_precessing_response_invariance(shift_phi_jl):
         assert worst_reflected < 0.02
     else:
         assert worst_reflected > 0.2
+
+
+def test_curvature_shear_kwargs():
+    import inspect
+
+    from nessai.flowmodel.group_mixture import make_group_mixture_flow
+
+    from nessai_gw.group_mixture import curvature_shear_kwargs
+
+    params = inspect.signature(make_group_mixture_flow).parameters
+    names = ["chirp_mass_prime", "mass_ratio_prime"]
+    assert curvature_shear_kwargs(False, names, params) == {}
+    assert curvature_shear_kwargs(True, names, params) == {
+        "curvature_shear": "mass_ratio_prime"
+    }
+    with pytest.raises(ValueError, match="mass_ratio"):
+        curvature_shear_kwargs(True, ["chirp_mass_prime"], params)
+    with pytest.raises(RuntimeError, match="curvature_shear"):
+        curvature_shear_kwargs(True, names, {})

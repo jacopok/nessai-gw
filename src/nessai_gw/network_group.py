@@ -82,6 +82,7 @@ from .group_mixture import (
     _seam_note,
     _select_flow_model_factory,
     _wrap_angle,
+    curvature_shear_kwargs,
     detector_tensors,
     triangular_group_reparameterisations,
 )
@@ -865,6 +866,7 @@ def make_network_group_flow_proposal(
     circular_psi_phase=False,
     circular_sky_u=False,
     circular_standardisation=False,
+    mass_ratio_shear=False,
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
@@ -950,6 +952,11 @@ def make_network_group_flow_proposal(
         measured angle (``delta_phase``, ``sky_u`` late in a run) reaches the
         uniform latent as an O(1) shape rather than a spike.  Needs circular
         angles.  Default ``False``.
+    mass_ratio_shear : bool, optional
+        Shear the other non-circular standardised coordinates by an even
+        polynomial in ``mass_ratio_prime`` about the ``q = 1`` edge (see
+        :func:`~nessai_gw.group_mixture.curvature_shear_kwargs`).  Default
+        ``False``.
     time_reference_frequency : optional
         Must match :func:`network_group_reparameterisations` (the prime names
         do not depend on it; the probe checks the order of the inverse pass
@@ -1088,6 +1095,9 @@ def make_network_group_flow_proposal(
             allow_phase_mode=bool(phase_recanon),
         )
 
+    gm_kwargs.update(
+        curvature_shear_kwargs(mass_ratio_shear, prime_names, gm_params)
+    )
     flow_model_cls = make_flow(
         group_action_fn=physical,  # ignored on the prime-space path
         group_size=action.group_size,

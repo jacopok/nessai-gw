@@ -3086,6 +3086,33 @@ def _make_group_proposal_class(
     return _GroupFlowProposal
 
 
+def curvature_shear_kwargs(mass_ratio_shear, prime_names, gm_params):
+    """``make_group_mixture_flow`` keywords of ``mass_ratio_shear``.
+
+    The live points of a binary near equal masses lie on a ridge that bends
+    with its vertex at ``q = 1``: the phase depends on ``q`` through
+    ``eta``, quadratic in ``1 - q``, so the chirp mass, the effective spin,
+    the arrival time and the tides trade off against ``(ln q)**2``.  Mirrored
+    about ``q = 1`` (the ``log-mass-ratio`` boundary inversion, at
+    ``mass_ratio_prime = 0``), the ridge is a U.  nessai's ``curvature_shear``
+    subtracts from every other non-circular standardised coordinate the even
+    polynomial in ``mass_ratio_prime`` fitted to the live points, which turns
+    the U into a straight band, with unit Jacobian.
+    """
+    if not mass_ratio_shear:
+        return {}
+    if "curvature_shear" not in gm_params:
+        raise RuntimeError(
+            "mass_ratio_shear requires a version of nessai whose "
+            "make_group_mixture_flow accepts `curvature_shear`."
+        )
+    if "mass_ratio_prime" not in prime_names:
+        raise ValueError(
+            "mass_ratio_shear needs 'mass_ratio' in the sampling parameters."
+        )
+    return {"curvature_shear": "mass_ratio_prime"}
+
+
 def make_triangular_group_flow_proposal(
     sampling_parameters,
     reference_time,
@@ -3116,6 +3143,7 @@ def make_triangular_group_flow_proposal(
     doppler_vector=None,
     circular_psi_phase=False,
     circular_standardisation=False,
+    mass_ratio_shear=False,
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
@@ -3269,6 +3297,11 @@ def make_triangular_group_flow_proposal(
         ``circular_standardisation``), so a tightly measured angle reaches the
         uniform latent as an O(1) shape rather than a spike.  Needs
         ``circular_psi_phase``.  Default ``False``.
+    mass_ratio_shear : bool, optional
+        Shear the other non-circular standardised coordinates by an even
+        polynomial in ``mass_ratio_prime`` about the ``q = 1`` edge, fitted
+        to the live points (nessai's ``curvature_shear``, see
+        :func:`curvature_shear_kwargs`).  Default ``False``.
     adaptive_domain : bool, optional
         Give every group-mixture expert an :class:`AdaptiveFundamentalDomain`
         ``base_reparam``: each expert moves the sky, ``psi`` and
@@ -3476,6 +3509,9 @@ def make_triangular_group_flow_proposal(
         raise RuntimeError(
             "circular_standardisation needs circular_psi_phase."
         )
+    gm_kwargs.update(
+        curvature_shear_kwargs(mass_ratio_shear, prime_names, _gm_params)
+    )
     flow_model_cls = _make_flow_model(
         group_action_fn=action,  # ignored on the prime-space path
         group_size=base_action.group_size,
@@ -3604,6 +3640,7 @@ def make_et_group_flow_proposal(
     doppler_vector=None,
     circular_psi_phase=False,
     circular_standardisation=False,
+    mass_ratio_shear=False,
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
@@ -3643,6 +3680,7 @@ def make_et_group_flow_proposal(
         adaptive_domain=adaptive_domain,
         circular_psi_phase=circular_psi_phase,
         circular_standardisation=circular_standardisation,
+        mass_ratio_shear=mass_ratio_shear,
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,
