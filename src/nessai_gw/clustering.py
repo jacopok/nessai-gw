@@ -66,6 +66,7 @@ __all__ = [
     "fit_live_diagonal_split",
     "gaussian_split_gain",
     "rank_gaussianise",
+    "gaussian_frame",
     "make_diagonal_split_cluster_flow",
 ]
 
@@ -100,6 +101,32 @@ def rank_gaussianise(x):
     x = np.asarray(x, dtype=float)
     ranks = np.argsort(np.argsort(x, axis=0, kind="stable"), axis=0) + 1
     return ndtri(ranks / (x.shape[0] + 1.0))
+
+
+def gaussian_frame(t, param_names, circular_idx=None, rank_params=()):
+    """The base-flow frame ``t`` the split gain is measured in: without the
+    circular columns (zeroed by the routing frame) and any other constant
+    column, with the ``rank_params`` columns rank-Gaussianised
+    (:func:`rank_gaussianise`)."""
+    t = np.asarray(t, dtype=float)
+    keep = np.ones(t.shape[1], dtype=bool)
+    if circular_idx is not None:
+        idx = circular_idx
+        if hasattr(idx, "cpu"):
+            idx = idx.cpu().numpy()
+        idx = np.asarray(idx, dtype=int).ravel()
+        if idx.size:
+            keep[idx] = False
+    keep &= t.std(axis=0) > 0
+    rank = [
+        i
+        for i, name in enumerate(param_names)
+        if name in rank_params and keep[i]
+    ]
+    if rank:
+        t = t.copy()
+        t[:, rank] = rank_gaussianise(t[:, rank])
+    return t[:, keep]
 
 
 def gaussian_split_gain(t, labels, min_count=2):
@@ -406,23 +433,10 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         impossible.  Any other zero-variance column is dropped too.  The
         :attr:`rank_gaussian_params` columns are rank-Gaussianised.
         """
-        t = np.asarray(t, dtype=float)
-        keep = np.ones(t.shape[1], dtype=bool)
         experts = getattr(self, "experts", None)
         idx = getattr(experts[0], "_circular_idx", None) if experts else None
-        if idx is not None and idx.numel():
-            keep[idx.cpu().numpy()] = False
-        keep &= t.std(axis=0) > 0
         names = list(experts[0].param_names) if experts else []
-        rank = [
-            i
-            for i, name in enumerate(names)
-            if name in self.rank_gaussian_params and keep[i]
-        ]
-        if rank:
-            t = t.copy()
-            t[:, rank] = rank_gaussianise(t[:, rank])
-        return t[:, keep]
+        return gaussian_frame(t, names, idx, self.rank_gaussian_params)
 
     def _split_labels(self, c, v):
         """1 on the (higher-``sky_v``) clump side of the stored line, else 0."""
