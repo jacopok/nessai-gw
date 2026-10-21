@@ -7,10 +7,11 @@ The multimodalities the partition is meant for come from known places:
   whose azimuth is ``sky_u`` in the baseline frame -- one periodic
   coordinate, cut at its empty gaps (:class:`nessai.partition.GapSplitter`);
 * the ET triangle: the plateau and clump branches in the canonical
-  ``(cos theta_jn, sky_v)`` plane, cut by the straight line the diagonal
-  split fits (:class:`LineSplitter`, the trigger and the line of
-  :class:`nessai_gw.clustering.DiagonalSplitClusterWrapper`, frozen once it
-  fires).
+  ``(cos theta_jn, sky_v)`` plane, cut by the straight line of the diagonal
+  split (:class:`nessai_gw.clustering.DiagonalSplitClusterWrapper`), frozen
+  once it fires: :class:`DiagonalSplitTrigger` takes the line and the moment
+  from the proposal's own diagonal split, :class:`LineSplitter` refits them
+  from the live points.
 
 :class:`SkyCoordinates` computes them from the physical parameters with the
 proposal's sky frame (:class:`nessai_gw.reparameterisations.sky.EqualAreaSky`)
@@ -33,7 +34,12 @@ from .clustering import (
 
 logger = logging.getLogger("nessai.nessai_gw.partition")
 
-__all__ = ["SkyCoordinates", "LineSplitter", "base_frame"]
+__all__ = [
+    "SkyCoordinates",
+    "LineSplitter",
+    "DiagonalSplitTrigger",
+    "base_frame",
+]
 
 _COORDINATES = ("sky_u", "sky_v", "cos_theta_jn")
 
@@ -266,4 +272,90 @@ class LineSplitter:
             angle=float(fit["angle"]),
             gain_on=self.gain_on,
         )
+        return cut
+
+
+class DiagonalSplitTrigger:
+    """The proposal's own diagonal split as a partition: the cut is the line
+    of its :class:`~nessai_gw.clustering.DiagonalSplitClusterWrapper`, used
+    once the split is active and its two experts have trained -- the same
+    activation (gain, side fractions, patience) and line as a run without
+    the partition, so the regions are the experts' two sides. The coordinates
+    are :class:`SkyCoordinates` ``(cos theta_jn, sky_v)`` with
+    ``fold="plane"``, the canonical plane the line lives in; the cut is only
+    used if it labels at least ``min_agreement`` of the points as the
+    mixture routes them. Paired with ``max_regions=2``: the split is made
+    once, and each region's copy of the proposal keeps the expert of its
+    side (:meth:`nessai.flowmodel.group_mixture.GroupFlowProposalMixin.restrict_to_region`)
+    and its own diagonal split, which may split that flow again.
+
+    Parameters
+    ----------
+    min_agreement : float
+        Minimum fraction of the points the cut and the mixture's routing
+        put on the same side.
+    """
+
+    def __init__(self, min_agreement=0.99):
+        self.min_agreement = float(min_agreement)
+
+    @staticmethod
+    def _wrapper(proposal):
+        from .clustering import DiagonalSplitClusterWrapper
+
+        model = getattr(getattr(proposal, "flow", None), "model", None)
+        if not isinstance(model, DiagonalSplitClusterWrapper):
+            return None
+        return model
+
+    def propose(
+        self,
+        coords,
+        periods,
+        points=None,
+        proposal=None,
+        max_labels=None,
+        force=False,
+    ):
+        import torch
+
+        coords = np.asarray(coords, dtype=float)
+        if coords.shape[1] != 2:
+            raise ValueError("DiagonalSplitTrigger needs two split coordinates")
+        if max_labels is not None and max_labels < 2:
+            return None
+        w = self._wrapper(proposal)
+        if w is None:
+            raise RuntimeError(
+                "DiagonalSplitTrigger needs a proposal with the diagonal split"
+            )
+        if not (
+            bool(w._clustering_seen)
+            and int(w._n_active.item()) >= 2
+            and bool(w._split_fitted)
+            and not bool(w._pending_split_train.item())
+        ):
+            return None
+        cut = LinearCut(
+            w._split_normal.cpu().numpy().copy(), float(w._split_offset)
+        )
+        labels = cut.classify(coords)
+        # the training tensor's leading rows are the points (any augmented
+        # copies follow), as in base_frame
+        x = proposal._training_data_as_prime_tensor(points)[: len(points)]
+        with torch.no_grad():
+            routed = w._route(x).cpu().numpy()
+        agreement = float(np.mean(labels == routed))
+        cut.info = dict(
+            gain=float(w._split_gain),
+            fraction=float(labels.mean()),
+            agreement=agreement,
+        )
+        if agreement < self.min_agreement:
+            logger.warning(
+                f"DiagonalSplitTrigger: the line {cut.describe()} agrees "
+                f"with the mixture's routing at {agreement:.4f} of the live "
+                f"points (< {self.min_agreement}): not splitting"
+            )
+            return None
         return cut

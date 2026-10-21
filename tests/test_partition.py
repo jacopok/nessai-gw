@@ -109,3 +109,95 @@ def test_line_splitter_heteroscedastic():
     blob = rng.normal(size=(2 * n, 2))
     assert splitter.propose(blob, [None, None]) is None
     assert splitter.propose(blob, [None, None], force=True) is not None
+
+
+class _TriggerWrapper:
+    """The state DiagonalSplitTrigger reads off a DiagonalSplitClusterWrapper;
+    routes by its line on (x0, x1) unless ``routed`` is set."""
+
+    def __init__(self, active, pending=False, routed=None):
+        import torch
+
+        self._clustering_seen = torch.tensor(True)
+        self._n_active = torch.tensor(2 if active else 1)
+        self._split_fitted = torch.tensor(True)
+        self._pending_split_train = torch.tensor(pending)
+        self._split_normal = torch.tensor([1.0, 2.0], dtype=torch.float64)
+        self._split_offset = torch.tensor(0.5, dtype=torch.float64)
+        self._split_gain = torch.tensor(1.3)
+        self.routed = routed
+
+    def _route(self, x):
+        import torch
+
+        if self.routed is not None:
+            return torch.as_tensor(self.routed)
+        return (x @ self._split_normal > self._split_offset).long()
+
+
+class _TriggerProposal:
+    def __init__(self, wrapper):
+        self.flow = type("F", (), {"model": wrapper})()
+
+    def _training_data_as_prime_tensor(self, points):
+        import torch
+
+        return torch.as_tensor(
+            np.column_stack([points["x0"], points["x1"]]), dtype=torch.float64
+        )
+
+
+def _trigger(monkeypatch):
+    import nessai_gw.clustering as clustering
+
+    from nessai_gw.partition import DiagonalSplitTrigger
+
+    # the stand-in passes for the wrapper class
+    monkeypatch.setattr(
+        clustering, "DiagonalSplitClusterWrapper", _TriggerWrapper
+    )
+    return DiagonalSplitTrigger()
+
+
+def _plane_points(n=1000):
+    rng = np.random.default_rng(5)
+    p = empty_structured_array(n, names=["x0", "x1"])
+    p["x0"] = rng.uniform(-1, 1, n)
+    p["x1"] = rng.uniform(0, 0.5, n)
+    return p, np.column_stack([p["x0"], p["x1"]])
+
+
+def test_diagonal_split_trigger_takes_the_active_line(monkeypatch):
+    trigger = _trigger(monkeypatch)
+    points, coords = _plane_points()
+    for state in (dict(active=False), dict(active=True, pending=True)):
+        proposal = _TriggerProposal(_TriggerWrapper(**state))
+        assert trigger.propose(coords, [None, None], points, proposal) is None
+    proposal = _TriggerProposal(_TriggerWrapper(active=True))
+    cut = trigger.propose(coords, [None, None], points, proposal)
+    np.testing.assert_array_equal(cut.normal, [1.0, 2.0])
+    assert cut.offset == 0.5
+    assert cut.info["agreement"] == 1.0
+    assert cut.info["gain"] == pytest.approx(1.3)
+    np.testing.assert_array_equal(
+        cut.classify(coords), coords @ [1.0, 2.0] > 0.5
+    )
+    assert (
+        trigger.propose(coords, [None, None], points, proposal, max_labels=1)
+        is None
+    )
+
+
+def test_diagonal_split_trigger_refuses_a_line_off_the_routing(monkeypatch):
+    trigger = _trigger(monkeypatch)
+    points, coords = _plane_points()
+    routed = (coords[:, 0] > 0).astype(int)  # not the line
+    proposal = _TriggerProposal(_TriggerWrapper(active=True, routed=routed))
+    assert trigger.propose(coords, [None, None], points, proposal) is None
+
+
+def test_diagonal_split_trigger_needs_the_diagonal_split(monkeypatch):
+    trigger = _trigger(monkeypatch)
+    points, coords = _plane_points()
+    with pytest.raises(RuntimeError):
+        trigger.propose(coords, [None, None], points, _TriggerProposal(None))
