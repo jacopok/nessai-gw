@@ -73,6 +73,7 @@ from ._geometry import greenwich_mean_sidereal_time
 from .group_mixture import (
     _DELTA_PHASE_SCALE,
     _MIN_CANON_STD,
+    AMPLITUDE_ARGUMENT_CIRCLE,
     POLARISATION_PHASE_CIRCLE,
     AdaptiveFundamentalDomain,
     CircularCanonicalTransform,
@@ -85,6 +86,11 @@ from .group_mixture import (
     curvature_shear_kwargs,
     detector_tensors,
     triangular_group_reparameterisations,
+)
+
+from .reparameterisations.network_amplitudes import (
+    NETWORK_AMPLITUDE_ANGLES,
+    NETWORK_AMPLITUDE_PRIME_PARAMETERS,
 )
 
 logger = nessai_logger.getChild(__name__)
@@ -246,6 +252,25 @@ class DetectorNetworkGeometry:
         elif isinstance(snrs, dict):
             snrs = [float(snrs[n]) for n in names]
         return cls(vertices, snrs, reference_time, names=names, **kwargs)
+
+    def site_tensors(self):
+        """``(2, 3, 3)`` tensors of the two loudest sites' detectors, for the
+        ``network-amplitudes`` reparameterisation.  Each site must be a single
+        interferometer: a co-located triangle measures two amplitudes."""
+        if self.tensors is None or len(self.sites) < 2:
+            raise ValueError(
+                "network amplitudes need two sites and the detector tensors."
+            )
+        out = []
+        for site in self.sites[:2]:
+            if len(site["members"]) != 1:
+                raise ValueError(
+                    "network amplitudes need one interferometer per site; "
+                    f"site {'+'.join(site['members'])} has "
+                    f"{len(site['members'])}."
+                )
+            out.append(self.tensors[self.names.index(site["members"][0])])
+        return np.stack(out)
 
     def _group_sites(self, tol):
         sites = []
@@ -495,6 +520,35 @@ class PrimeSpacePolarisationPhaseAction:
         if self.baseline_flip:
             ok = ok & (_wrap(point_dict["sky_u"] - self.sky_u_offset, 1.0) < 0.5)
         return ok
+
+
+class TrivialPrimeSpaceAction:
+    """The one-element group, for the ``network-amplitudes`` coordinates.
+
+    The two sites' complex amplitudes are invariant under the
+    polarisation/phase quarter turn (the reparameterisation is the quotient
+    by it), so nothing is left to fold; the group mixture then reduces to its
+    base flow with the same machinery (standardisation, circular angles).
+    """
+
+    group_size = 1
+    mode_factor_sizes = [1]
+    sky_u_period = 1.0
+
+    def bind(self, prime_names):
+        pass
+
+    def __call__(self, point_dict, modes, inverse=False):
+        return dict(point_dict)
+
+    def in_fundamental_domain(self, point_dict):
+        any_value = next(iter(point_dict.values()))
+        return torch.ones_like(any_value, dtype=torch.bool)
+
+
+def _identity_group_action(point_dict, modes, inverse=False):
+    """Physical ``group_action_fn`` of :class:`TrivialPrimeSpaceAction`."""
+    return dict(point_dict)
 
 
 class AdaptiveNetworkDomain(AdaptiveFundamentalDomain):
@@ -757,6 +811,7 @@ def network_group_reparameterisations(
     time_to_merger=None,
     chirp_distance_inversion=False,
     waveform_phase=None,
+    network_amplitudes=False,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -824,7 +879,24 @@ def network_group_reparameterisations(
         The waveform's 22-mode phase, ``"module:function"``, as in
         :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
         Default ``None`` (merger phase).
+    network_amplitudes : bool, optional
+        Carry ``(luminosity_distance, theta_jn, psi, phase)`` as the two
+        sites' complex amplitudes (``network-amplitudes``; see
+        :class:`~nessai_gw.reparameterisations.NetworkAmplitudesReparameterisation`),
+        which replaces ``chirp_distance`` and ``delta_phase``.  Needs two
+        sites with one interferometer each.  Must match
+        :func:`make_network_group_flow_proposal`.  Default ``False``.
     """
+    if network_amplitudes:
+        return _network_amplitude_reparameterisations(
+            sampling_parameters, geometry,
+            effective_spin=effective_spin, log_mass_ratio=log_mass_ratio,
+            precessing_spin=precessing_spin,
+            effective_tidal_deformability=effective_tidal_deformability,
+            doppler_vector=doppler_vector,
+            time_reference_frequency=time_reference_frequency,
+            time_to_merger=time_to_merger, waveform_phase=waveform_phase,
+        )
     return triangular_group_reparameterisations(
         sampling_parameters,
         geometry.reference_time,
@@ -843,6 +915,20 @@ def network_group_reparameterisations(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
         ),
+    )
+
+
+def _network_amplitude_reparameterisations(sampling_parameters, geometry,
+                                           **kwargs):
+    """The network profile with ``network-amplitudes`` (the two loudest
+    sites') in place of the distance, ``delta_phase`` and ``theta_jn``."""
+    return triangular_group_reparameterisations(
+        sampling_parameters,
+        geometry.reference_time,
+        vertex=geometry.timing_vertex,
+        amplitudes=True,
+        amplitude_tensors=geometry.site_tensors(),
+        **kwargs,
     )
 
 
@@ -872,6 +958,7 @@ def make_network_group_flow_proposal(
     chirp_distance_inversion=False,
     waveform_phase=None,
     phase_recanon=False,
+    network_amplitudes=False,
 ):
     """``FlowProposal`` subclass for any detector network.
 
@@ -967,7 +1054,44 @@ def make_network_group_flow_proposal(
         on a clump, ``phase mod pi/2`` where the phase is pinned instead).
         Needs ``circular_psi_phase`` and ``adaptive_domain``.  Default
         ``False``.
+    network_amplitudes : bool, optional
+        The flow sees the two sites' complex amplitudes
+        ``(ln_amp_k, arg_amp_k)`` instead of ``chirp_distance``,
+        ``theta_jn_prime``, ``psi_prime`` and ``delta_phase``; must match
+        :func:`network_group_reparameterisations`.  The amplitudes are
+        invariant under the polarisation/phase quarter turn, so the group
+        is trivial (:class:`TrivialPrimeSpaceAction`) and the ``arg_amp_k``
+        are angles of a circular base flow.  Excludes ``baseline_flip``,
+        ``circular_psi_phase``, ``phase_recanon`` and the ``psi`` /
+        ``delta_phase`` offsets; ``circular_sky_u`` and
+        ``circular_standardisation`` work as usual.  Default ``False``.
     """
+    if network_amplitudes:
+        return _make_network_amplitude_flow_proposal(
+            sampling_parameters, geometry,
+            gaussianise_sky=gaussianise_sky,
+            adaptive_domain=adaptive_domain,
+            n_clusters_max=n_clusters_max,
+            flow_model_factory=flow_model_factory,
+            effective_spin=effective_spin,
+            log_mass_ratio=log_mass_ratio,
+            precessing_spin=precessing_spin,
+            effective_tidal_deformability=effective_tidal_deformability,
+            doppler_vector=doppler_vector,
+            circular_sky_u=circular_sky_u,
+            circular_standardisation=circular_standardisation,
+            mass_ratio_shear=mass_ratio_shear,
+            time_reference_frequency=time_reference_frequency,
+            time_to_merger=time_to_merger,
+            waveform_phase=waveform_phase,
+            unsupported=dict(
+                baseline_flip=baseline_flip,
+                circular_psi_phase=circular_psi_phase,
+                phase_recanon=phase_recanon,
+                psi_offset=psi_offset, delta_offset=delta_offset,
+                sky_u_offset=sky_u_offset,
+            ),
+        )
     if phase_recanon and not (circular_psi_phase and adaptive_domain):
         raise ValueError(
             "phase_recanon needs circular_psi_phase and adaptive_domain."
@@ -1110,6 +1234,105 @@ def make_network_group_flow_proposal(
     logger.info("Network group proposal for %r", geometry)
     return _make_group_proposal_class(
         "NetworkGroupFlowProposal",
+        flow_model_cls,
+        action,
+        sky_rotation=geometry.sky_frame_rotation,
+        psi_single=True,
+        phase_coordinates="polarisation-phase",
+    )
+
+
+def _make_network_amplitude_flow_proposal(
+    sampling_parameters,
+    geometry,
+    gaussianise_sky,
+    adaptive_domain,
+    n_clusters_max,
+    flow_model_factory,
+    effective_spin,
+    log_mass_ratio,
+    precessing_spin,
+    effective_tidal_deformability,
+    doppler_vector,
+    circular_sky_u,
+    circular_standardisation,
+    mass_ratio_shear,
+    time_reference_frequency,
+    time_to_merger,
+    waveform_phase,
+    unsupported,
+):
+    """:func:`make_network_group_flow_proposal` with ``network_amplitudes``."""
+    from nessai.flowmodel.group_mixture import make_group_mixture_flow
+
+    bad = sorted(k for k, v in unsupported.items() if v)
+    if bad:
+        raise ValueError(f"network_amplitudes excludes {bad}.")
+    names = list(sampling_parameters)
+    prime = _prime_parameter_names(
+        names, geometry.reference_time, vertex=geometry.timing_vertex,
+        psi_single=True, effective_spin=effective_spin,
+        precessing_spin=precessing_spin, log_mass_ratio=log_mass_ratio,
+        effective_tidal_deformability=effective_tidal_deformability,
+        doppler_vector=doppler_vector,
+        time_reference_frequency=time_reference_frequency,
+        time_to_merger=time_to_merger, waveform_phase=waveform_phase,
+        chirp_distance=False,
+    )
+    # the placeholder order; initialise re-binds to nessai's actual one
+    replaced = {"delta_phase", "psi_prime", "theta_jn_prime",
+                "luminosity_distance_prime"}
+    prime_names = list(NETWORK_AMPLITUDE_PRIME_PARAMETERS) + [
+        n for n in prime if n not in replaced
+    ]
+    action = TrivialPrimeSpaceAction()
+    gm_params = inspect.signature(make_group_mixture_flow).parameters
+    if "circular_parameters" not in gm_params:
+        raise RuntimeError(
+            "network_amplitudes requires a version of nessai whose "
+            "make_group_mixture_flow accepts `circular_parameters`."
+        )
+    gm_kwargs = {"mode_factor_sizes": action.mode_factor_sizes}
+    canonical = None
+    if gaussianise_sky and "sky_u" in prime_names:
+        canonical = SkyOctantProbit(
+            prime_names, u_scale=None if circular_sky_u else 1.0, v_scale=1.0,
+        )
+    circles = {name: AMPLITUDE_ARGUMENT_CIRCLE
+               for name in NETWORK_AMPLITUDE_ANGLES}
+    if circular_sky_u:
+        if "sky_u" not in prime_names:
+            raise RuntimeError(
+                "circular_sky_u needs the sky (ra, dec) in the sampling "
+                "parameters."
+            )
+        circles["sky_u"] = (0.0, 1.0, (0.0, 1.0))
+    canonical = CircularCanonicalTransform(circles, prime_names, inner=canonical)
+    gm_kwargs["circular_parameters"] = list(circles)
+    gm_kwargs["canonical_transform"] = canonical
+    if circular_standardisation:
+        gm_kwargs["circular_standardisation"] = True
+    # the sky_u seam is the only one left for the adaptive domain to move,
+    # and AdaptiveNetworkDomain is built around psi_prime / delta_phase
+    if adaptive_domain and not circular_sky_u:
+        logger.info("network_amplitudes: the sky_u seam stays fixed")
+    gm_kwargs.update(
+        curvature_shear_kwargs(mass_ratio_shear, prime_names, gm_params)
+    )
+    flow_model_cls = _select_flow_model_factory(
+        n_clusters_max, flow_model_factory
+    )(
+        group_action_fn=_identity_group_action,
+        group_size=action.group_size,
+        param_names=prime_names,
+        prime_space_action=action,
+        prime_space_in_domain=action.in_fundamental_domain,
+        min_canon_std=_MIN_CANON_STD,
+        **gm_kwargs,
+    )
+    logger.info("Network amplitude proposal for %r", geometry)
+    return _make_group_proposal_class(
+        "NetworkAmplitudeFlowProposal",
         flow_model_cls,
         action,
         sky_rotation=geometry.sky_frame_rotation,

@@ -11,6 +11,7 @@ from .chirp_distance import ChirpDistanceReparameterisation
 from .distance import DistanceReparameterisation
 from .inclination import PolarisationEllipseReparameterisation
 from .mass import DopplerChirpMassReparameterisation
+from .network_amplitudes import NetworkAmplitudesReparameterisation
 from .phase import (
     ArgAlphaBetaReparameterisation,
     DeltaPhaseReparameterisation,
@@ -130,6 +131,12 @@ known_reparameterisations.add_reparameterisation(
 known_reparameterisations.add_reparameterisation(
     "chirp-distance",
     ChirpDistanceReparameterisation,
+    {},
+)
+
+known_reparameterisations.add_reparameterisation(
+    "network-amplitudes",
+    NetworkAmplitudesReparameterisation,
     {},
 )
 

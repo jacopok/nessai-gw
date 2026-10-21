@@ -838,3 +838,104 @@ def test_network_proposal_circular_options(geometry):
     assert dom.allow_phase_mode and dom.circular_psi_phase
     with pytest.raises(ValueError, match="phase_recanon"):
         make_network_group_flow_proposal(PARAMETERS, geometry, phase_recanon=True)
+
+
+# ---------------------------------------------------------------------------
+# network amplitudes
+# ---------------------------------------------------------------------------
+def test_site_tensors(geometry):
+    # loudest site first
+    np.testing.assert_array_equal(geometry.site_tensors(), TENSORS[::-1])
+
+
+def test_site_tensors_need_one_interferometer_per_site():
+    geo = DetectorNetworkGeometry(
+        [IT, IT + 10.0, DE], [30.0, 30.0, 40.0], REFERENCE_TIME,
+        tensors=np.concatenate([TENSORS[:1], TENSORS]),
+    )
+    with pytest.raises(ValueError, match="one interferometer per site"):
+        geo.site_tensors()
+
+
+def test_amplitude_reparameterisations(geometry):
+    reps = network_group_reparameterisations(
+        PARAMETERS, geometry, network_amplitudes=True
+    )
+    first, *_ = reps
+    assert reps[first]["reparameterisation"] == "network-amplitudes"
+    assert reps[first]["parameters"] == [
+        "luminosity_distance", "theta_jn", "psi", "phase"
+    ]
+    assert not {"theta_jn", "phase"} & set(reps)
+
+
+@requires_group_mixture
+def test_amplitude_proposal_initialise_train_and_draw(geometry, tmp_path):
+    bounds = {
+        "chirp_mass": [1.19, 1.21], "mass_ratio": [0.5, 1.0],
+        "chi_1": [-0.05, 0.05], "chi_2": [-0.05, 0.05],
+        "luminosity_distance": [25.0, 4000.0], "theta_jn": [0.0, np.pi],
+        "psi": [0.0, np.pi], "phase": [0.0, 2 * np.pi],
+        "ra": [0.0, 2 * np.pi], "dec": [-np.pi / 2, np.pi / 2],
+        "geocent_time": [REFERENCE_TIME - 0.1, REFERENCE_TIME + 0.1],
+    }
+    model = _stub_model(PARAMETERS, {k: np.asarray(v) for k, v in bounds.items()})
+    model.set_rng(np.random.default_rng(0))
+    cls = make_network_group_flow_proposal(
+        PARAMETERS, geometry, network_amplitudes=True, circular_sky_u=True
+    )
+    assert cls.__qualname__ == "NetworkAmplitudeFlowProposal"
+    with pytest.raises(ValueError, match="excludes"):
+        make_network_group_flow_proposal(
+            PARAMETERS, geometry, network_amplitudes=True, baseline_flip=True
+        )
+    proposal = cls(
+        model,
+        output=str(tmp_path),
+        poolsize=200,
+        reparameterisations=network_group_reparameterisations(
+            PARAMETERS, geometry, network_amplitudes=True
+        ),
+        flow_config={"n_blocks": 2, "n_neurons": 8, "n_layers": 1,
+                     "ftype": "circular"},
+        training_config={"max_epochs": 3, "patience": 3},
+    )
+    proposal.initialise()
+    prime = list(proposal.prime_parameters)
+    amplitudes = ["ln_amp_1", "arg_amp_1", "ln_amp_2", "arg_amp_2"]
+    assert set(amplitudes) | {"sky_u", "sky_v", "t_det"} <= set(prime)
+    assert not {
+        "psi_prime", "delta_phase", "theta_jn_prime", "chirp_distance"
+    } & set(prime)
+
+    rng = np.random.default_rng(7)
+    from nessai.livepoint import numpy_array_to_live_points
+
+    theta = np.column_stack([
+        rng.uniform(*bounds[n], 1000) for n in PARAMETERS
+    ])
+    theta[:, PARAMETERS.index("dec")] = np.arcsin(rng.uniform(-1, 1, 1000))
+    live = numpy_array_to_live_points(theta, PARAMETERS)
+    live["logL"] = 0.0
+    live["logP"] = model.log_prior(live)
+    x_prime, log_j = proposal.rescale(live)
+    back, log_j_inv = proposal.inverse_rescale(x_prime)
+    n = len(live)
+    # within ~0.01 of face-on/off the amplitudes depend on theta_jn only at
+    # fourth order and the inverse loses its digits
+    ok = np.abs(np.sin(live["theta_jn"])) > 0.01
+    for name in ("luminosity_distance", "theta_jn", "ra", "dec"):
+        np.testing.assert_allclose(back[name][:n][ok], live[name][ok], rtol=1e-7)
+    np.testing.assert_allclose(log_j[:n][ok], -log_j_inv[:n][ok], atol=1e-6)
+    proposal.train(live)
+    worst = live[:1].copy()
+    worst["logL"] = -np.inf
+    proposal.populate(worst, n_samples=200)
+    x = proposal.samples
+    assert len(x) > 0
+    assert np.all(np.isfinite(model.log_prior(x)))
+    flow = proposal.flow.model
+    assert flow.group_size == 1
+    assert sorted(prime[i] for i in flow.circular_features) == sorted(
+        ["arg_amp_1", "arg_amp_2", "sky_u"]
+    )

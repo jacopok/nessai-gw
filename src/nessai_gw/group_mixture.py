@@ -155,6 +155,8 @@ original one.
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import torch
 
@@ -1147,6 +1149,103 @@ class PrimeSpaceTriangularGroupAction:
         return self._action.in_fundamental_domain(acted)
 
 
+class PrimeSpaceSkyGroupAction:
+    """The eight sky elements of :class:`TriangularDetectorGroupAction`,
+    acting on the sky alone, for the triangle's ``amplitudes`` coordinates.
+
+    The A and E channels' complex amplitudes
+    (:mod:`nessai_gw.reparameterisations.network_amplitudes`) are invariant
+    under the quarter turns about the plane normal and the reflection through
+    the plane, as the data are, and they have already folded the
+    polarisation/phase quarter turn.  What is left acts on the equal-area
+    sky of the detector frame, ``sky_u -> sky_u + k/4 mod 1`` and ``sky_v ->
+    1 - sky_v``, and under the reflection on ``phi_jl`` (shifted by ``pi``,
+    as in :class:`PrimeSpaceTriangularGroupAction`); the amplitudes and
+    ``t_det`` are carried through.  The canonical points are those with
+    ``sky_u in [0, 1/4)`` and ``sky_v <= 1/2`` (``beta >= 0``), as for the
+    full group.
+
+    Parameters
+    ----------
+    action : TriangularDetectorGroupAction
+        The eight-element physical action (no phase factor); only its frame
+        and mode bookkeeping are used.
+    prime_names : list of str
+        The flow's prime-parameter names, in order (re-bound with
+        :meth:`bind`).
+    """
+
+    mode_factor_sizes = [8]
+
+    def __init__(self, action, prime_names):
+        if action.group_size != TRIANGULAR_DETECTOR_GROUP_SIZE:
+            raise ValueError(
+                "PrimeSpaceSkyGroupAction needs the eight-element action "
+                "(no phase_reflection or polarisation_quarter)."
+            )
+        self._action = action
+        self.group_size = action.group_size
+        self.bind(prime_names)
+
+    @property
+    def sky_frame_rotation(self):
+        return self._action.sky_frame_rotation
+
+    @property
+    def sky_frame_merger_gmst(self):
+        return self._action.merger_gmst
+
+    def set_gmst(self, gmst):
+        raise NotImplementedError(
+            "the amplitudes are evaluated at the merger's Earth orientation"
+        )
+
+    def bind(self, prime_names):
+        """(Re)bind to the flow's actual prime-parameter order."""
+        self._prime_names = list(prime_names)
+        names = set(self._prime_names)
+        if not {"sky_u", "sky_v"} <= names:
+            raise RuntimeError(
+                "PrimeSpaceSkyGroupAction needs sky_u / sky_v in the prime "
+                f"parameters; got {self._prime_names}."
+            )
+        self._phi_jl_pair = None
+        self._phi_jl_single = None
+        for pair in (("s1_x", "s1_y"), ("phi_jl_x", "phi_jl_y")):
+            if all(n in names for n in pair):
+                self._phi_jl_pair = pair
+                break
+        else:
+            if "phi_jl_prime" in names:
+                self._phi_jl_single = "phi_jl_prime"
+
+    def __call__(self, point_dict, modes, inverse: bool = False):
+        u = point_dict["sky_u"]
+        modes = torch.as_tensor(modes, device=u.device)
+        if inverse:
+            modes = self._action.invert_modes(modes)
+        k, reflected, _ = self._action.decode_modes(modes)
+        out = dict(point_dict)
+        out["sky_u"] = torch.remainder(u + 0.25 * k.to(u.dtype), 1.0)
+        v = point_dict["sky_v"]
+        out["sky_v"] = torch.where(reflected, 1.0 - v, v)
+        if self._phi_jl_pair is not None:
+            for n in self._phi_jl_pair:
+                out[n] = torch.where(reflected, -point_dict[n], point_dict[n])
+        elif self._phi_jl_single is not None:
+            w = point_dict[self._phi_jl_single]
+            out[self._phi_jl_single] = torch.where(
+                reflected, torch.remainder(w + 2.0, 2.0) - 1.0, w
+            )
+        return {n: out[n] for n in self._prime_names}
+
+    def in_fundamental_domain(self, point_dict):
+        return (
+            (torch.remainder(point_dict["sky_u"], 1.0) < 0.25)
+            & (point_dict["sky_v"] <= 0.5)
+        )
+
+
 _LOG_2PI = float(np.log(2.0 * np.pi))
 _HALF_LOG_2PI = 0.5 * _LOG_2PI
 
@@ -1390,6 +1489,10 @@ class CircularCanonicalTransform:
 #: fundamental domain folded by the polarisation/phase quarter turn (and the
 #: (2, 2) reflection) with zero offsets: ``[-1, 0)`` of the range ``[-1, 1)``.
 POLARISATION_PHASE_CIRCLE = (-1.0, 1.0, (-1.0, 1.0))
+
+#: ``circles`` entry of the ``arg_amp_k`` coordinates (``network-amplitudes``):
+#: their whole range.
+AMPLITUDE_ARGUMENT_CIRCLE = (-np.pi, _TWO_PI, (-np.pi, np.pi))
 
 
 class PhaseQuarterRecanonicaliser(torch.nn.Module):
@@ -2060,6 +2163,8 @@ def triangular_group_reparameterisations(
     time_to_merger=None,
     chirp_distance_inversion=False,
     waveform_phase=None,
+    amplitudes=False,
+    amplitude_tensors=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2248,12 +2353,40 @@ def triangular_group_reparameterisations(
         fitted at every training, which unwinds its helix around the
         intrinsic parameters.  Needs ``phase_coordinates="polarisation-phase"``,
         ``chirp_mass`` and ``mass_ratio``.  Default ``None`` (merger phase).
+    amplitudes : bool, optional
+        Replace ``luminosity_distance``, ``theta_jn``, ``psi`` and ``phase``
+        by the complex amplitudes of two detectors, ``(ln_amp_k, arg_amp_k)``
+        (``network-amplitudes``, see
+        :mod:`nessai_gw.reparameterisations.network_amplitudes`; with
+        ``waveform_phase`` the phase in them is measured at its reference
+        frequency).  Excludes ``chirp_distance`` and ``arg-alpha-beta``.
+        Use with ``amplitudes=True`` in
+        :func:`make_triangular_group_flow_proposal`.  Default ``False``.
+    amplitude_tensors : array_like, optional
+        With ``amplitudes``: the ``(3, 3, 3)`` tensors of the triangle (its
+        A and E channels are used) or ``(2, 3, 3)`` of two sites.  Defaults
+        to :data:`ET_EMR_DETECTOR_TENSORS`.
 
     Returns
     -------
     dict
         A ``reparameterisations`` mapping for ``bilby.run_sampler`` / nessai.
     """
+    if amplitudes:
+        return _amplitude_reparameterisations(
+            sampling_parameters, reference_time,
+            ET_EMR_DETECTOR_TENSORS if amplitude_tensors is None
+            else amplitude_tensors,
+            vertex=vertex, phase_coordinates=phase_coordinates,
+            polarisation_ellipse=polarisation_ellipse,
+            chirp_distance=chirp_distance, effective_spin=effective_spin,
+            log_mass_ratio=log_mass_ratio, precessing_spin=precessing_spin,
+            effective_tidal_deformability=effective_tidal_deformability,
+            doppler_vector=doppler_vector,
+            time_reference_frequency=time_reference_frequency,
+            time_frequency_range=time_frequency_range,
+            time_to_merger=time_to_merger, waveform_phase=waveform_phase,
+        )
     if vertex is None:
         vertex = ET_EMR_VERTEX
     chirp_distance = bool(chirp_distance) and (
@@ -2527,6 +2660,54 @@ def triangular_group_reparameterisations(
     if phase_coordinates == "arg-alpha-beta" and "phase" in sampling_parameters:
         reps["arg-alpha-beta"] = {"parameters": ["psi", "phase"]}
     return reps
+
+
+def _amplitude_reparameterisations(sampling_parameters, reference_time,
+                                   tensors, phase_coordinates,
+                                   polarisation_ellipse, chirp_distance,
+                                   waveform_phase=None, **kwargs):
+    """:func:`triangular_group_reparameterisations` with ``amplitudes``:
+    ``network-amplitudes`` in place of the distance, ``theta_jn`` and
+    ``delta_phase`` (and of the ``psi_prime`` the proposal would add).  It
+    reads the sky and (with ``waveform_phase``) the intrinsic parameters on
+    its inverse, so it goes first."""
+    from .reparameterisations.network_amplitudes import (
+        NETWORK_AMPLITUDE_PARAMETERS,
+    )
+
+    bad = [name for name, on in (
+        ("chirp_distance", chirp_distance),
+        ("polarisation_ellipse", polarisation_ellipse is not None),
+        ("arg-alpha-beta", phase_coordinates != "polarisation-phase"),
+    ) if on]
+    if bad:
+        raise ValueError(f"amplitudes excludes {bad}.")
+    missing = sorted(
+        (set(NETWORK_AMPLITUDE_PARAMETERS) | {"ra", "dec", "chirp_mass"})
+        - set(sampling_parameters)
+    )
+    if missing:
+        raise RuntimeError(
+            f"amplitudes needs {missing} in the sampling parameters."
+        )
+    reps = triangular_group_reparameterisations(
+        sampling_parameters, reference_time,
+        phase_coordinates="polarisation-phase", chirp_distance=False,
+        waveform_phase=waveform_phase, **kwargs,
+    )
+    phase = reps.pop("phase", {})
+    for name in NETWORK_AMPLITUDE_PARAMETERS:
+        reps.pop(name, None)
+    entry = {
+        "reparameterisation": "network-amplitudes",
+        "parameters": list(NETWORK_AMPLITUDE_PARAMETERS),
+        "tensors": np.asarray(tensors, dtype=float),
+        "reference_time": float(reference_time),
+    }
+    for key in ("waveform_phase", "frequency_range", "spins", "tides"):
+        if key in phase:
+            entry[key] = phase[key]
+    return {"luminosity_distance": entry, **reps}
 
 
 #: Dummy prior bounds for the throwaway reparameterisation build in
@@ -3150,6 +3331,7 @@ def make_triangular_group_flow_proposal(
     waveform_phase=None,
     reference_epoch=None,
     base_action=None,
+    amplitudes=False,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -3339,7 +3521,50 @@ def make_triangular_group_flow_proposal(
         As in :func:`triangular_group_reparameterisations` (the prime names do
         not depend on it; the probe checks the order of the inverse pass with
         it).  Default ``None``.
+    amplitudes : bool, optional
+        Carry ``(luminosity_distance, theta_jn, psi, phase)`` as the complex
+        amplitudes of the triangle's A and E channels (``amplitudes=True`` in
+        :func:`triangular_group_reparameterisations`), whose arguments are
+        angles of the circular flow (Möbius-standardised with
+        ``circular_standardisation``).  They fold the polarisation/phase
+        quarter turn, so the group is the eight sky elements
+        (:class:`PrimeSpaceSkyGroupAction`).  Needs a circular flow (``ftype
+        = "circular"``); excludes the options that act on ``psi``,
+        ``delta_phase`` or ``theta_jn`` (``phase_recanon``,
+        ``adaptive_domain``, ``circular_psi_phase``,
+        ``polarisation_ellipse``, ``phase_coordinates``, ``chirp_distance``,
+        ``reference_epoch``) and ``base_action``.  Default ``False``.
     """
+    if amplitudes:
+        bad = sorted(name for name, on in (
+            ("phase_recanon", phase_recanon),
+            ("adaptive_domain", adaptive_domain),
+            ("circular_psi_phase", circular_psi_phase),
+            ("polarisation_ellipse", polarisation_ellipse is not None),
+            ("phase_coordinates", phase_coordinates != "polarisation-phase"),
+            ("chirp_distance", chirp_distance),
+            ("reference_epoch", reference_epoch is not None),
+            ("base_action", base_action is not None),
+            ("polarisation_offset", polarisation_offset),
+        ) if on)
+        if bad:
+            raise ValueError(f"amplitudes excludes {bad}.")
+        return _make_triangle_amplitude_flow_proposal(
+            sampling_parameters, reference_time, plane_normal, vertex,
+            azimuth_offset=azimuth_offset,
+            n_clusters_max=n_clusters_max,
+            flow_model_factory=flow_model_factory,
+            circular_standardisation=circular_standardisation,
+            mass_ratio_shear=mass_ratio_shear,
+            prime_kwargs=dict(
+                effective_spin=effective_spin, log_mass_ratio=log_mass_ratio,
+                precessing_spin=precessing_spin,
+                effective_tidal_deformability=effective_tidal_deformability,
+                doppler_vector=doppler_vector,
+                time_reference_frequency=time_reference_frequency,
+                time_to_merger=time_to_merger, waveform_phase=waveform_phase,
+            ),
+        )
     try:
         from nessai.flowmodel.group_mixture import make_group_mixture_flow
     except ImportError as exc:  # pragma: no cover - depends on nessai version
@@ -3533,6 +3758,95 @@ def make_triangular_group_flow_proposal(
     )
 
 
+def _make_triangle_amplitude_flow_proposal(
+    sampling_parameters, reference_time, plane_normal, vertex,
+    azimuth_offset, n_clusters_max, flow_model_factory,
+    circular_standardisation, mass_ratio_shear, prime_kwargs,
+):
+    """:func:`make_triangular_group_flow_proposal` with ``amplitudes``."""
+    from nessai.flowmodel.group_mixture import make_group_mixture_flow
+
+    from .reparameterisations.network_amplitudes import (
+        NETWORK_AMPLITUDE_ANGLES,
+        NETWORK_AMPLITUDE_PARAMETERS,
+        NETWORK_AMPLITUDE_PRIME_PARAMETERS,
+    )
+
+    names = list(sampling_parameters)
+    missing = sorted(
+        (set(NETWORK_AMPLITUDE_PARAMETERS) | {"ra", "dec", "chirp_mass",
+                                             "geocent_time"}) - set(names)
+    )
+    if missing:
+        raise RuntimeError(
+            f"The sampling space is missing {missing}, which the triangle's "
+            "amplitudes need."
+        )
+    gm_params = inspect.signature(make_group_mixture_flow).parameters
+    for key in ("circular_parameters", "canonical_transform",
+                "mode_factor_sizes"):
+        if key not in gm_params:
+            raise RuntimeError(
+                "amplitudes requires a version of nessai whose "
+                f"make_group_mixture_flow accepts `{key}`."
+            )
+    base_action = TriangularDetectorGroupAction(
+        reference_time=reference_time, plane_normal=plane_normal,
+        vertex=vertex, azimuth_offset=azimuth_offset,
+    )
+    prime = _prime_parameter_names(
+        names, reference_time, vertex=vertex, psi_single=True,
+        chirp_distance=False, **prime_kwargs,
+    )
+    # the placeholder order; initialise re-binds to nessai's actual one
+    replaced = {"delta_phase", "psi_prime", "theta_jn_prime",
+                "luminosity_distance_prime"}
+    prime_names = list(NETWORK_AMPLITUDE_PRIME_PARAMETERS) + [
+        n for n in prime if n not in replaced
+    ]
+    action = PrimeSpaceSkyGroupAction(base_action, prime_names)
+    circles = {name: AMPLITUDE_ARGUMENT_CIRCLE
+               for name in NETWORK_AMPLITUDE_ANGLES}
+    gm_kwargs = {
+        "mode_factor_sizes": action.mode_factor_sizes,
+        "circular_parameters": list(circles),
+        "canonical_transform": CircularCanonicalTransform(
+            circles, prime_names,
+            inner=SkyOctantProbit(prime_names, u_scale=4.0),
+        ),
+    }
+    if circular_standardisation:
+        if "circular_standardisation" not in gm_params:
+            raise RuntimeError(
+                "circular_standardisation requires a version of nessai "
+                "whose make_group_mixture_flow accepts it."
+            )
+        gm_kwargs["circular_standardisation"] = True
+    gm_kwargs.update(
+        curvature_shear_kwargs(mass_ratio_shear, prime_names, gm_params)
+    )
+    flow_model_cls = _select_flow_model_factory(
+        n_clusters_max, flow_model_factory
+    )(
+        group_action_fn=action,  # ignored on the prime-space path
+        group_size=action.group_size,
+        param_names=prime_names,
+        prime_space_action=action,
+        prime_space_in_domain=action.in_fundamental_domain,
+        min_canon_std=_MIN_CANON_STD,
+        **gm_kwargs,
+    )
+    logger.info("Triangle amplitude proposal (eight sky elements)")
+    return _make_group_proposal_class(
+        "TriangleAmplitudeFlowProposal",
+        flow_model_cls,
+        action,
+        sky_rotation=base_action.sky_frame_rotation,
+        psi_single=True,
+        phase_coordinates="polarisation-phase",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Einstein Telescope (ET-EMR / Meuse-Rhine site) specifics
 #
@@ -3646,6 +3960,7 @@ def make_et_group_flow_proposal(
     chirp_distance_inversion=False,
     waveform_phase=None,
     reference_epoch=None,
+    amplitudes=False,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -3686,4 +4001,5 @@ def make_et_group_flow_proposal(
         chirp_distance_inversion=chirp_distance_inversion,
         waveform_phase=waveform_phase,
         reference_epoch=reference_epoch,
+        amplitudes=amplitudes,
     )
