@@ -384,6 +384,10 @@ class SheetChartFlowProposal(FlowProposal):
     """
 
     use_default_reparameterisations = False
+    #: a partitioned run does not split its region again (nessai skips the
+    #: check): the chart covers one mode, and the split coordinates need the
+    #: group proposal's sky frame
+    splittable = False
 
     def __init__(
         self,
