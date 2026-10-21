@@ -69,10 +69,12 @@ from nessai import config as nessai_config
 from nessai.livepoint import empty_structured_array, live_points_to_array
 from nessai.proposal import FlowProposal
 
+from . import nessai_logger
 from ._ellipse import PolarisationEllipse
 from ._geometry import geocenter_time_delay, greenwich_mean_sidereal_time
 
-logger = logging.getLogger(__name__)
+# a child of nessai's logger, so the messages reach the run's log
+logger = nessai_logger.getChild(__name__)
 
 _TWO_PI = 2.0 * np.pi
 #: The physical parameters the chart replaces.
