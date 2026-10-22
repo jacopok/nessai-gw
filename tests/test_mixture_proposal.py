@@ -188,3 +188,50 @@ def test_stage_switch_on_spread(tmp_path):
     x["logL"] = np.linspace(-8, 0, 1000)  # spread 8: switched
     prop.populate(x[0], n_samples=200, plot=False)
     assert prop.switched_at is not None and prop.samples.size == 200
+
+
+def test_stage_switch_race(tmp_path):
+    """With switch_race: from race_start_lnx every race_every-th pool is the
+    secondary's, each pool's cost per new point recorded; the switch follows
+    the recorded costs."""
+    model = Box()
+    model.set_rng(np.random.default_rng(0))
+    cls = mixture_proposal_class(FlowProposal, FlowProposal,
+                                 dict(flow_config=FLOW, training_config=TRAINING),
+                                 switch_race=True, race_start_lnx=-0.5, race_every=2,
+                                 race_wins=2, class_name="ToyRaceFlowProposal")
+    prop = cls(model, flow_config=FLOW, training_config=TRAINING, output=str(tmp_path),
+               poolsize=200, plot=False)
+    prop.rng = np.random.default_rng(5)
+    prop.initialise()
+    x = live_points(model, n=1000)
+    x["it"] = np.arange(1000) - 800  # ln X -0.2: before the race
+    x["logL"] = np.linspace(-1, 0, 1000)
+    prop.current_live_points = x
+    prop.train(x, plot=False)
+    assert prop.secondary.training_count == 0
+    prop.populate(x[0], n_samples=200, plot=False)
+    assert len(prop.race_history) == 0 and prop.switched_at is None
+    x["it"] = np.arange(1000)  # ln X -1: racing
+    prop.train(x, plot=False)
+    assert prop.secondary.training_count == 1
+    for _ in range(8):
+        prop.populate(x[0], n_samples=200, plot=False)
+        assert prop.samples.size == 200 and prop.populated
+        if prop.switched_at is not None:
+            break
+    h = prop.race_history
+    assert [e["component"] for e in h] == [i % 2 for i in range(len(h))]
+    wins, switched = 0, None
+    for i, e in enumerate(h):
+        if e["component"] == 1:
+            wins = wins + 1 if e["cost"] < h[i - 1]["cost"] else 0
+            if wins >= 2:
+                switched = i
+                break
+    assert (switched is None) == (prop.switched_at is None)
+    if switched is not None:
+        assert switched == len(h) - 1
+        n = len(h)
+        prop.populate(x[0], n_samples=200, plot=False)
+        assert len(prop.race_history) == n  # no more racing

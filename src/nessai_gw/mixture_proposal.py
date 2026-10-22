@@ -80,7 +80,12 @@ class MixtureProposalMixin:
     ``switch_spread`` instead, the switch is when the live points' ln L
     spread (max - min) first falls to ``switch_spread`` (the secondary
     trained from ``2 * switch_spread``): a live set in the posterior bulk,
-    whatever the signal's loudness.
+    whatever the signal's loudness. With ``switch_race`` instead, the two
+    race from ln X ``race_start_lnx`` on: every ``race_every``-th pool is the
+    secondary's (trained from then on), the others the run's, each timed
+    (population with the pool's likelihoods) per pool point above the
+    threshold; the switch is when the secondary's cost per new point is
+    below the run's latest at ``race_wins`` of its pools in a row.
     """
 
     secondary_class = None
@@ -92,6 +97,12 @@ class MixtureProposalMixin:
     switch_lnx = None
     switch_warmup = 2.0
     switch_spread = None
+    switch_race = False
+    race_start_lnx = -5.0
+    race_every = 4
+    race_wins = 2
+    #: the race's pools: dicts of ln X, component, seconds, new points, cost
+    race_history = ()
     #: ln X at which the pools switched to the secondary (None: not yet)
     switched_at = None
     #: settings of the run's proposal the secondary shares
@@ -181,7 +192,8 @@ class MixtureProposalMixin:
     @property
     def _staged(self):
         return (self.switch_lnx is not None
-                or getattr(self, "switch_spread", None) is not None)
+                or getattr(self, "switch_spread", None) is not None
+                or getattr(self, "switch_race", False))
 
     def _near_switch(self, warmup=False):
         """Whether the live points have reached the switch (or, with
@@ -189,6 +201,11 @@ class MixtureProposalMixin:
         live = getattr(self, "current_live_points", None)
         if live is None or not len(live):
             return False
+        if getattr(self, "switch_race", False):
+            # the race decides the switch (in populate); its pools need the
+            # secondary trained from its start
+            lnx = self._live_lnx()
+            return bool(warmup) and lnx is not None and lnx <= self.race_start_lnx
         spread = getattr(self, "switch_spread", None)
         if spread is not None:
             logl = np.asarray(live["logL"], float)
@@ -344,17 +361,57 @@ class MixtureProposalMixin:
 
 
     def _populate_stage(self, worst_point, n_samples, plot, r, max_samples):
-        """``switch_lnx``: the pool of the run's proposal, or of the
-        secondary once ln X has reached ``switch_lnx``."""
-        if self.switched_at is None and self._near_switch():
-            lnx = self._live_lnx()
-            self.switched_at = lnx if lnx is not None else np.nan
-            logl = np.asarray(self.current_live_points["logL"], float)
-            logger.info("Mixture: the pools are the secondary's from ln X %.2f on (live ln L "
-                        "spread %.1f)", self.switched_at, logl.max() - logl.min())
+        """``switch_lnx`` / ``switch_spread`` / ``switch_race``: the pool of the
+        run's proposal, or of the secondary once switched (or for a race)."""
+        if self.switched_at is None and not getattr(self, "switch_race", False) \
+                and self._near_switch():
+            self._switch()
+        if self.switched_at is None and getattr(self, "switch_race", False) \
+                and self._near_switch(warmup=True):
+            return self._race(worst_point, n_samples, plot, r, max_samples)
         if self.switched_at is None:
             return super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
                                     max_samples=max_samples)
+        self._secondary_pool(worst_point, n_samples, r, max_samples)
+
+    def _switch(self):
+        lnx = self._live_lnx()
+        self.switched_at = lnx if lnx is not None else np.nan
+        logl = np.asarray(self.current_live_points["logL"], float)
+        logger.info("Mixture: the pools are the secondary's from ln X %.2f on (live ln L "
+                    "spread %.1f)", self.switched_at, logl.max() - logl.min())
+
+    def _race(self, worst_point, n_samples, plot, r, max_samples):
+        """One pool of the race: the secondary's every ``race_every``-th."""
+        history = list(self.race_history)
+        k = 1 if len(history) % self.race_every == self.race_every - 1 else 0
+        st = datetime.datetime.now()
+        if k:
+            self._secondary_pool(worst_point, n_samples, r, max_samples)
+        else:
+            super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
+                             max_samples=max_samples)
+        seconds = (datetime.datetime.now() - st).total_seconds()
+        n_new = int(np.sum(self.samples["logL"] > worst_point["logL"]))
+        entry = dict(lnx=self._live_lnx(), component=k, seconds=seconds, n_new=n_new,
+                     n_pool=int(self.samples.size), cost=seconds / max(n_new, 1))
+        history.append(entry)
+        self.race_history = history
+        logger.info("Mixture race at ln X %.2f: %s pool %.1f s, %d of %d above the threshold, "
+                    "%.3f s per new point", entry["lnx"], ("network", "secondary")[k], seconds,
+                    n_new, entry["n_pool"], entry["cost"])
+        if k:
+            costs = {}
+            wins = 0
+            for e in history:
+                if e["component"] == 0:
+                    costs[0] = e["cost"]
+                elif 0 in costs:
+                    wins = wins + 1 if e["cost"] < costs[0] else 0
+            if wins >= self.race_wins:
+                self._switch()
+
+    def _secondary_pool(self, worst_point, n_samples, r, max_samples):
         st = datetime.datetime.now()
         sec = self.secondary
         sec.current_live_points = self.current_live_points
@@ -373,11 +430,11 @@ class MixtureProposalMixin:
         self.populated = True
         self._checked_population = False
 
-
 def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None,
                            mixture_weight=0.5, min_weight=0.05, mixture_quantile=None,
                            reset_secondary=False, switch_lnx=None, switch_warmup=2.0,
-                           switch_spread=None, class_name="MixtureFlowProposal"):
+                           switch_spread=None, switch_race=False, race_start_lnx=-5.0,
+                           race_every=4, race_wins=2, class_name="MixtureFlowProposal"):
     """``primary_class`` (the run's proposal) mixed with a second proposal
     (see :class:`MixtureProposalMixin`), published at module scope as
     ``class_name`` so checkpoints unpickle (build it again before resuming).
@@ -399,6 +456,11 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
         Instead of a mixture, the run's proposal until ln X reaches
         ``switch_lnx`` (or the live ln L spread falls to ``switch_spread``),
         the secondary after (see :class:`MixtureProposalMixin`).
+    switch_race, race_start_lnx, race_every, race_wins : optional
+        Instead, a race of the two from ln X ``race_start_lnx`` on, the
+        switch when the secondary's measured cost per new point beats the
+        run's at ``race_wins`` of its pools in a row (see
+        :class:`MixtureProposalMixin`).
     """
     attrs = dict(
         secondary_class=secondary_class,
@@ -410,6 +472,10 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
         switch_lnx=None if switch_lnx is None else float(switch_lnx),
         switch_warmup=float(switch_warmup),
         switch_spread=None if switch_spread is None else float(switch_spread),
+        switch_race=bool(switch_race),
+        race_start_lnx=float(race_start_lnx),
+        race_every=int(race_every),
+        race_wins=int(race_wins),
         __module__=__name__,
         __qualname__=class_name,
     )
