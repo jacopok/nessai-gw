@@ -162,3 +162,29 @@ def test_stage_switch(tmp_path):
         assert (v == flow_state[k]).all()
     copy = pickle.loads(pickle.dumps(prop))
     assert copy.switched_at == prop.switched_at
+
+
+def test_stage_switch_on_spread(tmp_path):
+    model = Box()
+    model.set_rng(np.random.default_rng(0))
+    cls = mixture_proposal_class(FlowProposal, FlowProposal,
+                                 dict(flow_config=FLOW, training_config=TRAINING),
+                                 switch_spread=10.0, class_name="ToySpreadSwitchFlowProposal")
+    prop = cls(model, flow_config=FLOW, training_config=TRAINING, output=str(tmp_path),
+               poolsize=200, plot=False)
+    prop.rng = np.random.default_rng(4)
+    prop.initialise()
+    x = live_points(model, n=1000)
+    x["it"] = np.arange(1000)
+    x["logL"] = np.linspace(-30, 0, 1000)  # spread 30: neither switch nor warm-up
+    prop.current_live_points = x
+    prop.train(x, plot=False)
+    assert prop.secondary.training_count == 0
+    prop.populate(x[0], n_samples=200, plot=False)
+    assert prop.switched_at is None
+    x["logL"] = np.linspace(-15, 0, 1000)  # spread 15: warm-up
+    prop.train(x, plot=False)
+    assert prop.secondary.training_count == 1 and prop.switched_at is None
+    x["logL"] = np.linspace(-8, 0, 1000)  # spread 8: switched
+    prop.populate(x[0], n_samples=200, plot=False)
+    assert prop.switched_at is not None and prop.samples.size == 200

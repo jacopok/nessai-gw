@@ -76,7 +76,11 @@ class MixtureProposalMixin:
     until the live points' ln X (``-max(it) / nlive``) first reaches
     ``switch_lnx``, the secondary on its own (its own population, with a
     copy of the run's truncation rules) from then on. The secondary is
-    trained from ``switch_warmup`` nats before the switch.
+    trained from ``switch_warmup`` nats before the switch. With
+    ``switch_spread`` instead, the switch is when the live points' ln L
+    spread (max - min) first falls to ``switch_spread`` (the secondary
+    trained from ``2 * switch_spread``): a live set in the posterior bulk,
+    whatever the signal's loudness.
     """
 
     secondary_class = None
@@ -87,6 +91,7 @@ class MixtureProposalMixin:
     reset_secondary = False
     switch_lnx = None
     switch_warmup = 2.0
+    switch_spread = None
     #: ln X at which the pools switched to the secondary (None: not yet)
     switched_at = None
     #: settings of the run's proposal the secondary shares
@@ -164,15 +169,32 @@ class MixtureProposalMixin:
             self.populated = False
             return
         super().train(x, plot=plot)
-        if self.switch_lnx is not None:
-            lnx = self._live_lnx()
-            if lnx is not None and lnx <= self.switch_lnx + self.switch_warmup:
+        if self._staged:
+            if self._near_switch(warmup=True):
                 self.secondary.current_live_points = live
                 self.secondary.train(x, plot=False)
             return
         self.secondary.current_live_points = live
         self.secondary.train(x, plot=False)
         self._fit_mixture_weight(live if live is not None and len(live) else x)
+
+    @property
+    def _staged(self):
+        return (self.switch_lnx is not None
+                or getattr(self, "switch_spread", None) is not None)
+
+    def _near_switch(self, warmup=False):
+        """Whether the live points have reached the switch (or, with
+        ``warmup``, its warm-up)."""
+        live = getattr(self, "current_live_points", None)
+        if live is None or not len(live):
+            return False
+        spread = getattr(self, "switch_spread", None)
+        if spread is not None:
+            logl = np.asarray(live["logL"], float)
+            return float(logl.max() - logl.min()) <= spread * (2.0 if warmup else 1.0)
+        lnx = self._live_lnx()
+        return lnx is not None and lnx <= self.switch_lnx + (self.switch_warmup if warmup else 0.0)
 
     def _live_lnx(self):
         """ln X of the current live points, ``-max(it) / nlive``."""
@@ -245,7 +267,7 @@ class MixtureProposalMixin:
     def populate(self, worst_point, n_samples=10000, plot=True, r=None, max_samples=1_000_000):
         """Fill the pool with ``n_samples`` draws of the mixture, kept by
         rejection against the weight cap (see the module notes)."""
-        if self.switch_lnx is not None:
+        if self._staged:
             return self._populate_stage(worst_point, n_samples, plot, r, max_samples)
         st = datetime.datetime.now()
         if not self.initialised:
@@ -324,10 +346,12 @@ class MixtureProposalMixin:
     def _populate_stage(self, worst_point, n_samples, plot, r, max_samples):
         """``switch_lnx``: the pool of the run's proposal, or of the
         secondary once ln X has reached ``switch_lnx``."""
-        lnx = self._live_lnx()
-        if self.switched_at is None and lnx is not None and lnx <= self.switch_lnx:
-            self.switched_at = lnx
-            logger.info("Mixture: the pools are the secondary's from ln X %.2f on", lnx)
+        if self.switched_at is None and self._near_switch():
+            lnx = self._live_lnx()
+            self.switched_at = lnx if lnx is not None else np.nan
+            logl = np.asarray(self.current_live_points["logL"], float)
+            logger.info("Mixture: the pools are the secondary's from ln X %.2f on (live ln L "
+                        "spread %.1f)", self.switched_at, logl.max() - logl.min())
         if self.switched_at is None:
             return super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
                                     max_samples=max_samples)
@@ -353,7 +377,7 @@ class MixtureProposalMixin:
 def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None,
                            mixture_weight=0.5, min_weight=0.05, mixture_quantile=None,
                            reset_secondary=False, switch_lnx=None, switch_warmup=2.0,
-                           class_name="MixtureFlowProposal"):
+                           switch_spread=None, class_name="MixtureFlowProposal"):
     """``primary_class`` (the run's proposal) mixed with a second proposal
     (see :class:`MixtureProposalMixin`), published at module scope as
     ``class_name`` so checkpoints unpickle (build it again before resuming).
@@ -371,10 +395,10 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
     mixture_weight : float or None
         The secondary's share of the draws; ``None`` fits it to the live
         points after every training.
-    switch_lnx, switch_warmup : float, optional
+    switch_lnx, switch_warmup, switch_spread : float, optional
         Instead of a mixture, the run's proposal until ln X reaches
-        ``switch_lnx``, the secondary after (see
-        :class:`MixtureProposalMixin`).
+        ``switch_lnx`` (or the live ln L spread falls to ``switch_spread``),
+        the secondary after (see :class:`MixtureProposalMixin`).
     """
     attrs = dict(
         secondary_class=secondary_class,
@@ -385,6 +409,7 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
         reset_secondary=bool(reset_secondary),
         switch_lnx=None if switch_lnx is None else float(switch_lnx),
         switch_warmup=float(switch_warmup),
+        switch_spread=None if switch_spread is None else float(switch_spread),
         __module__=__name__,
         __qualname__=class_name,
     )
