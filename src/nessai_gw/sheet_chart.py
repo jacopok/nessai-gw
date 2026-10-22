@@ -133,9 +133,15 @@ class SheetChart:
         The model's parameters: :data:`EXTRINSIC` and any others, which are
         carried as they are (``mass_ratio`` as ``ln q``).
     phase_sign : {None, -1, 1}
-        ``s`` in ``e^{2i s phase}``; ``None`` picks, at every fit, the sign
-        that makes the phase residuals narrower (bilby's waveforms: -1).
+        ``s`` in ``e^{2i s phase}``; ``None`` picks the sign that makes the
+        phase residuals narrower (bilby's waveforms: -1), at the first fit
+        and at a refit where the other sign is clearly better
+        (:attr:`STICKY_SIGN`).
     """
+
+    #: a refit changes the automatic phase sign only if the other sign's
+    #: residual phases spread less than this fraction of the current one's
+    STICKY_SIGN = 0.5
 
     def __init__(self, plane_normal, vertex, reference_time, names, phase_sign=None):
         self.plane_normal = np.asarray(plane_normal, dtype=float)
@@ -219,7 +225,16 @@ class SheetChart:
             ra_, rb_ = a / a0, b / b0
             # circular spread of the residual phases (1 - mean resultant length)
             spread[sign] = 2 - abs(np.mean(ra_ / np.abs(ra_))) - abs(np.mean(rb_ / np.abs(rb_)))
-        self.phase_sign = min(spread, key=spread.get)
+        best = min(spread, key=spread.get)
+        # keep the sign of the previous fit unless the other is clearly
+        # better: on broad live sets the two are close, and a flip would
+        # change the flow's coordinates between trainings
+        if not (
+            self.fitted
+            and len(spread) == 2
+            and spread[best] > self.STICKY_SIGN * spread[self.phase_sign]
+        ):
+            self.phase_sign = best
         a, b = self._alpha_beta(
             x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], self.phase_sign
         )
@@ -288,6 +303,8 @@ class SheetChart:
     def forward(self, x):
         """Physical -> whitened chart ``y``, branch ``k`` and ``ln q`` terms
         (``ln |dy/dx| + ln p_k``)."""
+        if not self.fitted:
+            raise RuntimeError("the sheet chart is used before it is fitted")
         c, k, log_j = self.columns_of(x)
         y = np.linalg.solve(self.chol, (c - self.mean).T).T
         return y, k, log_j + self.log_det_whiten + self.log_p_k[k]
@@ -296,6 +313,14 @@ class SheetChart:
         """Whitened chart ``y`` and branch ``k`` -> physical parameters (a
         dict of arrays), the mask of the rows inside the chart's domain and
         the forward ``ln q`` terms at them."""
+        if not self.fitted:
+            raise RuntimeError("the sheet chart is used before it is fitted")
+        # draws far out in the flow's tails overflow: they are flagged
+        # invalid below, without a warning each
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            return self._inverse(y, k)
+
+    def _inverse(self, y, k):
         y = np.atleast_2d(np.asarray(y, dtype=float))
         k = np.asarray(k, dtype=int)
         c = y @ self.chol.T + self.mean
@@ -341,15 +366,15 @@ class SheetChart:
             psi=psi,
             phase=phase,
         )
-        with np.errstate(divide="ignore", invalid="ignore"):
-            log_j += (
-                np.log(np.cos(dec))
-                + np.log(32.0)
-                - np.log(dist)
-                - np.log(np.sin(theta))
-                + self.log_det_whiten
-                + self.log_p_k[k]
-            )
+        log_j += (
+            np.log(np.cos(dec))
+            + np.log(32.0)
+            - np.log(dist)
+            - np.log(np.sin(theta))
+            + self.log_det_whiten
+            + self.log_p_k[k]
+        )
+        valid &= np.isfinite(log_j) & np.isfinite(out["geocent_time"])
         return out, valid, np.where(valid, log_j, 0.0)
 
     def describe(self):
