@@ -84,6 +84,21 @@ S^4``: ``|beta|`` then grows as ``t0 theta_jn / 2`` and the prior is smooth
 at the poles, while away from them (``tan(theta_jn / 2)^3 >> t0``) the
 chart is the plain one.
 
+Intrinsic coordinates
+---------------------
+By default the charts carry the intrinsic parameters as they are (the
+mass ratio as ``ln q``). ``coordinates`` (:meth:`_Chart.set_coordinates`)
+gives them the group proposals' coordinates, with the same nessai-gw
+reparameterisations: the effective spins and tides, the chirp mass in the
+Earth's frame ``chirp_mass (1 - n.v/c)`` (it reads the sky, which the
+inverse takes first), the arrival time when the 22 mode passes a reference
+frequency (a shift of the chart's time by ``tau(f) - tau_ref``) and the
+phase at a reference frequency (``phase + a(theta) / 2`` in ``(alpha,
+beta)``). The shifts depend on the intrinsic parameters and the sky only,
+so the Jacobian stays triangular in the order (sky, intrinsic, time,
+amplitudes) and only the Doppler factor adds to it. The reference
+frequencies are chosen at every refit, on the training points.
+
 One interferometer
 ------------------
 A single interferometer (CE) measures one complex amplitude and an
@@ -109,6 +124,11 @@ from nessai.proposal import FlowProposal
 from . import nessai_logger
 from ._ellipse import PolarisationEllipse, _complex_response
 from ._geometry import geocenter_time_delay, greenwich_mean_sidereal_time
+from .reparameterisations.mass import doppler_factor
+from .reparameterisations.phase import PolarisationPhaseReparameterisation
+from .reparameterisations.spin import EffectiveSpinReparameterisation
+from .reparameterisations.tides import EffectiveTidalDeformabilityReparameterisation
+from .reparameterisations.time import DetectorCenterTimeReparameterisation
 
 # a child of nessai's logger, so the messages reach the run's log
 logger = nessai_logger.getChild(__name__)
@@ -140,6 +160,17 @@ SHEET_COLUMNS = (
 )
 #: Intrinsic parameters sampled in their logarithm.
 LOG_PARAMETERS = ("mass_ratio",)
+#: Keywords of :meth:`_Chart.set_coordinates` (``coordinates`` of the
+#: proposals), off by default.
+COORDINATES = (
+    "effective_spin",
+    "effective_tidal_deformability",
+    "doppler_vector",
+    "time_reference_frequency",
+    "time_to_merger",
+    "waveform_phase",
+    "time_frequency_range",
+)
 
 
 def _wrap(x, period=_TWO_PI):
@@ -155,12 +186,24 @@ class _Chart:
     """What the charts share: the intrinsic columns (``mass_ratio`` as ``ln
     q``), the polarisation amplitudes ``(alpha, beta)``, the ``(psi,
     phase)`` branch label, the automatic phase sign, the whitening and the
-    branch shares. A chart defines :meth:`fit` (which ends with
-    :meth:`_finish_fit`), :meth:`columns_of`, :meth:`_inverse` and its
-    column names."""
+    branch shares. A chart defines :meth:`fit` (which starts with
+    :meth:`_update_coordinates` and ends with :meth:`_finish_fit`),
+    :meth:`columns_of`, :meth:`_inverse`, its column names and the vertex
+    its arrival time is taken at (``_timing_vertex``).
+
+    :meth:`set_coordinates` swaps in the group proposals' coordinates of
+    the intrinsic parameters and of their couplings to the extrinsic ones
+    (see the module notes)."""
 
     #: prefix of the column names
     prefix = "chart_"
+    #: (charts pickled before the coordinates: none of them)
+    coordinates = None
+    doppler_vector = None
+    _spin = None
+    _tides = None
+    _time = None
+    _phase = None
 
     def _set_names(self, names, phase_sign, extrinsic_columns):
         self.names = list(names)
@@ -172,16 +215,174 @@ class _Chart:
         self.fixed_phase_sign = phase_sign
         self.phase_sign = -1 if phase_sign is None else phase_sign
         self.intrinsic = [n for n in self.names if n not in EXTRINSIC]
-        self.columns = [
-            f"{self.prefix}ln_{n}" if n in LOG_PARAMETERS else f"{self.prefix}{n}"
-            for n in self.intrinsic
-        ] + list(extrinsic_columns)
+        self._extrinsic_columns = list(extrinsic_columns)
+        self._set_columns()
         self.fitted = False
         self.fiducial = None
+
+    def _set_columns(self):
+        renamed = {n: f"ln_{n}" for n in LOG_PARAMETERS}
+        if self.doppler_vector is not None:
+            renamed["chirp_mass"] = "doppler_chirp_mass"
+        for rep in (self._spin, self._tides):
+            if rep is not None:
+                renamed.update(zip(rep.parameters, rep.prime_parameters))
+        self.columns = [
+            f"{self.prefix}{renamed.get(n, n)}" for n in self.intrinsic
+        ] + list(self._extrinsic_columns)
+
+    # -- coordinates ----------------------------------------------------
+    def set_coordinates(
+        self,
+        prior_bounds,
+        effective_spin=False,
+        effective_tidal_deformability=False,
+        doppler_vector=None,
+        time_reference_frequency=None,
+        time_to_merger=None,
+        waveform_phase=None,
+        time_frequency_range=(8.0, 300.0),
+    ):
+        """Sample in the group proposals' coordinates of the intrinsic
+        parameters (the same nessai-gw reparameterisations, see
+        :func:`nessai_gw.group_mixture.triangular_group_reparameterisations`).
+
+        ``effective_spin``: the aligned spins as ``(chi_eff_prime,
+        chi_diff_prime)``; ``effective_tidal_deformability``: the tides as
+        ``(lambda_tilde_prime, lambda_diff_prime)``; ``doppler_vector``
+        (``v / c`` of the Earth): the chirp mass in the Earth's frame,
+        ``chirp_mass (1 - n.v/c)``; ``time_reference_frequency`` (Hz or
+        ``"adaptive"``; with ``time_to_merger`` and
+        ``time_frequency_range``): the arrival time when the 22 mode passes
+        that frequency instead of at merger; ``waveform_phase``: the phase
+        at a reference frequency, ``phase + a(theta) / 2``, in ``(alpha,
+        beta)``. The reference frequencies and their fits are updated at
+        every :meth:`fit`, as the group proposals update them before every
+        training. The spins and tides do nothing without both parameters,
+        as there.
+
+        Parameters
+        ----------
+        prior_bounds : dict
+            The model's bounds (those of the spins and the tides are used).
+        """
+        names = set(self.names)
+        spins = ["chi_1", "chi_2"] if {"chi_1", "chi_2"} <= names else None
+        tides = ["lambda_1", "lambda_2"] if {"lambda_1", "lambda_2"} <= names else None
+        bounds = {n: [float(v) for v in prior_bounds[n]] for n in self.names}
+        if ((time_reference_frequency is not None or waveform_phase is not None)
+                and not {"chirp_mass", "mass_ratio"} <= names):
+            raise ValueError("time_reference_frequency and waveform_phase need "
+                             "'chirp_mass' and 'mass_ratio'")
+        if time_to_merger is not None and time_reference_frequency is None:
+            raise ValueError("time_to_merger needs time_reference_frequency")
+        if (effective_spin or effective_tidal_deformability) and "mass_ratio" not in names:
+            raise ValueError("effective_spin and effective_tidal_deformability "
+                             "need 'mass_ratio'")
+        if doppler_vector is not None and "chirp_mass" not in names:
+            raise ValueError("doppler_vector needs 'chirp_mass'")
+        frequency_range = [float(f) for f in time_frequency_range]
+        dv = None if doppler_vector is None else [float(v) for v in doppler_vector]
+        self.doppler_vector = None if dv is None else np.asarray(dv)
+        self._spin = (
+            EffectiveSpinReparameterisation(
+                parameters=spins, prior_bounds={n: bounds[n] for n in spins}
+            )
+            if effective_spin and spins else None
+        )
+        self._tides = (
+            EffectiveTidalDeformabilityReparameterisation(
+                parameters=tides, prior_bounds={n: bounds[n] for n in tides}
+            )
+            if effective_tidal_deformability and tides else None
+        )
+        self._time = (
+            DetectorCenterTimeReparameterisation(
+                parameters=["geocent_time"],
+                prior_bounds={"geocent_time": bounds["geocent_time"]},
+                vertex=self._timing_vertex,
+                reference_time=self.reference_time,
+                reference_frequency=time_reference_frequency,
+                frequency_range=frequency_range,
+                doppler_vector=dv,
+                spins=spins,
+                time_to_merger=time_to_merger,
+                tides=tides if time_to_merger is not None else None,
+            )
+            if time_reference_frequency is not None else None
+        )
+        self._phase = (
+            PolarisationPhaseReparameterisation(
+                parameters=["phase"],
+                prior_bounds={"phase": bounds["phase"]},
+                waveform_phase=waveform_phase,
+                frequency_range=frequency_range,
+                doppler_vector=dv,
+                spins=spins,
+                tides=tides,
+            )
+            if waveform_phase is not None else None
+        )
+        self.coordinates = {
+            k: v for k, v in dict(
+                effective_spin=self._spin is not None,
+                effective_tidal_deformability=self._tides is not None,
+                doppler_vector=dv,
+                time_reference_frequency=time_reference_frequency,
+                time_to_merger=time_to_merger,
+                waveform_phase=waveform_phase,
+            ).items() if v
+        }
+        self._set_columns()
+        self.fitted = False
+        return self
+
+    def _update_coordinates(self, x):
+        """Choose the reference frequencies and refit the time and phase
+        offsets on the points ``x`` (at the start of every :meth:`fit`)."""
+        for rep in (self._time, self._phase):
+            if rep is not None:
+                rep.update(x)
+
+    def _time_shift(self, x):
+        """``tau(f) - tau_ref`` (s), subtracted from the arrival time (0
+        with the time at merger)."""
+        return 0.0 if self._time is None else self._time._shift(x)
+
+    def _phase_shift(self, x):
+        """``a(theta) / 2`` (rad), added to the phase in ``(alpha, beta)``
+        (0 with the phase at merger)."""
+        return 0.0 if self._phase is None else self._phase._shift(x)
+
+    def _shifts_of(self, out):
+        """The time and phase shifts at the inverse's intrinsic parameters
+        and sky (``out``, a dict of arrays)."""
+        if self._time is None and self._phase is None:
+            return 0.0, 0.0
+        n = len(out["ra"])
+        x = np.empty(n, dtype=[(k, float) for k in out])
+        for k, v in out.items():
+            x[k] = v
+        return self._time_shift(x), self._phase_shift(x)
+
+    def _describe_coordinates(self):
+        parts = []
+        if self._time is not None and self._time.reference_frequency is not None:
+            parts.append(f"time at {self._time.reference_frequency:.1f} Hz")
+        if self._phase is not None:
+            f = self._phase.reference_frequency
+            parts.append("phase at merger" if f is None else f"phase at {f:.1f} Hz")
+        return "".join(p + "; " for p in parts)
 
     @property
     def dims(self):
         return len(self.columns)
+
+    @property
+    def n_labels(self):
+        """Number of discrete labels: the ``(psi, phase)`` branches (times
+        the ring's arcs, :class:`RingChart`)."""
+        return len(LATTICE)
 
     @staticmethod
     def _alpha_beta(theta_jn, distance, psi, phase, sign):
@@ -220,12 +421,12 @@ class _Chart:
         ``x`` (the rest of the fit done)."""
         self.mean = np.zeros(self.dims)
         self.chol = np.eye(self.dims)
-        self.log_p_k = np.zeros(len(LATTICE))
+        self.log_p_k = np.zeros(self.n_labels)
         self.log_det_whiten = 0.0
         self.fitted = True
         c, k, _ = self.columns_of(x)
-        counts = np.bincount(k, minlength=len(LATTICE))
-        self.p_k = (counts + 1.0) / (len(k) + len(LATTICE))
+        counts = np.bincount(k, minlength=self.n_labels)
+        self.p_k = (counts + 1.0) / (len(k) + self.n_labels)
         self.log_p_k = np.log(self.p_k)
         self.mean = c.mean(axis=0)
         cov = np.cov(c, rowvar=False)
@@ -235,23 +436,51 @@ class _Chart:
         return self
 
     def _intrinsic_columns(self, x):
-        cols, log_j = [], np.zeros(len(x))
+        """The intrinsic columns of ``x`` (a list) and their ``ln |dc/dx|``
+        (the Doppler chirp mass reads the sky)."""
+        cols, log_j = {}, np.zeros(len(x))
         for n in self.intrinsic:
             if n in LOG_PARAMETERS:
-                cols.append(np.log(x[n]))
+                cols[n] = np.log(x[n])
                 log_j -= np.log(x[n])
+            elif n == "chirp_mass" and self.doppler_vector is not None:
+                d = doppler_factor(x["ra"], x["dec"], self.doppler_vector)
+                cols[n] = np.asarray(x[n], dtype=float) * d
+                log_j += np.log(d)
             else:
-                cols.append(np.asarray(x[n], dtype=float))
-        return cols, log_j
+                cols[n] = np.asarray(x[n], dtype=float)
+        for rep in (self._spin, self._tides):
+            if rep is not None:
+                prime = {}
+                _, _, log_j = rep.reparameterise(x, prime, log_j)
+                for n, p in zip(rep.parameters, rep.prime_parameters):
+                    cols[n] = prime[p]
+        return [cols[n] for n in self.intrinsic], log_j
 
-    def _intrinsic_inverse(self, c):
+    def _intrinsic_inverse(self, c, ra=None, dec=None):
+        """The intrinsic parameters of the columns ``c`` (a dict) and the
+        forward ``ln |dc/dx|`` at them; ``ra``, ``dec`` for the Doppler
+        chirp mass (the sky is inverted first)."""
         out, log_j = {}, np.zeros(len(c))
         for i, n in enumerate(self.intrinsic):
             if n in LOG_PARAMETERS:
                 out[n] = np.exp(c[:, i])
                 log_j -= c[:, i]
+            elif n == "chirp_mass" and self.doppler_vector is not None:
+                d = doppler_factor(ra, dec, self.doppler_vector)
+                out[n] = c[:, i] / d
+                log_j += np.log(d)
             else:
                 out[n] = c[:, i]
+        for rep in (self._spin, self._tides):
+            if rep is not None:
+                prime = {
+                    p: c[:, self.intrinsic.index(n)]
+                    for n, p in zip(rep.parameters, rep.prime_parameters)
+                }
+                # the inverse returns minus the forward ln |dc/dx|
+                _, _, minus = rep.inverse_reparameterise(out, prime, np.zeros(len(c)))
+                log_j -= minus
         return out, log_j
 
     def forward(self, x):
@@ -322,6 +551,10 @@ class SheetChart(_Chart):
         self._set_names(names, phase_sign, SHEET_COLUMNS)
         self.ellipse = None
 
+    @property
+    def _timing_vertex(self):
+        return self.vertex
+
     # -- the sheet ------------------------------------------------------
     def _sheet(self, ra, dec):
         """``(alpha*, beta*)(n)`` of the fiducial pattern."""
@@ -347,6 +580,8 @@ class SheetChart(_Chart):
         and ``logL`` for the fiducial)."""
         x = np.atleast_1d(x)
         i = self._fiducial_index(x)
+        self._update_coordinates(x)
+        phase = x["phase"] + self._phase_shift(x)
         self.fiducial = {n: float(x[n][i]) for n in ("ra", "dec", "psi", "theta_jn")}
         self.ellipse = PolarisationEllipse(self.plane_normal, self.reference_time, self.fiducial)
         a0, b0 = self._sheet(x["ra"], x["dec"])
@@ -354,14 +589,14 @@ class SheetChart(_Chart):
         spread = {}
         for sign in signs:
             a, b = self._alpha_beta(
-                x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], sign
+                x["theta_jn"], x["luminosity_distance"], x["psi"], phase, sign
             )
             ra_, rb_ = a / a0, b / b0
             # circular spread of the residual phases (1 - mean resultant length)
             spread[sign] = 2 - abs(np.mean(ra_ / np.abs(ra_))) - abs(np.mean(rb_ / np.abs(rb_)))
         self._choose_sign(spread)
         a, b = self._alpha_beta(
-            x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], self.phase_sign
+            x["theta_jn"], x["luminosity_distance"], x["psi"], phase, self.phase_sign
         )
         self.ra_centre = _circular_mean(x["ra"])
         self.arg_a_offset = _circular_mean(np.angle(a / a0))
@@ -381,12 +616,14 @@ class SheetChart(_Chart):
         cols, log_j = self._intrinsic_columns(x)
         ra, dec = np.asarray(x["ra"], float), np.asarray(x["dec"], float)
         theta, dist = np.asarray(x["theta_jn"], float), np.asarray(x["luminosity_distance"], float)
-        psi, phase = np.asarray(x["psi"], float), np.asarray(x["phase"], float)
+        psi = np.asarray(x["psi"], float)
+        phase = np.asarray(x["phase"], float) + self._phase_shift(x)
         delay = geocenter_time_delay(self.vertex, self.gmst, ra, dec)
         cols += [
             _wrap(ra - self.ra_centre),
             np.sin(dec),
-            (np.asarray(x["geocent_time"], float) - self.reference_time) + delay,
+            (np.asarray(x["geocent_time"], float) - self.reference_time) + delay
+            - self._time_shift(x),
         ]
         log_j += np.log(np.cos(dec))
         a0, b0 = self._sheet(ra, dec)
@@ -405,7 +642,6 @@ class SheetChart(_Chart):
         """Unwhitened columns ``c`` and branch ``k`` -> the physical
         parameters, the rows in the chart's domain and ``ln |dc/dx|``."""
         n_int = len(self.intrinsic)
-        out, log_j = self._intrinsic_inverse(c)
         u, s, t, la, lb, r_a, r_b = (c[:, n_int + j] for j in range(7))
         valid = (
             (np.abs(s) < 1)
@@ -417,6 +653,8 @@ class SheetChart(_Chart):
         s = np.where(valid, s, 0.0)
         ra = np.remainder(u + self.ra_centre, _TWO_PI)
         dec = np.arcsin(s)
+        out, log_j = self._intrinsic_inverse(c, ra, dec)
+        t_shift, phase_shift = self._shifts_of(out | {"ra": ra, "dec": dec})
         delay = geocenter_time_delay(self.vertex, self.gmst, ra, dec)
         a0, b0 = self._sheet(ra, dec)
         abs_a = np.exp(np.where(valid, la, 0.0)) * np.abs(a0)
@@ -428,12 +666,12 @@ class SheetChart(_Chart):
         psi_c, phase_c = self._centre(a0, b0)
         dpsi, dphase = self._offsets(r_a, r_b)
         psi = np.remainder(psi_c + dpsi + LATTICE[k, 0], np.pi)
-        phase = np.remainder(phase_c + dphase + LATTICE[k, 1], _TWO_PI)
+        phase = np.remainder(phase_c + dphase + LATTICE[k, 1] - phase_shift, _TWO_PI)
         valid &= (sa > 0) & (sb > 0) & np.isfinite(dist) & (np.sin(theta) > 0)
         out.update(
             ra=ra,
             dec=dec,
-            geocent_time=self.reference_time + t - delay,
+            geocent_time=self.reference_time + t + t_shift - delay,
             theta_jn=theta,
             luminosity_distance=dist,
             psi=psi,
@@ -453,7 +691,7 @@ class SheetChart(_Chart):
         return (
             f"fiducial ra {self.fiducial['ra']:.3f} dec {self.fiducial['dec']:.3f} "
             f"theta_jn {self.fiducial['theta_jn']:.3f} psi {self.fiducial['psi']:.3f}; "
-            f"phase sign {self.phase_sign:+d}; branch shares "
+            + self._describe_coordinates() + f"phase sign {self.phase_sign:+d}; branch shares "
             f"{np.round(self.p_k, 3).tolist()}; sd " + self._column_sd()
         )
 
@@ -488,9 +726,20 @@ class RingChart(_Chart):
     The Jacobian of the amplitude block is
     ``|det M|^2 |alpha|^2 |beta|^2 32 / (d_L sin theta_jn) / (|A_1|^2
     |A_2|^2)``, of the sky ``cos dec``. The chart is singular where ``det M
-    = Z_1 conj(Z_2) - conj(Z_1) Z_2`` vanishes (the sky directions where the
-    two interferometers see the same polarisation): a set of measure zero,
-    and away from the ring for ET 2L.
+    = Z_1 conj(Z_2) - conj(Z_1) Z_2 = 2i Im(Z_1 conj(Z_2))`` vanishes (the
+    sky directions where the two interferometers see the same
+    polarisation), a set of measure zero which the ring crosses (for ET 2L
+    twice, about half a turn apart): there ``(alpha, beta)`` diverge, the
+    distance goes to zero and with it the prior, and ``cos theta_jn``
+    changes sign. The posterior along the ring is then separate arcs, which
+    one flow joins with leakage into the gaps between them (on the ET 2L
+    v78 run 40% of the draws, and the weight cap set by the live points on
+    their flanks: a population acceptance of ~2e-3). With ``arcs`` the ring
+    is cut at the crossings (refitted at every fit, along the ring at the
+    median angle to the baseline), the arc is a label with the ``(psi,
+    phase)`` branch and the azimuth column is the offset from the arc's
+    centre, so the arcs overlap in the chart (a shift: the Jacobian is
+    unchanged).
 
     Parameters
     ----------
@@ -508,17 +757,23 @@ class RingChart(_Chart):
         the prior is smooth at face-on and face-off; 0 is the plain chart.
         With ``t0 > 0`` the amplitude block's Jacobian is ``|det M|^2
         |alpha| |beta| 8 |c+ c-' - c- c+'| / d_L^3 / (|A_1|^2 |A_2|^2)``.
+    arcs : bool
+        Cut the ring into its arcs at the crossings of ``det M = 0`` (see
+        above).
     """
 
     prefix = "ring_"
-    #: (charts pickled before the option: the plain chart)
+    #: (charts pickled before the options: the plain chart)
     pole_regularisation = 0.0
+    arcs = False
+    arc_centres = None
 
     def __init__(self, tensors, vertices, reference_time, names, phase_sign=None,
-                 pole_regularisation=0.0):
+                 pole_regularisation=0.0, arcs=False):
         if not 0.0 <= pole_regularisation < np.sqrt(2.0):
             raise ValueError("pole_regularisation must be in [0, sqrt(2))")
         self.pole_regularisation = float(pole_regularisation)
+        self.arcs = bool(arcs)
         self.tensors = np.asarray(tensors, dtype=float)
         self.vertices = np.asarray(vertices, dtype=float)
         if self.tensors.shape != (2, 3, 3) or self.vertices.shape != (2, 3):
@@ -534,6 +789,45 @@ class RingChart(_Chart):
         self.e1 = e1 / np.linalg.norm(e1)
         self.e2 = np.cross(self.axis, self.e1)
         self._set_names(names, phase_sign, RING_COLUMNS)
+
+    @property
+    def _timing_vertex(self):
+        return self.vertices[0]
+
+    @property
+    def n_labels(self):
+        n_arcs = 1 if self.arc_centres is None else len(self.arc_centres)
+        return len(LATTICE) * n_arcs
+
+    # -- the arcs ---------------------------------------------------------
+    def _fit_arcs(self, x):
+        """The crossings of ``Im(Z_1 conj(Z_2)) = 0`` along the ring at the
+        median angle to the baseline of ``x``, and the arcs between them
+        (none, a single arc, if there are fewer than two)."""
+        self.arc_centres = self.arc_half_widths = None
+        if not self.arcs:
+            return
+        cos_alpha = float(np.median(self._ring(x["ra"], x["dec"])[1]))
+        grid = np.linspace(-np.pi, np.pi, 4097)[:-1]
+        z = self._response(*self._sky(grid, np.full(len(grid), cos_alpha)))
+        f = np.imag(z[:, 0] * np.conj(z[:, 1]))
+        f1 = np.roll(f, -1)
+        j = np.flatnonzero(np.sign(f) != np.sign(f1))
+        if len(j) < 2:
+            logger.warning("Ring chart: %d crossing(s) of det M = 0 along the ring: one arc", len(j))
+            return
+        step = grid[1] - grid[0]
+        bounds = np.sort(np.remainder(grid[j] + step * f[j] / (f[j] - f1[j]) + np.pi, _TWO_PI) - np.pi)
+        lengths = np.remainder(np.roll(bounds, -1) - bounds, _TWO_PI)
+        lengths[lengths == 0] = _TWO_PI
+        self.arc_half_widths = 0.5 * lengths
+        self.arc_centres = _wrap(bounds + self.arc_half_widths)
+
+    def _arc_of(self, azimuth):
+        """The arc each azimuth is on and its offset from the arc's centre."""
+        u = _wrap(np.asarray(azimuth, float)[:, None] - self.arc_centres[None, :])
+        j = np.argmax(self.arc_half_widths[None, :] - np.abs(u), axis=1)
+        return j, u[np.arange(len(j)), j]
 
     # -- the ring ---------------------------------------------------------
     def _ring(self, ra, dec):
@@ -642,20 +936,22 @@ class RingChart(_Chart):
         fiducial)."""
         x = np.atleast_1d(x)
         i = self._fiducial_index(x)
+        self._update_coordinates(x)
+        phase = x["phase"] + self._phase_shift(x)
         self.fiducial = {n: float(x[n][i]) for n in EXTRINSIC}
         z = self._response(x["ra"], x["dec"])
         signs = (self.fixed_phase_sign,) if self.fixed_phase_sign else (-1, 1)
         spread = {}
         for sign in signs:
             a, b = self._chart_alpha_beta(
-                x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], sign
+                x["theta_jn"], x["luminosity_distance"], x["psi"], phase, sign
             )
             r = self._amplitudes(z, a, b)
             r = r / r[i]
             spread[sign] = 2 - sum(abs(np.mean(r[:, j] / np.abs(r[:, j]))) for j in range(2))
         self._choose_sign(spread)
         a, b = self._chart_alpha_beta(
-            x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], self.phase_sign
+            x["theta_jn"], x["luminosity_distance"], x["psi"], phase, self.phase_sign
         )
         amps = self._amplitudes(z, a, b)
         self.reference_amplitudes = amps[i].copy()
@@ -664,6 +960,7 @@ class RingChart(_Chart):
         r = amps / self.reference_amplitudes
         self.arg_offsets = np.array([_circular_mean(np.angle(r[:, j])) for j in range(2)])
         self.azimuth_centre = _circular_mean(self._ring(x["ra"], x["dec"])[0])
+        self._fit_arcs(x)
         return self._finish_fit(x)
 
     # -- maps -------------------------------------------------------------
@@ -674,17 +971,22 @@ class RingChart(_Chart):
         cols, log_j = self._intrinsic_columns(x)
         ra, dec = np.asarray(x["ra"], float), np.asarray(x["dec"], float)
         theta, dist = np.asarray(x["theta_jn"], float), np.asarray(x["luminosity_distance"], float)
-        psi, phase = np.asarray(x["psi"], float), np.asarray(x["phase"], float)
+        psi = np.asarray(x["psi"], float)
+        phase = np.asarray(x["phase"], float) + self._phase_shift(x)
         azimuth, cos_alpha = self._ring(ra, dec)
         time = (np.asarray(x["geocent_time"], float) - self.reference_time) + (
             geocenter_time_delay(self.vertices[0], self.gmst, ra, dec)
-        )
+        ) - self._time_shift(x)
         z = self._response(ra, dec)
         a, b = self._chart_alpha_beta(theta, dist, psi, phase, self.phase_sign)
         amps = self._amplitudes(z, a, b)
         r = amps / self.reference_amplitudes
+        if self.arc_centres is None:
+            arc, offset = 0, _wrap(azimuth - self.azimuth_centre)
+        else:
+            arc, offset = self._arc_of(azimuth)
         cols += [
-            _wrap(azimuth - self.azimuth_centre),
+            offset,
             cos_alpha,
             time,
             np.log(np.abs(r[:, 0])),
@@ -694,14 +996,13 @@ class RingChart(_Chart):
         ]
         log_j += np.log(np.cos(dec)) + self._amplitude_log_j(z, a, b, amps, dist, theta)
         psi_c, phase_c = self._centre(a, b)
-        k = self._label(psi - psi_c, phase - phase_c)
+        k = self._label(psi - psi_c, phase - phase_c) + len(LATTICE) * arc
         return np.stack(cols, axis=1), k, log_j
 
     def _inverse(self, c, k):
         """Unwhitened columns ``c`` and branch ``k`` -> the physical
         parameters, the rows in the chart's domain and ``ln |dc/dx|``."""
         n_int = len(self.intrinsic)
-        out, log_j = self._intrinsic_inverse(c)
         u, s, t, l1, l2, r1, r2 = (c[:, n_int + j] for j in range(7))
         valid = (
             (np.abs(s) < 1)
@@ -711,7 +1012,16 @@ class RingChart(_Chart):
             & np.all(np.isfinite(c), axis=1)
         )
         s = np.where(valid, s, 0.0)
-        ra, dec = self._sky(np.where(valid, u, 0.0) + self.azimuth_centre, s)
+        if self.arc_centres is None:
+            centre = self.azimuth_centre
+        else:
+            arc = k // len(LATTICE)
+            centre = self.arc_centres[arc]
+            valid &= np.abs(u) < self.arc_half_widths[arc]
+        k = k % len(LATTICE)
+        ra, dec = self._sky(np.where(valid, u, 0.0) + centre, s)
+        out, log_j = self._intrinsic_inverse(c, ra, dec)
+        t_shift, phase_shift = self._shifts_of(out | {"ra": ra, "dec": dec})
         z = self._response(ra, dec)
         logs = np.stack([np.where(valid, l1, 0.0), np.where(valid, l2, 0.0)], axis=1)
         args = np.stack([r1, r2], axis=1) + self.arg_offsets
@@ -734,13 +1044,13 @@ class RingChart(_Chart):
         out.update(
             ra=ra,
             dec=dec,
-            geocent_time=self.reference_time + t - geocenter_time_delay(
+            geocent_time=self.reference_time + t + t_shift - geocenter_time_delay(
                 self.vertices[0], self.gmst, ra, dec
             ),
             theta_jn=theta,
             luminosity_distance=dist,
             psi=np.remainder(psi_c + LATTICE[k, 0], np.pi),
-            phase=np.remainder(phase_c + LATTICE[k, 1], _TWO_PI),
+            phase=np.remainder(phase_c + LATTICE[k, 1] - phase_shift, _TWO_PI),
         )
         log_j += np.log(np.cos(dec)) + self._amplitude_log_j(z, a, b, amps, dist, theta)
         return out, valid, log_j
@@ -752,6 +1062,11 @@ class RingChart(_Chart):
             f"ring azimuth centre {self.azimuth_centre:.3f}; "
             + (f"pole regularisation {self.pole_regularisation:g}; "
                if self.pole_regularisation else "")
+            + (f"arcs at {np.round(self.arc_centres, 2).tolist()} (half widths "
+               f"{np.round(self.arc_half_widths, 2).tolist()}, shares "
+               f"{np.round(self.p_k.reshape(-1, len(LATTICE)).sum(1), 3).tolist()}); "
+               if self.arc_centres is not None else "")
+            + self._describe_coordinates()
             + f"phase sign "
             f"{self.phase_sign:+d}; branch shares {np.round(self.p_k, 3).tolist()}; "
             f"sd " + self._column_sd()
@@ -814,6 +1129,10 @@ class SingleChart(_Chart):
         self.gmst = greenwich_mean_sidereal_time(self.reference_time)
         self._set_names(names, phase_sign, SINGLE_COLUMNS)
 
+    @property
+    def _timing_vertex(self):
+        return self.vertex
+
     def _response(self, ra, dec):
         return _complex_response(
             self.tensor[None], np.atleast_1d(ra), np.atleast_1d(dec), self.gmst
@@ -842,19 +1161,21 @@ class SingleChart(_Chart):
         fiducial)."""
         x = np.atleast_1d(x)
         i = self._fiducial_index(x)
+        self._update_coordinates(x)
+        phase = x["phase"] + self._phase_shift(x)
         self.fiducial = {n: float(x[n][i]) for n in EXTRINSIC}
         z = self._response(x["ra"], x["dec"])
         signs = (self.fixed_phase_sign,) if self.fixed_phase_sign else (-1, 1)
         spread = {}
         for sign in signs:
             amp = self._amplitude(
-                z, x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], sign
+                z, x["theta_jn"], x["luminosity_distance"], x["psi"], phase, sign
             )
             r = amp / amp[i]
             spread[sign] = 1 - abs(np.mean(r / np.abs(r)))
         self._choose_sign(spread)
         amp = self._amplitude(
-            z, x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], self.phase_sign
+            z, x["theta_jn"], x["luminosity_distance"], x["psi"], phase, self.phase_sign
         )
         self.reference_amplitude = complex(amp[i])
         self.arg_offset = _circular_mean(np.angle(amp / self.reference_amplitude))
@@ -870,7 +1191,8 @@ class SingleChart(_Chart):
         cols, log_j = self._intrinsic_columns(x)
         ra, dec = np.asarray(x["ra"], float), np.asarray(x["dec"], float)
         theta, dist = np.asarray(x["theta_jn"], float), np.asarray(x["luminosity_distance"], float)
-        psi, phase = np.asarray(x["psi"], float), np.asarray(x["phase"], float)
+        psi = np.asarray(x["psi"], float)
+        phase = np.asarray(x["phase"], float) + self._phase_shift(x)
         z = self._response(ra, dec)
         amp = self._amplitude(z, theta, dist, psi, phase, self.phase_sign)
         r = amp / self.reference_amplitude
@@ -879,7 +1201,8 @@ class SingleChart(_Chart):
             _wrap(ra - self.ra_centre),
             np.sin(dec),
             (np.asarray(x["geocent_time"], float) - self.reference_time)
-            + geocenter_time_delay(self.vertex, self.gmst, ra, dec),
+            + geocenter_time_delay(self.vertex, self.gmst, ra, dec)
+            - self._time_shift(x),
             np.cos(theta),
             w,
             np.log(np.abs(r)),
@@ -894,7 +1217,6 @@ class SingleChart(_Chart):
         """Unwhitened columns ``c`` and branch ``k`` -> the physical
         parameters, the rows in the chart's domain and ``ln |dc/dx|``."""
         n_int = len(self.intrinsic)
-        out, log_j = self._intrinsic_inverse(c)
         u, s, t, ct, w, la, r = (c[:, n_int + j] for j in range(7))
         valid = (
             (np.abs(s) < 1)
@@ -908,6 +1230,8 @@ class SingleChart(_Chart):
         ct = np.where(valid, ct, 0.0)
         ra = np.remainder(u + self.ra_centre, _TWO_PI)
         dec = np.arcsin(s)
+        out, log_j = self._intrinsic_inverse(c, ra, dec)
+        t_shift, phase_shift = self._shifts_of(out | {"ra": ra, "dec": dec})
         z = self._response(ra, dec)
         theta = np.arccos(ct)
         amp = self.reference_amplitude * np.exp(
@@ -920,13 +1244,13 @@ class SingleChart(_Chart):
         out.update(
             ra=ra,
             dec=dec,
-            geocent_time=self.reference_time + t - geocenter_time_delay(
+            geocent_time=self.reference_time + t + t_shift - geocenter_time_delay(
                 self.vertex, self.gmst, ra, dec
             ),
             theta_jn=theta,
             luminosity_distance=dist,
             psi=np.remainder(psi0 + LATTICE[k, 0], np.pi),
-            phase=np.remainder(phase0 + LATTICE[k, 1], _TWO_PI),
+            phase=np.remainder(phase0 + LATTICE[k, 1] - phase_shift, _TWO_PI),
         )
         log_j += np.log(np.cos(dec)) + np.log(8.0) + np.log(np.sin(theta)) - np.log(dist)
         valid &= np.isfinite(dist) & (dist > 0) & (np.sin(theta) > 0)
@@ -936,7 +1260,8 @@ class SingleChart(_Chart):
         if not self.fitted:
             return "unfitted"
         return (
-            f"phase sign {self.phase_sign:+d}; branch shares "
+            self._describe_coordinates()
+            + f"phase sign {self.phase_sign:+d}; branch shares "
             f"{np.round(self.p_k, 3).tolist()}; sd " + self._column_sd()
         )
 
@@ -959,6 +1284,9 @@ class ChartFlowProposal(FlowProposal):
     flow_config, training_config : dict, optional
         Of the flow; resuming keeps them (the sampler passes the
         configuration of its main proposal).
+    coordinates : dict, optional
+        Keywords of :meth:`_Chart.set_coordinates` (the model's bounds are
+        added): the group proposals' intrinsic coordinates.
     kwargs
         Passed to :class:`nessai.proposal.FlowProposal`.
     """
@@ -969,13 +1297,16 @@ class ChartFlowProposal(FlowProposal):
     #: sky frame
     splittable = False
 
-    def __init__(self, model, chart, flow_config=None, training_config=None, **kwargs):
+    def __init__(self, model, chart, flow_config=None, training_config=None,
+                 coordinates=None, **kwargs):
         super().__init__(
             model,
             flow_config=copy.deepcopy(flow_config),
             training_config=copy.deepcopy(training_config),
             **kwargs,
         )
+        if coordinates:
+            chart.set_coordinates(model.bounds, **coordinates)
         self.chart = chart
         # (named for the sheet chart, which came first: kept for its checkpoints)
         self.sheet_flow_config = copy.deepcopy(flow_config or {})
@@ -1042,7 +1373,7 @@ class ChartFlowProposal(FlowProposal):
     def inverse_rescale(self, x_prime, return_unit_hypercube=False, **kwargs):
         y = live_points_to_array(x_prime, self.prime_parameters, copy=True)
         y = np.atleast_2d(y).reshape(len(x_prime), -1)
-        k = self.rng.choice(len(LATTICE), size=len(y), p=self.chart.p_k)
+        k = self.rng.choice(len(self.chart.p_k), size=len(y), p=self.chart.p_k)
         out, valid, log_j = self.chart.inverse(y, k)
         x = empty_structured_array(len(y), dtype=self.x_dtype)
         for n in self.parameters:
@@ -1107,9 +1438,10 @@ class SheetChartFlowProposal(ChartFlowProposal):
     """
 
     def __init__(self, model, plane_normal, vertex, reference_time, phase_sign=None,
-                 flow_config=None, training_config=None, **kwargs):
+                 flow_config=None, training_config=None, coordinates=None, **kwargs):
         chart = SheetChart(plane_normal, vertex, reference_time, model.names, phase_sign)
-        super().__init__(model, chart, flow_config, training_config, **kwargs)
+        super().__init__(model, chart, flow_config, training_config,
+                         coordinates=coordinates, **kwargs)
 
 
 class RingChartFlowProposal(ChartFlowProposal):
@@ -1119,23 +1451,25 @@ class RingChartFlowProposal(ChartFlowProposal):
     Parameters
     ----------
     model : :obj:`nessai.model.Model`
-    tensors, vertices, reference_time, phase_sign, pole_regularisation
+    tensors, vertices, reference_time, phase_sign, pole_regularisation, arcs
         As for :class:`RingChart`.
     flow_config, training_config
         Default :data:`DEFAULT_FLOW_CONFIG`, :data:`DEFAULT_TRAINING_CONFIG`.
-    kwargs
+    coordinates, kwargs
         As for :class:`ChartFlowProposal`.
     """
 
     def __init__(self, model, tensors, vertices, reference_time, phase_sign=None,
-                 pole_regularisation=0.0, flow_config=None, training_config=None, **kwargs):
+                 pole_regularisation=0.0, flow_config=None, training_config=None,
+                 coordinates=None, arcs=False, **kwargs):
         chart = RingChart(tensors, vertices, reference_time, model.names, phase_sign,
-                          pole_regularisation)
+                          pole_regularisation, arcs)
         super().__init__(
             model,
             chart,
             flow_config or DEFAULT_FLOW_CONFIG,
             training_config or DEFAULT_TRAINING_CONFIG,
+            coordinates=coordinates,
             **kwargs,
         )
 
@@ -1152,20 +1486,35 @@ class SingleChartFlowProposal(ChartFlowProposal):
         As for :class:`SingleChart`.
     flow_config, training_config
         Default :data:`DEFAULT_FLOW_CONFIG`, :data:`DEFAULT_TRAINING_CONFIG`.
-    kwargs
+    coordinates, kwargs
         As for :class:`ChartFlowProposal`.
     """
 
     def __init__(self, model, tensor, vertex, reference_time, phase_sign=None,
-                 flow_config=None, training_config=None, **kwargs):
+                 flow_config=None, training_config=None, coordinates=None, **kwargs):
         chart = SingleChart(tensor, vertex, reference_time, model.names, phase_sign)
         super().__init__(
             model,
             chart,
             flow_config or DEFAULT_FLOW_CONFIG,
             training_config or DEFAULT_TRAINING_CONFIG,
+            coordinates=coordinates,
             **kwargs,
         )
+
+
+def _coordinates(coordinates):
+    """``coordinates`` checked and JSON-able (it goes to nessai's config)."""
+    if not coordinates:
+        return None
+    unknown = sorted(set(coordinates) - set(COORDINATES))
+    if unknown:
+        raise ValueError(f"unknown chart coordinates {unknown}")
+    out = dict(coordinates)
+    for key in ("doppler_vector", "time_frequency_range"):
+        if out.get(key) is not None:
+            out[key] = [float(v) for v in out[key]]
+    return out
 
 
 def _bound_proposal_class(base, geometry, class_name):
@@ -1190,7 +1539,7 @@ def _bound_proposal_class(base, geometry, class_name):
 
 
 def single_chart_proposal_class(
-    tensor, vertex, reference_time, phase_sign=None,
+    tensor, vertex, reference_time, phase_sign=None, coordinates=None,
     class_name="BoundSingleChartFlowProposal",
 ):
     """A :class:`SingleChartFlowProposal` subclass with the interferometer's
@@ -1200,13 +1549,14 @@ def single_chart_proposal_class(
         vertex=np.asarray(vertex, dtype=float).tolist(),
         reference_time=float(reference_time),
         phase_sign=phase_sign,
+        coordinates=_coordinates(coordinates),
     )
     return _bound_proposal_class(SingleChartFlowProposal, geometry, class_name)
 
 
 def ring_chart_proposal_class(
     tensors, vertices, reference_time, phase_sign=None, pole_regularisation=0.0,
-    class_name="BoundRingChartFlowProposal",
+    coordinates=None, arcs=False, class_name="BoundRingChartFlowProposal",
 ):
     """A :class:`RingChartFlowProposal` subclass with the network's geometry
     bound, for nessai's ``flow_proposal_class``: nessai (and bilby's nessai
@@ -1218,8 +1568,10 @@ def ring_chart_proposal_class(
 
     Parameters
     ----------
-    tensors, vertices, reference_time, phase_sign, pole_regularisation
+    tensors, vertices, reference_time, phase_sign, pole_regularisation, arcs
         As for :class:`RingChart`.
+    coordinates : dict, optional
+        As for :class:`ChartFlowProposal`.
     class_name : str
         Name of the class at module scope.
     """
@@ -1229,6 +1581,8 @@ def ring_chart_proposal_class(
         reference_time=float(reference_time),
         phase_sign=phase_sign,
         pole_regularisation=float(pole_regularisation),
+        coordinates=_coordinates(coordinates),
+        **({"arcs": True} if arcs else {}),
     )
     return _bound_proposal_class(RingChartFlowProposal, geometry, class_name)
 
@@ -1245,6 +1599,8 @@ class SheetChartRegions:
         As for :class:`SheetChart`.
     max_abs_cos_theta_jn : float
         The criterion above.
+    coordinates : dict, optional
+        As for :class:`ChartFlowProposal`.
     flow_config, training_config : dict, optional
         Of the new proposal's flow (default :data:`DEFAULT_FLOW_CONFIG`,
         :data:`DEFAULT_TRAINING_CONFIG`).
@@ -1269,6 +1625,7 @@ class SheetChartRegions:
         max_abs_cos_theta_jn=0.5,
         flow_config=None,
         training_config=None,
+        coordinates=None,
     ):
         self.plane_normal = [float(v) for v in plane_normal]
         self.vertex = [float(v) for v in vertex]
@@ -1277,6 +1634,7 @@ class SheetChartRegions:
         self.max_abs_cos_theta_jn = float(max_abs_cos_theta_jn)
         self.flow_config = dict(flow_config or DEFAULT_FLOW_CONFIG)
         self.training_config = dict(training_config or DEFAULT_TRAINING_CONFIG)
+        self.coordinates = _coordinates(coordinates)
 
     def wants(self, live_points):
         cos = np.abs(np.cos(np.asarray(live_points["theta_jn"], float)))
@@ -1300,6 +1658,7 @@ class SheetChartRegions:
             phase_sign=self.phase_sign,
             flow_config=self.flow_config,
             training_config=self.training_config,
+            coordinates=getattr(self, "coordinates", None),
             poolsize=getattr(clone, "_poolsize", None),
             update_poolsize=getattr(clone, "update_poolsize", True),
             max_poolsize_scale=getattr(clone, "max_poolsize_scale", 10),

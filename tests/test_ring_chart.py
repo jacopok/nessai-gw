@@ -345,3 +345,34 @@ def test_bound_proposal_class_pole_regularisation(tmp_path):
     assert prop.chart.pole_regularisation == 0.1
     copy = pickle.loads(pickle.dumps(prop))
     assert copy.chart.pole_regularisation == 0.1
+
+
+def test_arcs_round_trip_and_labels():
+    """With ``arcs`` the ring is cut at the two crossings of det M = 0; the
+    chart stays exact and the arc is a label next to the branch."""
+    x, _ = ring_points(n=1500, spread=1.2)
+    chart = RingChart(TENSORS, VERTICES, T0, NAMES, phase_sign=-1, pole_regularisation=0.1,
+                      arcs=True).fit(x)
+    assert len(chart.arc_centres) == 2
+    assert chart.n_labels == 8 and len(chart.p_k) == 8
+    np.testing.assert_allclose(chart.arc_half_widths.sum(), np.pi)
+    y, k, log_j = chart.forward(x)
+    out, valid, log_j_inv = chart.inverse(y, k)
+    assert valid.all()
+    np.testing.assert_allclose(log_j, log_j_inv, atol=1e-8)
+    for n in NAMES:
+        period = {"ra": 2 * np.pi, "psi": np.pi, "phase": 2 * np.pi}.get(n)
+        d = _wrap(x[n] - out[n], period) if period else x[n] - out[n]
+        assert np.max(np.abs(d)) < 1e-7 * max(1.0, np.max(np.abs(x[n]))), n
+    # each point's arc is the one its azimuth is on
+    arc, _ = chart._arc_of(chart._ring(x["ra"], x["dec"])[0])
+    np.testing.assert_array_equal(k // len(LATTICE), arc)
+    # the azimuth column is relative to the arc's centre: beyond its half
+    # width a draw is outside the chart
+    c = chart.columns_of(x[:1])[0].copy()
+    i = chart.columns.index("ring_azimuth")
+    c[0, i] = chart.arc_half_widths[0] + 0.01
+    assert not chart._inverse(c, np.array([0]))[1][0]
+    # without arcs: one arc, the plain chart's labels
+    plain = RingChart(TENSORS, VERTICES, T0, NAMES, phase_sign=-1, pole_regularisation=0.1).fit(x)
+    assert plain.arc_centres is None and plain.n_labels == len(LATTICE)
