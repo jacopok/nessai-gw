@@ -267,3 +267,81 @@ def test_branches_are_the_lattice():
         assert np.max(np.abs(_wrap(out["phase"] - xg["phase"]))) < 1e-8
         labels.append(k)
     assert np.all(np.sort(np.stack(labels), axis=0) == np.arange(4)[:, None])
+
+
+def pole_points(n=40, seed=1):
+    """Points within 0.2 rad of face-on and of face-off, anywhere on the sky."""
+    rng = np.random.default_rng(seed)
+    x, _ = ring_points(n=n, seed=seed)
+    theta = rng.uniform(1e-3, 0.2, n)
+    x["theta_jn"] = np.where(np.arange(n) % 2, theta, np.pi - theta)
+    x["ra"] = rng.uniform(0, 2 * np.pi, n)
+    x["dec"] = np.arcsin(rng.uniform(-0.9, 0.9, n))
+    x["psi"] = rng.uniform(0, np.pi, n)
+    x["phase"] = rng.uniform(0, 2 * np.pi, n)
+    return x
+
+
+def test_pole_regularisation_round_trip_and_jacobian():
+    x, _ = ring_points()
+    chart = RingChart(TENSORS, VERTICES, T0, NAMES, phase_sign=-1, pole_regularisation=0.1).fit(x)
+    for pts in (x, pole_points()):
+        y, k, log_j = chart.forward(pts)
+        out, valid, log_j_inv = chart.inverse(y, k)
+        assert valid.all()
+        np.testing.assert_allclose(log_j, log_j_inv, atol=1e-8)
+        for n in NAMES:
+            period = {"ra": 2 * np.pi, "psi": np.pi, "phase": 2 * np.pi}.get(n)
+            d = _wrap(pts[n] - out[n], period) if period else pts[n] - out[n]
+            assert np.max(np.abs(d)) < 1e-7 * max(1.0, np.max(np.abs(pts[n]))), n
+    pts = pole_points()
+    for i in (0, 1, 7):
+        p0 = pts[i : i + 1]
+        c0, _, lj = chart.columns_of(p0)
+        jac = np.zeros((len(NAMES), len(NAMES)))
+        for j, n in enumerate(NAMES):
+            p = p0.copy()
+            h = 1e-3 if n == "geocent_time" else 1e-7 * max(1.0, abs(float(p0[n][0])))
+            p[n] = p0[n] + h
+            jac[:, j] = (chart.columns_of(p)[0][0] - c0[0]) / h
+        assert abs(np.linalg.slogdet(jac)[1] - lj[0]) < 1e-3
+
+
+def test_pole_regularisation_smooths_the_prior():
+    """The isotropic prior's density in the chart, sin(theta_jn) / |dc/dx|,
+    is ~ theta_jn^-6 towards face-on in the plain chart and flat with the
+    regularisation."""
+    x, _ = ring_points()
+    p = np.repeat(x[:1], 3)
+    p["theta_jn"] = [1e-2, 1e-3, np.pi - 1e-3]
+    for t0, step in ((0.0, 6 * np.log(10)), (0.1, 0.0)):
+        chart = RingChart(TENSORS, VERTICES, T0, NAMES, phase_sign=-1, pole_regularisation=t0).fit(x)
+        _, _, log_j = chart.columns_of(p)
+        log_density = np.log(np.sin(p["theta_jn"])) - log_j
+        assert abs(log_density[1] - log_density[0] - step) < 0.05
+        if t0:
+            assert abs(log_density[2] - log_density[1]) < 5
+
+
+def test_pole_regularisation_off_is_the_plain_chart():
+    x, _ = ring_points()
+    plain = make_chart(-1).fit(x)
+    zero = RingChart(TENSORS, VERTICES, T0, NAMES, phase_sign=-1, pole_regularisation=0.0).fit(x)
+    for a, b in zip(plain.forward(x), zero.forward(x)):
+        np.testing.assert_array_equal(a, b)
+    # a chart pickled before the option has no instance attribute
+    state = pickle.loads(pickle.dumps(plain))
+    del state.__dict__["pole_regularisation"]
+    for a, b in zip(plain.forward(x), state.forward(x)):
+        np.testing.assert_array_equal(a, b)
+    with pytest.raises(ValueError, match="pole_regularisation"):
+        RingChart(TENSORS, VERTICES, T0, NAMES, pole_regularisation=1.5)
+
+
+def test_bound_proposal_class_pole_regularisation(tmp_path):
+    cls = ring_chart_proposal_class(TENSORS, VERTICES, T0, phase_sign=-1, pole_regularisation=0.1,
+                                    class_name="BoundRingChartFlowProposalPole")
+    prop = cls(RingModel(), poolsize=100, plot=False, output=str(tmp_path))
+    assert prop.chart.pole_regularisation == 0.1
+    copy = pickle.loads(pickle.dumps(prop))
+    assert copy.chart.pole_regularisation == 0.1

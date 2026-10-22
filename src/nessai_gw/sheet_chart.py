@@ -72,6 +72,18 @@ residuals are 0.02-0.03 wide while psi and phase cover their circles; the
 chart is valid over the whole sky but where ``det M`` vanishes, so
 :class:`RingChartFlowProposal` is a whole run's proposal.
 
+At face-on ``|beta| = sin^4(theta_jn / 2) / d_L`` vanishes as
+``theta_jn^4``, so the isotropic prior has a ``|beta|^(-3/2)`` spike on
+``beta = 0`` in the amplitude columns (and on ``alpha = 0`` at face-off),
+which a flow does not follow: on the ET 2L v78 run the face-on live points
+had weights ``e^9`` above the rest and the run lost three quarters of the
+posterior at ``|cos theta_jn| > 0.95``. ``pole_regularisation`` (``t0``)
+builds the amplitudes from ``c+ = C^4 + t0 C S^3`` and ``c- = S^4 + t0 S
+C^3`` (``S, C`` the sine and cosine of ``theta_jn / 2``) instead of ``C^4,
+S^4``: ``|beta|`` then grows as ``t0 theta_jn / 2`` and the prior is smooth
+at the poles, while away from them (``tan(theta_jn / 2)^3 >> t0``) the
+chart is the plain one.
+
 One interferometer
 ------------------
 A single interferometer (CE) measures one complex amplitude and an
@@ -490,11 +502,23 @@ class RingChart(_Chart):
         first.
     reference_time, names, phase_sign
         As for :class:`SheetChart`.
+    pole_regularisation : float
+        ``t0`` in ``[0, sqrt(2))`` (see the module notes): the amplitudes
+        built from ``c+ = C^4 + t0 C S^3``, ``c- = S^4 + t0 S C^3`` so that
+        the prior is smooth at face-on and face-off; 0 is the plain chart.
+        With ``t0 > 0`` the amplitude block's Jacobian is ``|det M|^2
+        |alpha| |beta| 8 |c+ c-' - c- c+'| / d_L^3 / (|A_1|^2 |A_2|^2)``.
     """
 
     prefix = "ring_"
+    #: (charts pickled before the option: the plain chart)
+    pole_regularisation = 0.0
 
-    def __init__(self, tensors, vertices, reference_time, names, phase_sign=None):
+    def __init__(self, tensors, vertices, reference_time, names, phase_sign=None,
+                 pole_regularisation=0.0):
+        if not 0.0 <= pole_regularisation < np.sqrt(2.0):
+            raise ValueError("pole_regularisation must be in [0, sqrt(2))")
+        self.pole_regularisation = float(pole_regularisation)
         self.tensors = np.asarray(tensors, dtype=float)
         self.vertices = np.asarray(vertices, dtype=float)
         if self.tensors.shape != (2, 3, 3) or self.vertices.shape != (2, 3):
@@ -538,6 +562,43 @@ class RingChart(_Chart):
     def _amplitudes(z, a, b):
         return a[:, None] * z + b[:, None] * np.conj(z)
 
+    def _moduli(self, theta):
+        """``c+, c-`` and their derivatives in ``theta_jn``."""
+        h = 0.5 * np.asarray(theta, dtype=float)
+        s, c, t0 = np.sin(h), np.cos(h), self.pole_regularisation
+        cp, cm = c**4 + t0 * c * s**3, s**4 + t0 * s * c**3
+        dcp = 0.5 * (-4.0 * c**3 * s + t0 * (3.0 * c**2 * s**2 - s**4))
+        dcm = 0.5 * (4.0 * s**3 * c + t0 * (c**4 - 3.0 * s**2 * c**2))
+        return cp, cm, dcp, dcm
+
+    def _chart_alpha_beta(self, theta, distance, psi, phase, sign):
+        """``(alpha, beta)`` with the chart's moduli (the plain ones without
+        pole regularisation)."""
+        a, b = self._alpha_beta(theta, distance, psi, phase, sign)
+        if not self.pole_regularisation:
+            return a, b
+        cp, cm, _, _ = self._moduli(theta)
+        return cp / distance * np.exp(1j * np.angle(a)), cm / distance * np.exp(1j * np.angle(b))
+
+    def _theta_of(self, a, b):
+        """``theta_jn`` from the chart's ``(alpha, beta)``: ``|beta| / |alpha|
+        = (u^4 + t0 u) / (1 + t0 u^3)``, ``u = tan(theta_jn / 2)``, monotone
+        in ``u`` for ``t0 < sqrt(2)`` (bisection in ``ln u``, then Newton)."""
+        t0 = self.pole_regularisation
+        rho = np.abs(b) / np.abs(a)
+        rho = np.where(np.isfinite(rho), rho, 1.0)
+        lo, hi = np.full(rho.shape, -40.0), np.full(rho.shape, 40.0)
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            u = np.exp(mid)
+            below = (u**4 + t0 * u) < rho * (1.0 + t0 * u**3)
+            lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
+        u = np.exp(0.5 * (lo + hi))
+        for _ in range(3):
+            g = u**4 - rho * t0 * u**3 + t0 * u - rho
+            u = u - g / (4.0 * u**3 - 3.0 * rho * t0 * u**2 + t0)
+        return 2.0 * np.arctan(u)
+
     @staticmethod
     def _det(z):
         return z[:, 0] * np.conj(z[:, 1]) - np.conj(z[:, 0]) * z[:, 1]
@@ -551,6 +612,18 @@ class RingChart(_Chart):
         return 0.25 * (B - A), 0.25 * self.phase_sign * (A + B)
 
     def _amplitude_log_j(self, z, a, b, amps, distance, theta):
+        if self.pole_regularisation:
+            cp, cm, dcp, dcm = self._moduli(theta)
+            return (
+                2 * np.log(np.abs(self._det(z)))
+                + np.log(np.abs(a))
+                + np.log(np.abs(b))
+                + np.log(8.0)
+                + np.log(np.abs(cp * dcm - cm * dcp))
+                - 3 * np.log(distance)
+                - 2 * np.log(np.abs(amps[:, 0]))
+                - 2 * np.log(np.abs(amps[:, 1]))
+            )
         return (
             2 * np.log(np.abs(self._det(z)))
             + 2 * np.log(np.abs(a))
@@ -574,14 +647,14 @@ class RingChart(_Chart):
         signs = (self.fixed_phase_sign,) if self.fixed_phase_sign else (-1, 1)
         spread = {}
         for sign in signs:
-            a, b = self._alpha_beta(
+            a, b = self._chart_alpha_beta(
                 x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], sign
             )
             r = self._amplitudes(z, a, b)
             r = r / r[i]
             spread[sign] = 2 - sum(abs(np.mean(r[:, j] / np.abs(r[:, j]))) for j in range(2))
         self._choose_sign(spread)
-        a, b = self._alpha_beta(
+        a, b = self._chart_alpha_beta(
             x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], self.phase_sign
         )
         amps = self._amplitudes(z, a, b)
@@ -607,7 +680,7 @@ class RingChart(_Chart):
             geocenter_time_delay(self.vertices[0], self.gmst, ra, dec)
         )
         z = self._response(ra, dec)
-        a, b = self._alpha_beta(theta, dist, psi, phase, self.phase_sign)
+        a, b = self._chart_alpha_beta(theta, dist, psi, phase, self.phase_sign)
         amps = self._amplitudes(z, a, b)
         r = amps / self.reference_amplitudes
         cols += [
@@ -646,11 +719,18 @@ class RingChart(_Chart):
         det = self._det(z)
         a = (amps[:, 0] * np.conj(z[:, 1]) - np.conj(z[:, 0]) * amps[:, 1]) / det
         b = (z[:, 0] * amps[:, 1] - z[:, 1] * amps[:, 0]) / det
-        sa, sb = np.sqrt(np.abs(a)), np.sqrt(np.abs(b))
-        theta = np.arccos(np.clip((sa - sb) / (sa + sb), -1.0, 1.0))
-        dist = (sa + sb) ** -2
+        if self.pole_regularisation:
+            theta = self._theta_of(a, b)
+            dist = self._moduli(theta)[0] / np.abs(a)
+        else:
+            sa, sb = np.sqrt(np.abs(a)), np.sqrt(np.abs(b))
+            theta = np.arccos(np.clip((sa - sb) / (sa + sb), -1.0, 1.0))
+            dist = (sa + sb) ** -2
         psi_c, phase_c = self._centre(a, b)
-        valid &= (np.abs(det) > 0) & (sa > 0) & (sb > 0) & np.isfinite(dist) & (np.sin(theta) > 0)
+        valid &= (
+            (np.abs(det) > 0) & (np.abs(a) > 0) & (np.abs(b) > 0) & np.isfinite(dist)
+            & (np.sin(theta) > 0)
+        )
         out.update(
             ra=ra,
             dec=dec,
@@ -669,7 +749,10 @@ class RingChart(_Chart):
         if not self.fitted:
             return "unfitted"
         return (
-            f"ring azimuth centre {self.azimuth_centre:.3f}; phase sign "
+            f"ring azimuth centre {self.azimuth_centre:.3f}; "
+            + (f"pole regularisation {self.pole_regularisation:g}; "
+               if self.pole_regularisation else "")
+            + f"phase sign "
             f"{self.phase_sign:+d}; branch shares {np.round(self.p_k, 3).tolist()}; "
             f"sd " + self._column_sd()
         )
@@ -1036,7 +1119,7 @@ class RingChartFlowProposal(ChartFlowProposal):
     Parameters
     ----------
     model : :obj:`nessai.model.Model`
-    tensors, vertices, reference_time, phase_sign
+    tensors, vertices, reference_time, phase_sign, pole_regularisation
         As for :class:`RingChart`.
     flow_config, training_config
         Default :data:`DEFAULT_FLOW_CONFIG`, :data:`DEFAULT_TRAINING_CONFIG`.
@@ -1045,8 +1128,9 @@ class RingChartFlowProposal(ChartFlowProposal):
     """
 
     def __init__(self, model, tensors, vertices, reference_time, phase_sign=None,
-                 flow_config=None, training_config=None, **kwargs):
-        chart = RingChart(tensors, vertices, reference_time, model.names, phase_sign)
+                 pole_regularisation=0.0, flow_config=None, training_config=None, **kwargs):
+        chart = RingChart(tensors, vertices, reference_time, model.names, phase_sign,
+                          pole_regularisation)
         super().__init__(
             model,
             chart,
@@ -1121,7 +1205,7 @@ def single_chart_proposal_class(
 
 
 def ring_chart_proposal_class(
-    tensors, vertices, reference_time, phase_sign=None,
+    tensors, vertices, reference_time, phase_sign=None, pole_regularisation=0.0,
     class_name="BoundRingChartFlowProposal",
 ):
     """A :class:`RingChartFlowProposal` subclass with the network's geometry
@@ -1134,7 +1218,7 @@ def ring_chart_proposal_class(
 
     Parameters
     ----------
-    tensors, vertices, reference_time, phase_sign
+    tensors, vertices, reference_time, phase_sign, pole_regularisation
         As for :class:`RingChart`.
     class_name : str
         Name of the class at module scope.
@@ -1144,6 +1228,7 @@ def ring_chart_proposal_class(
         vertices=np.asarray(vertices, dtype=float).tolist(),
         reference_time=float(reference_time),
         phase_sign=phase_sign,
+        pole_regularisation=float(pole_regularisation),
     )
     return _bound_proposal_class(RingChartFlowProposal, geometry, class_name)
 
