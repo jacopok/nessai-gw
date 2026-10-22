@@ -56,6 +56,21 @@ face-on sky points: it suits a region of the posterior away from face-on, and
 :class:`SheetChartRegions` gives it to a partitioned run's regions whose live
 points are mostly edge-on, leaving the others their copy of the group
 proposal.
+
+Two separated interferometers
+-----------------------------
+Two interferometers (ET 2L) measure two complex amplitudes ``A_k = alpha
+Z_k(n) + beta conj(Z_k(n))`` and an arrival-time difference: five real
+constraints on the six extrinsic parameters other than the time, so the
+degenerate set is a curve, the ring about the baseline that the delay
+fixes, with ``(alpha, beta) = M(n)^-1 (A_1, A_2)`` along it.
+:class:`RingChart` samples the azimuth about the baseline, the cosine of
+the angle to it, the arrival time at the first interferometer and the
+amplitudes relative to the fiducial point's, with the same branch label.
+On the live points of the stalled ET 2L v70 run (ln X -46) the amplitude
+residuals are 0.02-0.03 wide while psi and phase cover their circles; the
+chart is valid over the whole sky but where ``det M`` vanishes, so
+:class:`RingChartFlowProposal` is a whole run's proposal.
 """
 
 from __future__ import annotations
@@ -70,7 +85,7 @@ from nessai.livepoint import empty_structured_array, live_points_to_array
 from nessai.proposal import FlowProposal
 
 from . import nessai_logger
-from ._ellipse import PolarisationEllipse
+from ._ellipse import PolarisationEllipse, _complex_response
 from ._geometry import geocenter_time_delay, greenwich_mean_sidereal_time
 
 # a child of nessai's logger, so the messages reach the run's log
@@ -114,7 +129,152 @@ def _circular_mean(angles):
     return float(np.angle(np.mean(np.exp(1j * np.asarray(angles, dtype=float)))))
 
 
-class SheetChart:
+class _Chart:
+    """What the charts share: the intrinsic columns (``mass_ratio`` as ``ln
+    q``), the polarisation amplitudes ``(alpha, beta)``, the ``(psi,
+    phase)`` branch label, the automatic phase sign, the whitening and the
+    branch shares. A chart defines :meth:`fit` (which ends with
+    :meth:`_finish_fit`), :meth:`columns_of`, :meth:`_inverse` and its
+    column names."""
+
+    #: a refit changes the automatic phase sign only if the other sign's
+    #: residual phases spread less than this fraction of the current one's
+    STICKY_SIGN = 0.5
+    #: prefix of the column names
+    prefix = "chart_"
+
+    def _set_names(self, names, phase_sign, extrinsic_columns):
+        self.names = list(names)
+        missing = sorted(set(EXTRINSIC) - set(self.names))
+        if missing:
+            raise ValueError(f"the chart needs {missing} in the model parameters")
+        if phase_sign not in (None, -1, 1):
+            raise ValueError("phase_sign must be None, -1 or 1")
+        self.fixed_phase_sign = phase_sign
+        self.phase_sign = -1 if phase_sign is None else phase_sign
+        self.intrinsic = [n for n in self.names if n not in EXTRINSIC]
+        self.columns = [
+            f"{self.prefix}ln_{n}" if n in LOG_PARAMETERS else f"{self.prefix}{n}"
+            for n in self.intrinsic
+        ] + list(extrinsic_columns)
+        self.fitted = False
+        self.fiducial = None
+
+    @property
+    def dims(self):
+        return len(self.columns)
+
+    @staticmethod
+    def _alpha_beta(theta_jn, distance, psi, phase, sign):
+        c = np.cos(theta_jn)
+        alpha = (1 + c) ** 2 / 4 / distance * np.exp(1j * (-2 * psi + 2 * sign * phase))
+        beta = (1 - c) ** 2 / 4 / distance * np.exp(1j * (2 * psi + 2 * sign * phase))
+        return alpha, beta
+
+    @staticmethod
+    def _label(dpsi, dphase):
+        """Index of the lattice element ``(dpsi, dphase)`` is (mod
+        ``(pi, 2 pi)``)."""
+        err = np.abs(_wrap(dpsi[:, None] - LATTICE[None, :, 0], np.pi)) + np.abs(
+            _wrap(dphase[:, None] - LATTICE[None, :, 1], _TWO_PI)
+        )
+        return np.argmin(err, axis=1)
+
+    def _fiducial_index(self, x):
+        if len(x) < self.dims + 2:
+            raise ValueError(f"cannot fit the chart to {len(x)} points")
+        if "logL" in (x.dtype.names or ()) and np.isfinite(x["logL"]).any():
+            return int(np.nanargmax(np.where(np.isfinite(x["logL"]), x["logL"], -np.inf)))
+        return 0
+
+    def _choose_sign(self, spread):
+        """The phase sign from the residual-phase spread of each candidate:
+        the narrower, but the sign of the previous fit is kept unless the
+        other is clearly better (on broad live sets the two are close, and a
+        flip would change the flow's coordinates between trainings)."""
+        best = min(spread, key=spread.get)
+        if not (
+            self.fitted
+            and len(spread) == 2
+            and spread[best] > self.STICKY_SIGN * spread[self.phase_sign]
+        ):
+            self.phase_sign = best
+        self.spread = spread[self.phase_sign]
+
+    def _finish_fit(self, x):
+        """The branch shares and the whitening, from the chart's columns of
+        ``x`` (the rest of the fit done)."""
+        self.mean = np.zeros(self.dims)
+        self.chol = np.eye(self.dims)
+        self.log_p_k = np.zeros(len(LATTICE))
+        self.log_det_whiten = 0.0
+        self.fitted = True
+        c, k, _ = self.columns_of(x)
+        counts = np.bincount(k, minlength=len(LATTICE))
+        self.p_k = (counts + 1.0) / (len(k) + len(LATTICE))
+        self.log_p_k = np.log(self.p_k)
+        self.mean = c.mean(axis=0)
+        cov = np.cov(c, rowvar=False)
+        cov += np.diag(1e-12 * np.diag(cov) + 1e-300)
+        self.chol = np.linalg.cholesky(cov)
+        self.log_det_whiten = -float(np.sum(np.log(np.diag(self.chol))))
+        return self
+
+    def _intrinsic_columns(self, x):
+        cols, log_j = [], np.zeros(len(x))
+        for n in self.intrinsic:
+            if n in LOG_PARAMETERS:
+                cols.append(np.log(x[n]))
+                log_j -= np.log(x[n])
+            else:
+                cols.append(np.asarray(x[n], dtype=float))
+        return cols, log_j
+
+    def _intrinsic_inverse(self, c):
+        out, log_j = {}, np.zeros(len(c))
+        for i, n in enumerate(self.intrinsic):
+            if n in LOG_PARAMETERS:
+                out[n] = np.exp(c[:, i])
+                log_j -= c[:, i]
+            else:
+                out[n] = c[:, i]
+        return out, log_j
+
+    def forward(self, x):
+        """Physical -> whitened chart ``y``, branch ``k`` and ``ln q`` terms
+        (``ln |dy/dx| + ln p_k``)."""
+        if not self.fitted:
+            raise RuntimeError("the chart is used before it is fitted")
+        c, k, log_j = self.columns_of(np.atleast_1d(x))
+        y = np.linalg.solve(self.chol, (c - self.mean).T).T
+        return y, k, log_j + self.log_det_whiten + self.log_p_k[k]
+
+    def inverse(self, y, k):
+        """Whitened chart ``y`` and branch ``k`` -> physical parameters (a
+        dict of arrays), the mask of the rows inside the chart's domain and
+        the forward ``ln q`` terms at them."""
+        if not self.fitted:
+            raise RuntimeError("the chart is used before it is fitted")
+        # draws far out in the flow's tails overflow: they are flagged
+        # invalid, without a warning each
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            y = np.atleast_2d(np.asarray(y, dtype=float))
+            c = y @ self.chol.T + self.mean
+            out, valid, log_j = self._inverse(c, np.asarray(k, dtype=int))
+            log_j = log_j + self.log_det_whiten + self.log_p_k[k]
+            valid &= np.all(np.isfinite(c), axis=1) & np.isfinite(log_j)
+            for n in self.names:
+                valid &= np.isfinite(out[n])
+        return out, valid, np.where(valid, log_j, 0.0)
+
+    def _column_sd(self):
+        sd = np.sqrt(np.sum(self.chol**2, axis=1))
+        return ", ".join(
+            f"{n[len(self.prefix):]} {v:.3g}" for n, v in zip(self.columns, sd)
+        )
+
+
+class SheetChart(_Chart):
     """The map between the physical parameters and the sheet chart.
 
     Parameters
@@ -139,46 +299,20 @@ class SheetChart:
         (:attr:`STICKY_SIGN`).
     """
 
-    #: a refit changes the automatic phase sign only if the other sign's
-    #: residual phases spread less than this fraction of the current one's
-    STICKY_SIGN = 0.5
+    prefix = "sheet_"
 
     def __init__(self, plane_normal, vertex, reference_time, names, phase_sign=None):
         self.plane_normal = np.asarray(plane_normal, dtype=float)
         self.vertex = np.asarray(vertex, dtype=float)
         self.reference_time = float(reference_time)
         self.gmst = greenwich_mean_sidereal_time(self.reference_time)
-        self.names = list(names)
-        missing = sorted(set(EXTRINSIC) - set(self.names))
-        if missing:
-            raise ValueError(f"the sheet chart needs {missing} in the model parameters")
-        if phase_sign not in (None, -1, 1):
-            raise ValueError("phase_sign must be None, -1 or 1")
-        self.fixed_phase_sign = phase_sign
-        self.intrinsic = [n for n in self.names if n not in EXTRINSIC]
-        self.columns = [
-            f"sheet_ln_{n}" if n in LOG_PARAMETERS else f"sheet_{n}"
-            for n in self.intrinsic
-        ] + list(SHEET_COLUMNS)
-        self.fitted = False
+        self._set_names(names, phase_sign, SHEET_COLUMNS)
         self.ellipse = None
-        self.fiducial = None
-        self.phase_sign = -1 if phase_sign is None else phase_sign
-
-    @property
-    def dims(self):
-        return len(self.columns)
 
     # -- the sheet ------------------------------------------------------
     def _sheet(self, ra, dec):
         """``(alpha*, beta*)(n)`` of the fiducial pattern."""
         return self.ellipse.coefficients(np.asarray(ra, float), np.asarray(dec, float))
-
-    def _alpha_beta(self, theta_jn, distance, psi, phase, sign):
-        c = np.cos(theta_jn)
-        alpha = (1 + c) ** 2 / 4 / distance * np.exp(1j * (-2 * psi + 2 * sign * phase))
-        beta = (1 - c) ** 2 / 4 / distance * np.exp(1j * (2 * psi + 2 * sign * phase))
-        return alpha, beta
 
     def _centre(self, a0, b0):
         """The ``(psi, phase)`` the sheet predicts (one representative of
@@ -193,26 +327,13 @@ class SheetChart:
         """The ``(psi, phase)`` offset of residual phases ``(r_a, r_b)``."""
         return 0.25 * (r_b - r_a), 0.25 * self.phase_sign * (r_a + r_b)
 
-    @staticmethod
-    def _label(dpsi, dphase):
-        """Index of the lattice element ``(dpsi, dphase)`` is (mod
-        ``(pi, 2 pi)``)."""
-        err = np.abs(_wrap(dpsi[:, None] - LATTICE[None, :, 0], np.pi)) + np.abs(
-            _wrap(dphase[:, None] - LATTICE[None, :, 1], _TWO_PI)
-        )
-        return np.argmin(err, axis=1)
-
     # -- fit --------------------------------------------------------------
     def fit(self, x):
         """Fit the fiducial, the offsets, the branch shares and the whitening
         to the points ``x`` (a structured array with the model parameters,
         and ``logL`` for the fiducial)."""
         x = np.atleast_1d(x)
-        if len(x) < self.dims + 2:
-            raise ValueError(f"cannot fit the sheet chart to {len(x)} points")
-        i = 0
-        if "logL" in (x.dtype.names or ()) and np.isfinite(x["logL"]).any():
-            i = int(np.nanargmax(np.where(np.isfinite(x["logL"]), x["logL"], -np.inf)))
+        i = self._fiducial_index(x)
         self.fiducial = {n: float(x[n][i]) for n in ("ra", "dec", "psi", "theta_jn")}
         self.ellipse = PolarisationEllipse(self.plane_normal, self.reference_time, self.fiducial)
         a0, b0 = self._sheet(x["ra"], x["dec"])
@@ -225,16 +346,7 @@ class SheetChart:
             ra_, rb_ = a / a0, b / b0
             # circular spread of the residual phases (1 - mean resultant length)
             spread[sign] = 2 - abs(np.mean(ra_ / np.abs(ra_))) - abs(np.mean(rb_ / np.abs(rb_)))
-        best = min(spread, key=spread.get)
-        # keep the sign of the previous fit unless the other is clearly
-        # better: on broad live sets the two are close, and a flip would
-        # change the flow's coordinates between trainings
-        if not (
-            self.fitted
-            and len(spread) == 2
-            and spread[best] > self.STICKY_SIGN * spread[self.phase_sign]
-        ):
-            self.phase_sign = best
+        self._choose_sign(spread)
         a, b = self._alpha_beta(
             x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], self.phase_sign
         )
@@ -246,38 +358,14 @@ class SheetChart:
         self._arg_b0_fid = float(np.angle(b0f))
         self._arg_a_fid = self._arg_a0_fid + self.arg_a_offset
         self._arg_b_fid = self._arg_b0_fid + self.arg_b_offset
-        self.mean = np.zeros(self.dims)
-        self.chol = np.eye(self.dims)
-        self.log_p_k = np.zeros(len(LATTICE))
-        self.fitted = True
-        c, k, _ = self.columns_of(x)
-        counts = np.bincount(k, minlength=len(LATTICE))
-        self.p_k = (counts + 1.0) / (len(k) + len(LATTICE))
-        self.log_p_k = np.log(self.p_k)
-        self.mean = c.mean(axis=0)
-        cov = np.cov(c, rowvar=False)
-        cov += np.diag(1e-12 * np.diag(cov) + 1e-300)
-        self.chol = np.linalg.cholesky(cov)
-        self.log_det_whiten = -float(np.sum(np.log(np.diag(self.chol))))
-        self.spread = phase_spread = spread[self.phase_sign]
-        logger.debug(
-            "Sheet chart: fiducial %s, phase sign %d (spread %.3g), branch shares %s",
-            self.fiducial, self.phase_sign, phase_spread, np.round(self.p_k, 3),
-        )
-        return self
+        return self._finish_fit(x)
 
     # -- maps -----------------------------------------------------------
     def columns_of(self, x):
         """Physical -> unwhitened chart columns ``c``, branch ``k`` and
         ``ln |dc/dx|``."""
         x = np.atleast_1d(x)
-        cols, log_j = [], np.zeros(len(x))
-        for n in self.intrinsic:
-            if n in LOG_PARAMETERS:
-                cols.append(np.log(x[n]))
-                log_j -= np.log(x[n])
-            else:
-                cols.append(np.asarray(x[n], dtype=float))
+        cols, log_j = self._intrinsic_columns(x)
         ra, dec = np.asarray(x["ra"], float), np.asarray(x["dec"], float)
         theta, dist = np.asarray(x["theta_jn"], float), np.asarray(x["luminosity_distance"], float)
         psi, phase = np.asarray(x["psi"], float), np.asarray(x["phase"], float)
@@ -300,39 +388,11 @@ class SheetChart:
         k = self._label(psi - psi_c - dpsi, phase - phase_c - dphase)
         return np.stack(cols, axis=1), k, log_j
 
-    def forward(self, x):
-        """Physical -> whitened chart ``y``, branch ``k`` and ``ln q`` terms
-        (``ln |dy/dx| + ln p_k``)."""
-        if not self.fitted:
-            raise RuntimeError("the sheet chart is used before it is fitted")
-        c, k, log_j = self.columns_of(x)
-        y = np.linalg.solve(self.chol, (c - self.mean).T).T
-        return y, k, log_j + self.log_det_whiten + self.log_p_k[k]
-
-    def inverse(self, y, k):
-        """Whitened chart ``y`` and branch ``k`` -> physical parameters (a
-        dict of arrays), the mask of the rows inside the chart's domain and
-        the forward ``ln q`` terms at them."""
-        if not self.fitted:
-            raise RuntimeError("the sheet chart is used before it is fitted")
-        # draws far out in the flow's tails overflow: they are flagged
-        # invalid below, without a warning each
-        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            return self._inverse(y, k)
-
-    def _inverse(self, y, k):
-        y = np.atleast_2d(np.asarray(y, dtype=float))
-        k = np.asarray(k, dtype=int)
-        c = y @ self.chol.T + self.mean
+    def _inverse(self, c, k):
+        """Unwhitened columns ``c`` and branch ``k`` -> the physical
+        parameters, the rows in the chart's domain and ``ln |dc/dx|``."""
         n_int = len(self.intrinsic)
-        out = {}
-        log_j = np.zeros(len(c))
-        for i, n in enumerate(self.intrinsic):
-            if n in LOG_PARAMETERS:
-                out[n] = np.exp(c[:, i])
-                log_j -= c[:, i]
-            else:
-                out[n] = c[:, i]
+        out, log_j = self._intrinsic_inverse(c)
         u, s, t, la, lb, r_a, r_b = (c[:, n_int + j] for j in range(7))
         valid = (
             (np.abs(s) < 1)
@@ -371,69 +431,286 @@ class SheetChart:
             + np.log(32.0)
             - np.log(dist)
             - np.log(np.sin(theta))
-            + self.log_det_whiten
-            + self.log_p_k[k]
         )
-        valid &= np.isfinite(log_j) & np.isfinite(out["geocent_time"])
-        return out, valid, np.where(valid, log_j, 0.0)
+        return out, valid, log_j
 
     def describe(self):
         if not self.fitted:
             return "unfitted"
-        names = self.columns
-        sd = np.sqrt(np.sum(self.chol**2, axis=1))
         return (
             f"fiducial ra {self.fiducial['ra']:.3f} dec {self.fiducial['dec']:.3f} "
             f"theta_jn {self.fiducial['theta_jn']:.3f} psi {self.fiducial['psi']:.3f}; "
             f"phase sign {self.phase_sign:+d}; branch shares "
-            f"{np.round(self.p_k, 3).tolist()}; sd "
-            + ", ".join(f"{n[6:]} {v:.3g}" for n, v in zip(names, sd))
+            f"{np.round(self.p_k, 3).tolist()}; sd " + self._column_sd()
         )
 
 
-class SheetChartFlowProposal(FlowProposal):
-    """A flow proposal in the sheet chart (see the module notes).
+#: Flow coordinates of the extrinsic block of the ring chart.
+RING_COLUMNS = (
+    "ring_azimuth",
+    "ring_cos_alpha",
+    "ring_time",
+    "ring_ln_a1",
+    "ring_ln_a2",
+    "ring_arg_a1",
+    "ring_arg_a2",
+)
+
+
+class RingChart(_Chart):
+    """The ring chart of a network of two separated interferometers.
+
+    Each interferometer measures one complex amplitude of the dominant mode,
+    ``A_k = alpha Z_k(n) + beta conj(Z_k(n))`` (``Z_k = F_+ + i F_x`` at
+    ``psi = 0``), and the two an arrival-time difference that holds the sky
+    to a ring about their baseline. With the two amplitudes, the arrival
+    time and the delay fixed, the extrinsic parameters keep one degree of
+    freedom: the azimuth about the baseline, along which ``(theta_jn, d_L,
+    psi, phase)`` follow ``(alpha, beta) = M(n)^-1 (A_1, A_2)``. The chart's
+    coordinates are that azimuth, the cosine of the angle to the baseline,
+    the arrival time at the first interferometer and the amplitudes' log
+    moduli and phases relative to the fiducial point's (centred), with the
+    ``(psi, phase)`` branch a label as in :class:`SheetChart`.
+
+    The Jacobian of the amplitude block is
+    ``|det M|^2 |alpha|^2 |beta|^2 32 / (d_L sin theta_jn) / (|A_1|^2
+    |A_2|^2)``, of the sky ``cos dec``. The chart is singular where ``det M
+    = Z_1 conj(Z_2) - conj(Z_1) Z_2`` vanishes (the sky directions where the
+    two interferometers see the same polarisation): a set of measure zero,
+    and away from the ring for ET 2L.
+
+    Parameters
+    ----------
+    tensors : array_like, shape (2, 3, 3)
+        Earth-fixed detector tensors of the two interferometers
+        (:func:`nessai_gw.group_mixture.detector_tensors`).
+    vertices : array_like, shape (2, 3)
+        Their Earth-fixed vertices (m); the arrival time is taken at the
+        first.
+    reference_time, names, phase_sign
+        As for :class:`SheetChart`.
+    """
+
+    prefix = "ring_"
+
+    def __init__(self, tensors, vertices, reference_time, names, phase_sign=None):
+        self.tensors = np.asarray(tensors, dtype=float)
+        self.vertices = np.asarray(vertices, dtype=float)
+        if self.tensors.shape != (2, 3, 3) or self.vertices.shape != (2, 3):
+            raise ValueError("the ring chart needs two interferometers")
+        self.reference_time = float(reference_time)
+        self.gmst = greenwich_mean_sidereal_time(self.reference_time)
+        baseline = self.vertices[1] - self.vertices[0]
+        if not np.linalg.norm(baseline) > 0:
+            raise ValueError("the two interferometers share a vertex: no baseline")
+        self.axis = baseline / np.linalg.norm(baseline)
+        pole = np.array([0.0, 0.0, 1.0]) if abs(self.axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        e1 = np.cross(self.axis, pole)
+        self.e1 = e1 / np.linalg.norm(e1)
+        self.e2 = np.cross(self.axis, self.e1)
+        self._set_names(names, phase_sign, RING_COLUMNS)
+
+    # -- the ring ---------------------------------------------------------
+    def _ring(self, ra, dec):
+        """Azimuth about the baseline and cosine of the angle to it."""
+        phi = np.asarray(ra, float) - self.gmst
+        dec = np.asarray(dec, float)
+        n = np.stack([np.cos(dec) * np.cos(phi), np.cos(dec) * np.sin(phi), np.sin(dec)], -1)
+        return np.arctan2(n @ self.e2, n @ self.e1), n @ self.axis
+
+    def _sky(self, azimuth, cos_alpha):
+        sin_alpha = np.sqrt(np.clip(1.0 - cos_alpha**2, 0.0, None))
+        n = (
+            cos_alpha[:, None] * self.axis
+            + (sin_alpha * np.cos(azimuth))[:, None] * self.e1
+            + (sin_alpha * np.sin(azimuth))[:, None] * self.e2
+        )
+        ra = np.remainder(np.arctan2(n[:, 1], n[:, 0]) + self.gmst, _TWO_PI)
+        return ra, np.arcsin(np.clip(n[:, 2], -1.0, 1.0))
+
+    def _response(self, ra, dec):
+        return _complex_response(
+            self.tensors, np.atleast_1d(ra), np.atleast_1d(dec), self.gmst
+        )
+
+    @staticmethod
+    def _amplitudes(z, a, b):
+        return a[:, None] * z + b[:, None] * np.conj(z)
+
+    @staticmethod
+    def _det(z):
+        return z[:, 0] * np.conj(z[:, 1]) - np.conj(z[:, 0]) * z[:, 1]
+
+    def _centre(self, a, b):
+        """The ``(psi, phase)`` of ``(alpha, beta)`` (one representative of
+        the lattice class), with the branch of ``arg`` taken relative to the
+        fiducial's."""
+        A = self._arg_a_fid + _wrap(np.angle(a) - self._arg_a_fid)
+        B = self._arg_b_fid + _wrap(np.angle(b) - self._arg_b_fid)
+        return 0.25 * (B - A), 0.25 * self.phase_sign * (A + B)
+
+    def _amplitude_log_j(self, z, a, b, amps, distance, theta):
+        return (
+            2 * np.log(np.abs(self._det(z)))
+            + 2 * np.log(np.abs(a))
+            + 2 * np.log(np.abs(b))
+            + np.log(32.0)
+            - np.log(distance)
+            - np.log(np.sin(theta))
+            - 2 * np.log(np.abs(amps[:, 0]))
+            - 2 * np.log(np.abs(amps[:, 1]))
+        )
+
+    # -- fit --------------------------------------------------------------
+    def fit(self, x):
+        """Fit the fiducial amplitudes, the centres, the branch shares and
+        the whitening to the points ``x`` (with ``logL`` for the
+        fiducial)."""
+        x = np.atleast_1d(x)
+        i = self._fiducial_index(x)
+        self.fiducial = {n: float(x[n][i]) for n in EXTRINSIC}
+        z = self._response(x["ra"], x["dec"])
+        signs = (self.fixed_phase_sign,) if self.fixed_phase_sign else (-1, 1)
+        spread = {}
+        for sign in signs:
+            a, b = self._alpha_beta(
+                x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], sign
+            )
+            r = self._amplitudes(z, a, b)
+            r = r / r[i]
+            spread[sign] = 2 - sum(abs(np.mean(r[:, j] / np.abs(r[:, j]))) for j in range(2))
+        self._choose_sign(spread)
+        a, b = self._alpha_beta(
+            x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], self.phase_sign
+        )
+        amps = self._amplitudes(z, a, b)
+        self.reference_amplitudes = amps[i].copy()
+        self._arg_a_fid = float(np.angle(a[i]))
+        self._arg_b_fid = float(np.angle(b[i]))
+        r = amps / self.reference_amplitudes
+        self.arg_offsets = np.array([_circular_mean(np.angle(r[:, j])) for j in range(2)])
+        self.azimuth_centre = _circular_mean(self._ring(x["ra"], x["dec"])[0])
+        return self._finish_fit(x)
+
+    # -- maps -------------------------------------------------------------
+    def columns_of(self, x):
+        """Physical -> unwhitened chart columns ``c``, branch ``k`` and
+        ``ln |dc/dx|``."""
+        x = np.atleast_1d(x)
+        cols, log_j = self._intrinsic_columns(x)
+        ra, dec = np.asarray(x["ra"], float), np.asarray(x["dec"], float)
+        theta, dist = np.asarray(x["theta_jn"], float), np.asarray(x["luminosity_distance"], float)
+        psi, phase = np.asarray(x["psi"], float), np.asarray(x["phase"], float)
+        azimuth, cos_alpha = self._ring(ra, dec)
+        time = (np.asarray(x["geocent_time"], float) - self.reference_time) + (
+            geocenter_time_delay(self.vertices[0], self.gmst, ra, dec)
+        )
+        z = self._response(ra, dec)
+        a, b = self._alpha_beta(theta, dist, psi, phase, self.phase_sign)
+        amps = self._amplitudes(z, a, b)
+        r = amps / self.reference_amplitudes
+        cols += [
+            _wrap(azimuth - self.azimuth_centre),
+            cos_alpha,
+            time,
+            np.log(np.abs(r[:, 0])),
+            np.log(np.abs(r[:, 1])),
+            _wrap(np.angle(r[:, 0]) - self.arg_offsets[0]),
+            _wrap(np.angle(r[:, 1]) - self.arg_offsets[1]),
+        ]
+        log_j += np.log(np.cos(dec)) + self._amplitude_log_j(z, a, b, amps, dist, theta)
+        psi_c, phase_c = self._centre(a, b)
+        k = self._label(psi - psi_c, phase - phase_c)
+        return np.stack(cols, axis=1), k, log_j
+
+    def _inverse(self, c, k):
+        """Unwhitened columns ``c`` and branch ``k`` -> the physical
+        parameters, the rows in the chart's domain and ``ln |dc/dx|``."""
+        n_int = len(self.intrinsic)
+        out, log_j = self._intrinsic_inverse(c)
+        u, s, t, l1, l2, r1, r2 = (c[:, n_int + j] for j in range(7))
+        valid = (
+            (np.abs(s) < 1)
+            & (u >= -np.pi) & (u < np.pi)
+            & (r1 >= -np.pi) & (r1 < np.pi)
+            & (r2 >= -np.pi) & (r2 < np.pi)
+            & np.all(np.isfinite(c), axis=1)
+        )
+        s = np.where(valid, s, 0.0)
+        ra, dec = self._sky(np.where(valid, u, 0.0) + self.azimuth_centre, s)
+        z = self._response(ra, dec)
+        logs = np.stack([np.where(valid, l1, 0.0), np.where(valid, l2, 0.0)], axis=1)
+        args = np.stack([r1, r2], axis=1) + self.arg_offsets
+        amps = self.reference_amplitudes * np.exp(logs + 1j * np.where(valid[:, None], args, 0.0))
+        det = self._det(z)
+        a = (amps[:, 0] * np.conj(z[:, 1]) - np.conj(z[:, 0]) * amps[:, 1]) / det
+        b = (z[:, 0] * amps[:, 1] - z[:, 1] * amps[:, 0]) / det
+        sa, sb = np.sqrt(np.abs(a)), np.sqrt(np.abs(b))
+        theta = np.arccos(np.clip((sa - sb) / (sa + sb), -1.0, 1.0))
+        dist = (sa + sb) ** -2
+        psi_c, phase_c = self._centre(a, b)
+        valid &= (np.abs(det) > 0) & (sa > 0) & (sb > 0) & np.isfinite(dist) & (np.sin(theta) > 0)
+        out.update(
+            ra=ra,
+            dec=dec,
+            geocent_time=self.reference_time + t - geocenter_time_delay(
+                self.vertices[0], self.gmst, ra, dec
+            ),
+            theta_jn=theta,
+            luminosity_distance=dist,
+            psi=np.remainder(psi_c + LATTICE[k, 0], np.pi),
+            phase=np.remainder(phase_c + LATTICE[k, 1], _TWO_PI),
+        )
+        log_j += np.log(np.cos(dec)) + self._amplitude_log_j(z, a, b, amps, dist, theta)
+        return out, valid, log_j
+
+    def describe(self):
+        if not self.fitted:
+            return "unfitted"
+        return (
+            f"ring azimuth centre {self.azimuth_centre:.3f}; phase sign "
+            f"{self.phase_sign:+d}; branch shares {np.round(self.p_k, 3).tolist()}; "
+            f"sd " + self._column_sd()
+        )
+
+
+class ChartFlowProposal(FlowProposal):
+    """A flow proposal in a chart (:class:`SheetChart`, :class:`RingChart`;
+    see the module notes).
 
     The chart replaces nessai's reparameterisations: it is refitted to the
     training points (``check_state``) at every training, and the branch
     label is drawn on the inverse pass. Draws outside the chart's domain
-    (``|sin dec| >= 1``, a wrapped coordinate outside its period) are
+    (a cosine at or beyond 1, a wrapped coordinate outside its period) are
     returned outside the prior bounds, so the prior-bounds check drops
     them.
 
     Parameters
     ----------
     model : :obj:`nessai.model.Model`
-    plane_normal, vertex, reference_time, phase_sign
-        As for :class:`SheetChart`.
+    chart : :class:`SheetChart` or :class:`RingChart`
+    flow_config, training_config : dict, optional
+        Of the flow; resuming keeps them (the sampler passes the
+        configuration of its main proposal).
     kwargs
         Passed to :class:`nessai.proposal.FlowProposal`.
     """
 
     use_default_reparameterisations = False
-    #: a partitioned run does not split its region again (nessai skips the
-    #: check): the chart covers one mode, and the split coordinates need the
-    #: group proposal's sky frame
+    #: a partitioned run does not split the proposal's region again (nessai
+    #: skips the check): the split coordinates need the group proposal's
+    #: sky frame
     splittable = False
 
-    def __init__(
-        self,
-        model,
-        plane_normal,
-        vertex,
-        reference_time,
-        phase_sign=None,
-        flow_config=None,
-        training_config=None,
-        **kwargs,
-    ):
+    def __init__(self, model, chart, flow_config=None, training_config=None, **kwargs):
         super().__init__(
             model,
             flow_config=copy.deepcopy(flow_config),
             training_config=copy.deepcopy(training_config),
             **kwargs,
         )
-        self.chart = SheetChart(plane_normal, vertex, reference_time, model.names, phase_sign)
+        self.chart = chart
+        # (named for the sheet chart, which came first: kept for its checkpoints)
         self.sheet_flow_config = copy.deepcopy(flow_config or {})
         self.chart_history = []
 
@@ -546,6 +823,53 @@ DEFAULT_TRAINING_CONFIG = {
     "val_size": 0.1,
     "clip_grad_norm": 5.0,
 }
+
+
+class SheetChartFlowProposal(ChartFlowProposal):
+    """A flow proposal in the sheet chart of a triangle
+    (:class:`SheetChart`): for a partitioned run's edge-on region
+    (:class:`SheetChartRegions`).
+
+    Parameters
+    ----------
+    model : :obj:`nessai.model.Model`
+    plane_normal, vertex, reference_time, phase_sign
+        As for :class:`SheetChart`.
+    flow_config, training_config, kwargs
+        As for :class:`ChartFlowProposal`.
+    """
+
+    def __init__(self, model, plane_normal, vertex, reference_time, phase_sign=None,
+                 flow_config=None, training_config=None, **kwargs):
+        chart = SheetChart(plane_normal, vertex, reference_time, model.names, phase_sign)
+        super().__init__(model, chart, flow_config, training_config, **kwargs)
+
+
+class RingChartFlowProposal(ChartFlowProposal):
+    """A flow proposal in the ring chart of two separated interferometers
+    (:class:`RingChart`): a whole run's proposal.
+
+    Parameters
+    ----------
+    model : :obj:`nessai.model.Model`
+    tensors, vertices, reference_time, phase_sign
+        As for :class:`RingChart`.
+    flow_config, training_config
+        Default :data:`DEFAULT_FLOW_CONFIG`, :data:`DEFAULT_TRAINING_CONFIG`.
+    kwargs
+        As for :class:`ChartFlowProposal`.
+    """
+
+    def __init__(self, model, tensors, vertices, reference_time, phase_sign=None,
+                 flow_config=None, training_config=None, **kwargs):
+        chart = RingChart(tensors, vertices, reference_time, model.names, phase_sign)
+        super().__init__(
+            model,
+            chart,
+            flow_config or DEFAULT_FLOW_CONFIG,
+            training_config or DEFAULT_TRAINING_CONFIG,
+            **kwargs,
+        )
 
 
 class SheetChartRegions:
