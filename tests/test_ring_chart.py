@@ -376,3 +376,19 @@ def test_arcs_round_trip_and_labels():
     # without arcs: one arc, the plain chart's labels
     plain = RingChart(TENSORS, VERTICES, T0, NAMES, phase_sign=-1, pole_regularisation=0.1).fit(x)
     assert plain.arc_centres is None and plain.n_labels == len(LATTICE)
+
+
+def test_population_to_cap():
+    """Rejection weights min(w, c) / c with population_to_cap, the batch
+    maximum otherwise."""
+    from types import SimpleNamespace
+    from nessai_gw.sheet_chart import RingChartFlowProposal
+    prop = object.__new__(RingChartFlowProposal)
+    prop._truncation_scheme = SimpleNamespace(log_weight_cap=1.0)
+    prop.population_weight_cap_mass = None
+    prop.clip_population_weights = False
+    log_w = np.array([-3.0, 0.0, 1.0])
+    np.testing.assert_allclose(prop._get_population_log_weights(log_w), [-4.0, -1.0, 0.0])
+    prop.population_to_cap = True
+    np.testing.assert_allclose(prop._get_population_log_weights(log_w - 2.0), [-6.0, -3.0, -2.0])
+    np.testing.assert_allclose(prop._get_population_log_weights(log_w + 1.0), [-3.0, 0.0, 0.0])

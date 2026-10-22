@@ -1296,9 +1296,12 @@ class ChartFlowProposal(FlowProposal):
     #: skips the check): the split coordinates need the group proposal's
     #: sky frame
     splittable = False
+    #: (checkpoints from before the option: each batch normalised by its own
+    #: largest weight)
+    population_to_cap = False
 
     def __init__(self, model, chart, flow_config=None, training_config=None,
-                 coordinates=None, **kwargs):
+                 coordinates=None, population_to_cap=False, **kwargs):
         super().__init__(
             model,
             flow_config=copy.deepcopy(flow_config),
@@ -1308,6 +1311,7 @@ class ChartFlowProposal(FlowProposal):
         if coordinates:
             chart.set_coordinates(model.bounds, **coordinates)
         self.chart = chart
+        self.population_to_cap = bool(population_to_cap)
         # (named for the sheet chart, which came first: kept for its checkpoints)
         self.sheet_flow_config = copy.deepcopy(flow_config or {})
         self.chart_history = []
@@ -1328,6 +1332,23 @@ class ChartFlowProposal(FlowProposal):
     def verify_rescaling(self):
         """The chart is fitted at the first training; its round trip is
         checked there (:meth:`check_state`)."""
+
+    def _get_population_log_weights(self, log_weights, min_yield=None):
+        """With ``population_to_cap``, the rejection weights of a batch are
+        ``min(w, c) / c`` for the truncation rule's weight cap ``c``: the pool
+        follows ``min(p, c q)`` whatever the batch holds. nessai normalises
+        each batch by its own largest weight instead, which takes a batch
+        without a draw at the cap at a higher rate than the rest: with the
+        charts' heavy weight tails (the top 1% of draws holding 70-90% of the
+        capped weight) the pool then misses the regions the flow
+        under-covers (face-on in the ring chart) and the acceptance reads
+        6-125 times the true one."""
+        if self.population_to_cap:
+            scheme = getattr(self, "_truncation_scheme", None)
+            log_cap = scheme.log_weight_cap if scheme is not None else np.inf
+            if np.isfinite(log_cap):
+                return np.minimum(np.asarray(log_weights, dtype=float) - log_cap, 0.0)
+        return super()._get_population_log_weights(log_weights, min_yield=min_yield)
 
     def check_state(self, x):
         """Refit the chart to the training points and check its round
