@@ -137,9 +137,6 @@ class _Chart:
     :meth:`_finish_fit`), :meth:`columns_of`, :meth:`_inverse` and its
     column names."""
 
-    #: a refit changes the automatic phase sign only if the other sign's
-    #: residual phases spread less than this fraction of the current one's
-    STICKY_SIGN = 0.5
     #: prefix of the column names
     prefix = "chart_"
 
@@ -188,17 +185,12 @@ class _Chart:
         return 0
 
     def _choose_sign(self, spread):
-        """The phase sign from the residual-phase spread of each candidate:
-        the narrower, but the sign of the previous fit is kept unless the
-        other is clearly better (on broad live sets the two are close, and a
-        flip would change the flow's coordinates between trainings)."""
-        best = min(spread, key=spread.get)
-        if not (
-            self.fitted
-            and len(spread) == 2
-            and spread[best] > self.STICKY_SIGN * spread[self.phase_sign]
-        ):
-            self.phase_sign = best
+        """The phase sign whose residual phases spread the least. (Keeping
+        the previous fit's sign unless the other was twice as narrow held a
+        sign picked on a broad live set: on the ET-Delta v78 edge-on region
+        +1 from the split on, while -1 was 2-4 times narrower.) The sign is
+        the waveform convention's: give it (``phase_sign``) when known."""
+        self.phase_sign = min(spread, key=spread.get)
         self.spread = spread[self.phase_sign]
 
     def _finish_fit(self, x):
@@ -293,10 +285,9 @@ class SheetChart(_Chart):
         The model's parameters: :data:`EXTRINSIC` and any others, which are
         carried as they are (``mass_ratio`` as ``ln q``).
     phase_sign : {None, -1, 1}
-        ``s`` in ``e^{2i s phase}``; ``None`` picks the sign that makes the
-        phase residuals narrower (bilby's waveforms: -1), at the first fit
-        and at a refit where the other sign is clearly better
-        (:attr:`STICKY_SIGN`).
+        ``s`` in ``e^{2i s phase}``, the waveform convention's (bilby's
+        waveforms: -1); ``None`` picks, at every fit, the sign that makes
+        the phase residuals narrower, which on broad live sets can be either.
     """
 
     prefix = "sheet_"

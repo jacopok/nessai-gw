@@ -132,14 +132,12 @@ def test_phase_sign_detected(sign):
     assert make_chart().fit(x).phase_sign == sign
 
 
-def test_phase_sign_sticky():
-    chart = make_chart().fit(sheet_points(sign=-1)[0])
-    # broad live points: both signs spread about as much, the sign stays
-    broad, _ = sheet_points(sign=1, noise=1.5)
-    assert chart.fit(broad).phase_sign == -1
-    assert make_chart(1).fit(broad).phase_sign == 1
-    # a clearly better sign takes over
-    assert chart.fit(sheet_points(sign=1)[0]).phase_sign == 1
+def test_phase_sign_refit():
+    """The automatic sign follows the live points at every fit; a given
+    sign is kept."""
+    chart = make_chart().fit(sheet_points(sign=1)[0])
+    assert chart.fit(sheet_points(sign=-1)[0]).phase_sign == -1
+    assert make_chart(1).fit(sheet_points(sign=-1)[0]).phase_sign == 1
 
 
 def test_unfitted_chart_refuses():
