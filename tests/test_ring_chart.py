@@ -10,7 +10,13 @@ from nessai.model import Model
 
 from nessai_gw._ellipse import _complex_response
 from nessai_gw._geometry import geocenter_time_delay, greenwich_mean_sidereal_time
-from nessai_gw.sheet_chart import LATTICE, RingChart, RingChartFlowProposal, _wrap
+from nessai_gw.sheet_chart import (
+    LATTICE,
+    RingChart,
+    RingChartFlowProposal,
+    _wrap,
+    ring_chart_proposal_class,
+)
 
 T0 = 1187008882.4
 #: ET 2L (MisA): ET_1L_IT (Sardinia) and ET_1L_DE (Lusatia), arms 45 deg apart
@@ -220,3 +226,22 @@ def test_proposal_pickle_resume(proposal, tmp_path):
 def test_default_flow_config():
     prop = RingChartFlowProposal(RingModel(), TENSORS, VERTICES, T0, poolsize=10, plot=False)
     assert prop.sheet_flow_config["n_blocks"] == 8
+
+
+def test_bound_proposal_class(tmp_path):
+    """The geometry bound into the class: nessai passes only the keyword
+    arguments it knows, and checkpoints unpickle through the module-scope
+    name."""
+    from nessai.proposal.utils import check_proposal_kwargs
+
+    cls = ring_chart_proposal_class(TENSORS, VERTICES, T0, phase_sign=-1)
+    kwargs = check_proposal_kwargs(
+        cls, {"poolsize": 100, "plot": False, "output": str(tmp_path), "flow_config": {"n_blocks": 2}}
+    )
+    prop = cls(RingModel(), **kwargs)
+    assert prop.chart.fixed_phase_sign == -1
+    np.testing.assert_allclose(prop.chart.tensors, TENSORS)
+    assert prop.sheet_flow_config == {"n_blocks": 2}
+    copy = pickle.loads(pickle.dumps(prop))
+    assert type(copy).__name__ == "BoundRingChartFlowProposal"
+    np.testing.assert_allclose(copy.chart.vertices, VERTICES)

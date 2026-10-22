@@ -863,6 +863,49 @@ class RingChartFlowProposal(ChartFlowProposal):
         )
 
 
+
+def ring_chart_proposal_class(
+    tensors, vertices, reference_time, phase_sign=None,
+    class_name="BoundRingChartFlowProposal",
+):
+    """A :class:`RingChartFlowProposal` subclass with the network's geometry
+    bound, for nessai's ``flow_proposal_class``: nessai (and bilby's nessai
+    plugin) pass a proposal only the keyword arguments nessai knows.
+
+    The class is published at module scope as ``class_name`` so checkpoints
+    unpickle: build it again (with the same geometry) before resuming, as
+    for :func:`nessai_gw.group_mixture` 's proposal classes.
+
+    Parameters
+    ----------
+    tensors, vertices, reference_time, phase_sign
+        As for :class:`RingChart`.
+    class_name : str
+        Name of the class at module scope.
+    """
+    geometry = dict(
+        tensors=np.asarray(tensors, dtype=float).tolist(),
+        vertices=np.asarray(vertices, dtype=float).tolist(),
+        reference_time=float(reference_time),
+        phase_sign=phase_sign,
+    )
+
+    class _BoundRingChartFlowProposal(RingChartFlowProposal):
+        def __init__(self, model, flow_config=None, training_config=None, **kwargs):
+            super().__init__(
+                model,
+                flow_config=flow_config,
+                training_config=training_config,
+                **geometry,
+                **kwargs,
+            )
+
+    _BoundRingChartFlowProposal.__module__ = __name__
+    _BoundRingChartFlowProposal.__qualname__ = class_name
+    _BoundRingChartFlowProposal.__name__ = class_name
+    globals()[class_name] = _BoundRingChartFlowProposal
+    return _BoundRingChartFlowProposal
+
 class SheetChartRegions:
     """``region_proposal`` factory for nessai's partitioned nested sampling:
     a region whose live points are mostly edge-on (median ``|cos
