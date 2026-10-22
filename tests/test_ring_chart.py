@@ -245,3 +245,25 @@ def test_bound_proposal_class(tmp_path):
     copy = pickle.loads(pickle.dumps(prop))
     assert type(copy).__name__ == "BoundRingChartFlowProposal"
     np.testing.assert_allclose(copy.chart.vertices, VERTICES)
+
+
+def test_branches_are_the_lattice():
+    """The four (psi, phase) shifts of the lattice leave the chart's
+    coordinates as they are, get four distinct labels and invert to
+    themselves."""
+    x, _ = ring_points()
+    chart = make_chart().fit(x)
+    y0, _, _ = chart.forward(x)
+    labels = []
+    for dpsi, dphase in LATTICE:
+        xg = x.copy()
+        xg["psi"] = np.remainder(x["psi"] + dpsi, np.pi)
+        xg["phase"] = np.remainder(x["phase"] + dphase, 2 * np.pi)
+        y, k, _ = chart.forward(xg)
+        np.testing.assert_allclose(y, y0, atol=1e-8)
+        out, valid, _ = chart.inverse(y, k)
+        assert valid.all()
+        assert np.max(np.abs(_wrap(out["psi"] - xg["psi"], np.pi))) < 1e-8
+        assert np.max(np.abs(_wrap(out["phase"] - xg["phase"]))) < 1e-8
+        labels.append(k)
+    assert np.all(np.sort(np.stack(labels), axis=0) == np.arange(4)[:, None])

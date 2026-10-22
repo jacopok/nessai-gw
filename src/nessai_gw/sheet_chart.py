@@ -71,6 +71,16 @@ On the live points of the stalled ET 2L v70 run (ln X -46) the amplitude
 residuals are 0.02-0.03 wide while psi and phase cover their circles; the
 chart is valid over the whole sky but where ``det M`` vanishes, so
 :class:`RingChartFlowProposal` is a whole run's proposal.
+
+One interferometer
+------------------
+A single interferometer (CE) measures one complex amplitude and an
+arrival time: the sky, ``theta_jn`` and ``psi`` are free along the
+degeneracy, and :class:`SingleChart` samples them with the arrival time,
+``ln |A / A*|`` and ``arg(A / A*)``. On the live points of a CE BBH run the
+detector phase ``arg A`` narrows to 0.01 rad by ln X -55 while
+``phase + sign(cos theta_jn) psi``, which lacks the sky-dependent
+``arg(Z + rho conj(Z))``, stays uniform.
 """
 
 from __future__ import annotations
@@ -665,9 +675,192 @@ class RingChart(_Chart):
         )
 
 
+#: Flow coordinates of the extrinsic block of the single-interferometer chart.
+SINGLE_COLUMNS = (
+    "single_ra",
+    "single_sin_dec",
+    "single_time",
+    "single_cos_theta_jn",
+    "single_psi4",
+    "single_ln_amplitude",
+    "single_arg_amplitude",
+)
+
+
+class SingleChart(_Chart):
+    """The chart of a single interferometer.
+
+    One interferometer measures one complex amplitude of the dominant mode,
+    ``A = alpha Z(n) + beta conj(Z(n))``, and its arrival time: three of the
+    seven extrinsic parameters. The sky, ``theta_jn`` and ``psi`` are free
+    along the degeneracy: at fixed ``(n, theta_jn, psi)`` the ratio
+    ``rho = beta / alpha = tan^4(theta_jn / 2) e^{4 i psi}`` is fixed, so
+    ``alpha = A / (Z + rho conj(Z))`` gives the distance and the phase. The
+    chart's coordinates are the sky, the arrival time at the
+    interferometer, ``cos theta_jn``, ``4 psi`` (centred and wrapped) and
+    ``ln |A / A*|``, ``arg(A / A*)`` relative to the fiducial point's
+    (centred), with the ``(psi, phase)`` branch a label as in
+    :class:`SheetChart` (``4 psi`` fixes ``psi`` modulo ``pi / 2``, the
+    amplitude the phase modulo ``pi``).
+
+    The Jacobian is ``8 sin theta_jn / d_L`` times ``cos dec``; the chart is
+    singular only where ``Z + rho conj(Z)`` vanishes (the interferometer
+    blind to the polarisation), a set of measure zero.
+
+    The sky group of :mod:`nessai_gw.group_mixture` 's single-interferometer
+    proposal is not folded: the flow models the whole sky.
+
+    Parameters
+    ----------
+    tensor : array_like, shape (3, 3)
+        Earth-fixed detector tensor.
+    vertex : array_like, shape (3,)
+        Its Earth-fixed vertex (m), where the arrival time is taken.
+    reference_time, names, phase_sign
+        As for :class:`SheetChart`.
+    """
+
+    prefix = "single_"
+
+    def __init__(self, tensor, vertex, reference_time, names, phase_sign=None):
+        self.tensor = np.asarray(tensor, dtype=float)
+        self.vertex = np.asarray(vertex, dtype=float)
+        if self.tensor.shape != (3, 3) or self.vertex.shape != (3,):
+            raise ValueError("the single chart needs one interferometer's tensor and vertex")
+        self.reference_time = float(reference_time)
+        self.gmst = greenwich_mean_sidereal_time(self.reference_time)
+        self._set_names(names, phase_sign, SINGLE_COLUMNS)
+
+    def _response(self, ra, dec):
+        return _complex_response(
+            self.tensor[None], np.atleast_1d(ra), np.atleast_1d(dec), self.gmst
+        )[:, 0]
+
+    @staticmethod
+    def _rho(cos_theta, psi):
+        return ((1 - cos_theta) / (1 + cos_theta)) ** 2 * np.exp(4j * psi)
+
+    def _amplitude(self, z, theta, distance, psi, phase, sign):
+        a, b = self._alpha_beta(theta, distance, psi, phase, sign)
+        return a * z + b * np.conj(z)
+
+    def _psi_phase(self, amplitude, z, cos_theta, psi4):
+        """``alpha``, ``psi`` (modulo ``pi / 2``) and the phase (modulo
+        ``pi``) of an amplitude at ``(n, cos theta_jn, 4 psi)``."""
+        psi = psi4 / 4
+        alpha = amplitude / (z + self._rho(cos_theta, psi) * np.conj(z))
+        phase = np.remainder((np.angle(alpha) + 2 * psi) / (2 * self.phase_sign), np.pi)
+        return alpha, psi, phase
+
+    # -- fit --------------------------------------------------------------
+    def fit(self, x):
+        """Fit the fiducial amplitude, the centres, the branch shares and
+        the whitening to the points ``x`` (with ``logL`` for the
+        fiducial)."""
+        x = np.atleast_1d(x)
+        i = self._fiducial_index(x)
+        self.fiducial = {n: float(x[n][i]) for n in EXTRINSIC}
+        z = self._response(x["ra"], x["dec"])
+        signs = (self.fixed_phase_sign,) if self.fixed_phase_sign else (-1, 1)
+        spread = {}
+        for sign in signs:
+            amp = self._amplitude(
+                z, x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], sign
+            )
+            r = amp / amp[i]
+            spread[sign] = 1 - abs(np.mean(r / np.abs(r)))
+        self._choose_sign(spread)
+        amp = self._amplitude(
+            z, x["theta_jn"], x["luminosity_distance"], x["psi"], x["phase"], self.phase_sign
+        )
+        self.reference_amplitude = complex(amp[i])
+        self.arg_offset = _circular_mean(np.angle(amp / self.reference_amplitude))
+        self.ra_centre = _circular_mean(x["ra"])
+        self.psi4_centre = _circular_mean(4 * np.asarray(x["psi"], float))
+        return self._finish_fit(x)
+
+    # -- maps -------------------------------------------------------------
+    def columns_of(self, x):
+        """Physical -> unwhitened chart columns ``c``, branch ``k`` and
+        ``ln |dc/dx|``."""
+        x = np.atleast_1d(x)
+        cols, log_j = self._intrinsic_columns(x)
+        ra, dec = np.asarray(x["ra"], float), np.asarray(x["dec"], float)
+        theta, dist = np.asarray(x["theta_jn"], float), np.asarray(x["luminosity_distance"], float)
+        psi, phase = np.asarray(x["psi"], float), np.asarray(x["phase"], float)
+        z = self._response(ra, dec)
+        amp = self._amplitude(z, theta, dist, psi, phase, self.phase_sign)
+        r = amp / self.reference_amplitude
+        w = _wrap(4 * psi - self.psi4_centre)
+        cols += [
+            _wrap(ra - self.ra_centre),
+            np.sin(dec),
+            (np.asarray(x["geocent_time"], float) - self.reference_time)
+            + geocenter_time_delay(self.vertex, self.gmst, ra, dec),
+            np.cos(theta),
+            w,
+            np.log(np.abs(r)),
+            _wrap(np.angle(r) - self.arg_offset),
+        ]
+        log_j += np.log(np.cos(dec)) + np.log(8.0) + np.log(np.sin(theta)) - np.log(dist)
+        _, psi0, phase0 = self._psi_phase(amp, z, np.cos(theta), w + self.psi4_centre)
+        k = self._label(psi - psi0, phase - phase0)
+        return np.stack(cols, axis=1), k, log_j
+
+    def _inverse(self, c, k):
+        """Unwhitened columns ``c`` and branch ``k`` -> the physical
+        parameters, the rows in the chart's domain and ``ln |dc/dx|``."""
+        n_int = len(self.intrinsic)
+        out, log_j = self._intrinsic_inverse(c)
+        u, s, t, ct, w, la, r = (c[:, n_int + j] for j in range(7))
+        valid = (
+            (np.abs(s) < 1)
+            & (np.abs(ct) < 1)
+            & (u >= -np.pi) & (u < np.pi)
+            & (w >= -np.pi) & (w < np.pi)
+            & (r >= -np.pi) & (r < np.pi)
+            & np.all(np.isfinite(c), axis=1)
+        )
+        s = np.where(valid, s, 0.0)
+        ct = np.where(valid, ct, 0.0)
+        ra = np.remainder(u + self.ra_centre, _TWO_PI)
+        dec = np.arcsin(s)
+        z = self._response(ra, dec)
+        theta = np.arccos(ct)
+        amp = self.reference_amplitude * np.exp(
+            np.where(valid, la, 0.0) + 1j * (np.where(valid, r, 0.0) + self.arg_offset)
+        )
+        alpha, psi0, phase0 = self._psi_phase(
+            amp, z, ct, np.where(valid, w, 0.0) + self.psi4_centre
+        )
+        dist = (1 + ct) ** 2 / 4 / np.abs(alpha)
+        out.update(
+            ra=ra,
+            dec=dec,
+            geocent_time=self.reference_time + t - geocenter_time_delay(
+                self.vertex, self.gmst, ra, dec
+            ),
+            theta_jn=theta,
+            luminosity_distance=dist,
+            psi=np.remainder(psi0 + LATTICE[k, 0], np.pi),
+            phase=np.remainder(phase0 + LATTICE[k, 1], _TWO_PI),
+        )
+        log_j += np.log(np.cos(dec)) + np.log(8.0) + np.log(np.sin(theta)) - np.log(dist)
+        valid &= np.isfinite(dist) & (dist > 0) & (np.sin(theta) > 0)
+        return out, valid, log_j
+
+    def describe(self):
+        if not self.fitted:
+            return "unfitted"
+        return (
+            f"phase sign {self.phase_sign:+d}; branch shares "
+            f"{np.round(self.p_k, 3).tolist()}; sd " + self._column_sd()
+        )
+
+
 class ChartFlowProposal(FlowProposal):
-    """A flow proposal in a chart (:class:`SheetChart`, :class:`RingChart`;
-    see the module notes).
+    """A flow proposal in a chart (:class:`SheetChart`, :class:`RingChart`,
+    :class:`SingleChart`; see the module notes).
 
     The chart replaces nessai's reparameterisations: it is refitted to the
     training points (``check_state``) at every training, and the branch
@@ -679,7 +872,7 @@ class ChartFlowProposal(FlowProposal):
     Parameters
     ----------
     model : :obj:`nessai.model.Model`
-    chart : :class:`SheetChart` or :class:`RingChart`
+    chart : :class:`SheetChart`, :class:`RingChart` or :class:`SingleChart`
     flow_config, training_config : dict, optional
         Of the flow; resuming keeps them (the sampler passes the
         configuration of its main proposal).
@@ -864,6 +1057,69 @@ class RingChartFlowProposal(ChartFlowProposal):
 
 
 
+class SingleChartFlowProposal(ChartFlowProposal):
+    """A flow proposal in the chart of a single interferometer
+    (:class:`SingleChart`): a whole run's proposal.
+
+    Parameters
+    ----------
+    model : :obj:`nessai.model.Model`
+    tensor, vertex, reference_time, phase_sign
+        As for :class:`SingleChart`.
+    flow_config, training_config
+        Default :data:`DEFAULT_FLOW_CONFIG`, :data:`DEFAULT_TRAINING_CONFIG`.
+    kwargs
+        As for :class:`ChartFlowProposal`.
+    """
+
+    def __init__(self, model, tensor, vertex, reference_time, phase_sign=None,
+                 flow_config=None, training_config=None, **kwargs):
+        chart = SingleChart(tensor, vertex, reference_time, model.names, phase_sign)
+        super().__init__(
+            model,
+            chart,
+            flow_config or DEFAULT_FLOW_CONFIG,
+            training_config or DEFAULT_TRAINING_CONFIG,
+            **kwargs,
+        )
+
+
+def _bound_proposal_class(base, geometry, class_name):
+    """``base`` with ``geometry`` bound into its constructor, published at
+    module scope as ``class_name`` so checkpoints unpickle."""
+
+    class _Bound(base):
+        def __init__(self, model, flow_config=None, training_config=None, **kwargs):
+            super().__init__(
+                model,
+                flow_config=flow_config,
+                training_config=training_config,
+                **geometry,
+                **kwargs,
+            )
+
+    _Bound.__module__ = __name__
+    _Bound.__qualname__ = class_name
+    _Bound.__name__ = class_name
+    globals()[class_name] = _Bound
+    return _Bound
+
+
+def single_chart_proposal_class(
+    tensor, vertex, reference_time, phase_sign=None,
+    class_name="BoundSingleChartFlowProposal",
+):
+    """A :class:`SingleChartFlowProposal` subclass with the interferometer's
+    geometry bound (see :func:`ring_chart_proposal_class`)."""
+    geometry = dict(
+        tensor=np.asarray(tensor, dtype=float).tolist(),
+        vertex=np.asarray(vertex, dtype=float).tolist(),
+        reference_time=float(reference_time),
+        phase_sign=phase_sign,
+    )
+    return _bound_proposal_class(SingleChartFlowProposal, geometry, class_name)
+
+
 def ring_chart_proposal_class(
     tensors, vertices, reference_time, phase_sign=None,
     class_name="BoundRingChartFlowProposal",
@@ -889,22 +1145,7 @@ def ring_chart_proposal_class(
         reference_time=float(reference_time),
         phase_sign=phase_sign,
     )
-
-    class _BoundRingChartFlowProposal(RingChartFlowProposal):
-        def __init__(self, model, flow_config=None, training_config=None, **kwargs):
-            super().__init__(
-                model,
-                flow_config=flow_config,
-                training_config=training_config,
-                **geometry,
-                **kwargs,
-            )
-
-    _BoundRingChartFlowProposal.__module__ = __name__
-    _BoundRingChartFlowProposal.__qualname__ = class_name
-    _BoundRingChartFlowProposal.__name__ = class_name
-    globals()[class_name] = _BoundRingChartFlowProposal
-    return _BoundRingChartFlowProposal
+    return _bound_proposal_class(RingChartFlowProposal, geometry, class_name)
 
 class SheetChartRegions:
     """``region_proposal`` factory for nessai's partitioned nested sampling:
