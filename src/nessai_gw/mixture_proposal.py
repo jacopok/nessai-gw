@@ -22,6 +22,7 @@ component's draws; the two-stage test is exact.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import os
 
@@ -68,7 +69,14 @@ class MixtureProposalMixin:
     ``mixture_quantile`` (the cap's quantile; ``None`` takes the run's
     log-proposal-threshold quantile, else 0.005), ``reset_secondary`` (reset
     the secondary's flow when the run resets its own; off: warm, as the
-    chart runs).
+    chart runs), ``switch_lnx`` (see below).
+
+    With ``switch_lnx`` (a ln X, negative) there is no mixture: the run's
+    proposal draws the pools on its own (its own population, unchanged)
+    until the live points' ln X (``-max(it) / nlive``) first reaches
+    ``switch_lnx``, the secondary on its own (its own population, with a
+    copy of the run's truncation rules) from then on. The secondary is
+    trained from ``switch_warmup`` nats before the switch.
     """
 
     secondary_class = None
@@ -77,6 +85,10 @@ class MixtureProposalMixin:
     min_weight = 0.05
     mixture_quantile = None
     reset_secondary = False
+    switch_lnx = None
+    switch_warmup = 2.0
+    #: ln X at which the pools switched to the secondary (None: not yet)
+    switched_at = None
     #: settings of the run's proposal the secondary shares
     copied = ("drawsize", "accumulate_weights", "check_acceptance",
               "threshold_from_live_points", "clip_population_weights",
@@ -107,6 +119,18 @@ class MixtureProposalMixin:
             self._build_secondary()
         if not resumed:
             self.secondary.initialise()
+            self._copy_truncation()
+
+    def _copy_truncation(self):
+        """The secondary's truncation rules: a copy of the run's (for its
+        own population, after a switch)."""
+        scheme = getattr(self, "_truncation_scheme", None)
+        if scheme is None:
+            return
+        self.secondary._truncation_scheme = copy.deepcopy(scheme)
+        self.secondary._truncation_scheme.configure(self.secondary)
+        if hasattr(self.secondary, "_sync_truncation_state"):
+            self.secondary._sync_truncation_state()
 
     def update_output(self, output):
         super().update_output(output)
@@ -122,6 +146,7 @@ class MixtureProposalMixin:
             secondary.resume(model, config)
         else:
             secondary.resume(model, dict(config))
+        self._copy_truncation()
 
     def reset_model_weights(self, **kwargs):
         super().reset_model_weights(**kwargs)
@@ -130,11 +155,31 @@ class MixtureProposalMixin:
 
     # -- training ---------------------------------------------------------
     def train(self, x, plot=True):
-        super().train(x, plot=plot)
         live = getattr(self, "current_live_points", None)
+        if self.switched_at is not None:
+            # after the switch only the secondary's flow is used
+            self.secondary.current_live_points = live
+            self.secondary.train(x, plot=False)
+            self.training_count += 1
+            self.populated = False
+            return
+        super().train(x, plot=plot)
+        if self.switch_lnx is not None:
+            lnx = self._live_lnx()
+            if lnx is not None and lnx <= self.switch_lnx + self.switch_warmup:
+                self.secondary.current_live_points = live
+                self.secondary.train(x, plot=False)
+            return
         self.secondary.current_live_points = live
         self.secondary.train(x, plot=False)
         self._fit_mixture_weight(live if live is not None and len(live) else x)
+
+    def _live_lnx(self):
+        """ln X of the current live points, ``-max(it) / nlive``."""
+        live = getattr(self, "current_live_points", None)
+        if live is None or not len(live) or "it" not in (live.dtype.names or ()):
+            return None
+        return -float(np.max(live["it"])) / len(live)
 
     def _fit_mixture_weight(self, x):
         entry = dict(training_count=int(self.training_count))
@@ -200,6 +245,8 @@ class MixtureProposalMixin:
     def populate(self, worst_point, n_samples=10000, plot=True, r=None, max_samples=1_000_000):
         """Fill the pool with ``n_samples`` draws of the mixture, kept by
         rejection against the weight cap (see the module notes)."""
+        if self.switch_lnx is not None:
+            return self._populate_stage(worst_point, n_samples, plot, r, max_samples)
         st = datetime.datetime.now()
         if not self.initialised:
             raise RuntimeError("Proposal has not been initialised.")
@@ -274,9 +321,39 @@ class MixtureProposalMixin:
         self._checked_population = False
 
 
+    def _populate_stage(self, worst_point, n_samples, plot, r, max_samples):
+        """``switch_lnx``: the pool of the run's proposal, or of the
+        secondary once ln X has reached ``switch_lnx``."""
+        lnx = self._live_lnx()
+        if self.switched_at is None and lnx is not None and lnx <= self.switch_lnx:
+            self.switched_at = lnx
+            logger.info("Mixture: the pools are the secondary's from ln X %.2f on", lnx)
+        if self.switched_at is None:
+            return super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
+                                    max_samples=max_samples)
+        st = datetime.datetime.now()
+        sec = self.secondary
+        sec.current_live_points = self.current_live_points
+        if not sec.training_count:
+            sec.train(self.current_live_points, plot=False)
+        sec.populate(worst_point, n_samples=n_samples, plot=False, r=r, max_samples=max_samples)
+        self.x = sec.x
+        self.samples = sec.samples
+        self.indices = self.rng.permutation(self.samples.size).tolist()
+        sec.indices, sec.populated = [], False
+        self.population_acceptance = sec.population_acceptance
+        if self.check_acceptance and getattr(sec, "acceptance", None):
+            self.acceptance.append(sec.acceptance[-1])
+        self.population_time += datetime.datetime.now() - st
+        self.populated_count += 1
+        self.populated = True
+        self._checked_population = False
+
+
 def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None,
                            mixture_weight=0.5, min_weight=0.05, mixture_quantile=None,
-                           reset_secondary=False, class_name="MixtureFlowProposal"):
+                           reset_secondary=False, switch_lnx=None, switch_warmup=2.0,
+                           class_name="MixtureFlowProposal"):
     """``primary_class`` (the run's proposal) mixed with a second proposal
     (see :class:`MixtureProposalMixin`), published at module scope as
     ``class_name`` so checkpoints unpickle (build it again before resuming).
@@ -294,6 +371,10 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
     mixture_weight : float or None
         The secondary's share of the draws; ``None`` fits it to the live
         points after every training.
+    switch_lnx, switch_warmup : float, optional
+        Instead of a mixture, the run's proposal until ln X reaches
+        ``switch_lnx``, the secondary after (see
+        :class:`MixtureProposalMixin`).
     """
     attrs = dict(
         secondary_class=secondary_class,
@@ -302,6 +383,8 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
         min_weight=float(min_weight),
         mixture_quantile=mixture_quantile,
         reset_secondary=bool(reset_secondary),
+        switch_lnx=None if switch_lnx is None else float(switch_lnx),
+        switch_warmup=float(switch_warmup),
         __module__=__name__,
         __qualname__=class_name,
     )

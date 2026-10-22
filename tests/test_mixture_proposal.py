@@ -126,3 +126,39 @@ def test_weight_checked_in_class():
     assert cls.mixture_weight == 0.25 and cls.secondary_class is FlowProposal
     import nessai_gw.mixture_proposal as module
     assert getattr(module, "ToyCheckMixtureFlowProposal") is cls
+
+
+def test_stage_switch(tmp_path):
+    """With switch_lnx: the run's proposal's own pools until ln X reaches
+    it, the secondary's after; after the switch only the secondary trains."""
+    model = Box()
+    model.set_rng(np.random.default_rng(0))
+    cls = mixture_proposal_class(FlowProposal, FlowProposal,
+                                 dict(flow_config=FLOW, training_config=TRAINING),
+                                 switch_lnx=-2.0, switch_warmup=1.0,
+                                 class_name="ToySwitchFlowProposal")
+    prop = cls(model, flow_config=FLOW, training_config=TRAINING, output=str(tmp_path),
+               poolsize=300, plot=False)
+    prop.rng = np.random.default_rng(3)
+    prop.initialise()
+    x = live_points(model, n=1000)
+    x["it"] = np.arange(1000)  # ln X ~ -1: before the switch, outside the warm-up
+    prop.current_live_points = x
+    prop.train(x, plot=False)
+    assert prop.secondary.training_count == 0
+    prop.populate(x[0], n_samples=300, plot=False)
+    assert prop.switched_at is None and prop.samples.size == 300
+    x["it"] = np.arange(1000) + 1600  # ln X -2.6: switched
+    prop.current_live_points = x
+    count = prop.training_count
+    prop.populate(x[0], n_samples=300, plot=False)
+    assert prop.switched_at == pytest.approx(-2.599)
+    assert prop.secondary.training_count == 1  # trained at the switch
+    assert prop.samples.size == 300 and len(prop.indices) == 300 and prop.populated
+    flow_state = {k: v.clone() for k, v in prop.flow.model.state_dict().items()}
+    prop.train(x, plot=False)
+    assert prop.training_count == count + 1 and prop.secondary.training_count == 2
+    for k, v in prop.flow.model.state_dict().items():
+        assert (v == flow_state[k]).all()
+    copy = pickle.loads(pickle.dumps(prop))
+    assert copy.switched_at == prop.switched_at
