@@ -164,6 +164,7 @@ from . import nessai_logger
 from ._geometry import SPEED_OF_LIGHT as _SPEED_OF_LIGHT
 from ._geometry import greenwich_mean_sidereal_time as _greenwich_mean_sidereal_time
 from ._geometry import gmst_hours_before
+from .reparameterisations.time import TIME_PARAMETERS
 
 logger = nessai_logger.getChild(__name__)
 
@@ -668,12 +669,13 @@ class TriangularDetectorGroupAction:
                 torch.remainder(point_dict["phi_jl"] + np.pi, _TWO_PI),
                 point_dict["phi_jl"],
             )
-        if "geocent_time" in point_dict:
-            out["geocent_time"] = (
-                point_dict["geocent_time"]
-                + self._geocenter_delay(ra, dec)
-                - self._geocenter_delay(ra_t, dec_t)
-            )
+        for key in TIME_PARAMETERS:
+            if key in point_dict:
+                out[key] = (
+                    point_dict[key]
+                    + self._geocenter_delay(ra, dec)
+                    - self._geocenter_delay(ra_t, dec_t)
+                )
 
         return out
 
@@ -873,7 +875,7 @@ class PrimeSpaceTriangularGroupAction:
         # detector-centre arrival time: invariant, carried through unchanged
         # (detector-center-time reparameterisation).
         self._t_det = None
-        for cand in ("t_det", "t_det_prime", "detector_time", "geocent_time"):
+        for cand in ("t_det", "t_det_prime", "detector_time", *TIME_PARAMETERS):
             if cand in names:
                 self._t_det = cand
                 break
@@ -2140,6 +2142,14 @@ CHIRP_DISTANCE_REQUIRES = ("chirp_mass", "theta_jn", "ra", "dec", "psi")
 PRECESSING_SPIN_PARAMETERS = ("a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl")
 
 
+def _time_parameter(sampling_parameters):
+    """The coalescence-time parameter sampled: ``geocent_time_offset`` if
+    present, else ``geocent_time`` (see :data:`TIME_PARAMETERS`)."""
+    names = set(sampling_parameters)
+    return next((name for name in reversed(TIME_PARAMETERS) if name in names),
+                "geocent_time")
+
+
 def triangular_group_reparameterisations(
     sampling_parameters,
     reference_time,
@@ -2462,9 +2472,11 @@ def triangular_group_reparameterisations(
     # ``detector-center-time`` and ``polarisation-ellipse`` read ``ra`` / ``dec``
     # -- and ``polarisation-ellipse`` supplies the ``theta_jn`` that
     # ``polarisation-phase`` needs, so it has to sit between the two.
-    _rank = {"phase": 0, "geocent_time": 0}
+    # the coalescence time: bilby's GPS time or its offset from an origin
+    time_name = _time_parameter(sampling_parameters)
+    _rank = {"phase": 0, time_name: 0}
     if polarisation_ellipse is not None:
-        _rank["geocent_time"] = 1
+        _rank[time_name] = 1
         _rank["theta_jn"] = 1
     if chirp_distance:
         # Depends on chirp_mass, theta_jn, ra, dec and psi on its inverse --
@@ -2487,16 +2499,17 @@ def triangular_group_reparameterisations(
     # rank puts it between the two.
     if time_reference_frequency is not None:
         missing = {"chirp_mass", "mass_ratio"} - set(sampling_parameters)
-        if missing or "geocent_time" not in sampling_parameters:
+        if missing or time_name not in sampling_parameters:
             raise ValueError(
-                "time_reference_frequency needs 'geocent_time', 'chirp_mass' "
-                f"and 'mass_ratio' in the sampling parameters; missing "
-                f"{sorted(missing | ({'geocent_time'} - set(sampling_parameters)))}"
+                "time_reference_frequency needs the time (one of "
+                f"{TIME_PARAMETERS}), 'chirp_mass' and 'mass_ratio' in the "
+                f"sampling parameters; missing "
+                f"{sorted(missing | ({time_name} - set(sampling_parameters)))}"
             )
         # The time at a frequency reads the chirp mass, mass ratio, spins and
         # (with time_to_merger) tides on its inverse (effective-spin and
         # effective-tidal-deformability are rank -1): rank it ahead of them.
-        _rank["geocent_time"] = -2
+        _rank[time_name] = -2
     elif time_to_merger is not None:
         raise ValueError("time_to_merger needs time_reference_frequency")
     if waveform_phase is not None:
@@ -2588,7 +2601,7 @@ def triangular_group_reparameterisations(
                     "reparameterisation": "angle-sine",
                     "update_bounds": False,
                 }
-        elif name == "geocent_time":
+        elif name in TIME_PARAMETERS:
             # t_det = geocent_time + delay(ra, dec): the invariant
             # detector-centre arrival time.  ``ra`` / ``dec`` (sky-ra-dec) are
             # prerequisites.
@@ -2883,7 +2896,7 @@ def _prime_parameter_names(
                 out.append("delta_phase")
         elif name == "psi" and phase_coordinates == "arg-alpha-beta":
             continue  # folded into (arg_alpha, arg_beta)
-        elif name == "geocent_time":
+        elif name in TIME_PARAMETERS:
             # detector-center-time: single ``t_det`` coordinate (no suffix)
             out.append("t_det")
         elif name in _ANGLE_SCALE:
@@ -3586,7 +3599,7 @@ def make_triangular_group_flow_proposal(
         )
     names = list(sampling_parameters)
     missing = sorted(
-        {"ra", "dec", "theta_jn", "psi", "phase", "geocent_time"} - set(names)
+        {"ra", "dec", "theta_jn", "psi", "phase", _time_parameter(names)} - set(names)
     )
     if missing:
         raise RuntimeError(
@@ -3775,7 +3788,7 @@ def _make_triangle_amplitude_flow_proposal(
     names = list(sampling_parameters)
     missing = sorted(
         (set(NETWORK_AMPLITUDE_PARAMETERS) | {"ra", "dec", "chirp_mass",
-                                             "geocent_time"}) - set(names)
+                                             _time_parameter(names)}) - set(names)
     )
     if missing:
         raise RuntimeError(

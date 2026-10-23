@@ -38,6 +38,7 @@ class GWReparamMixin:
         "phase": ("angle-2pi", None),
         "psi": ("angle-pi", None),
         "geocent_time": ("time", None),
+        "geocent_time_offset": ("time", None),
         "time_jitter": ("periodic", None),
         "a_1": ("default", None),
         "a_2": ("default", None),
