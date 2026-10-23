@@ -101,6 +101,12 @@ class MixtureProposalMixin:
     race_start_lnx = -5.0
     race_every = 4
     race_wins = 2
+    #: a race pool of the secondary draws at most this many times (a pool
+    #: that has lost by far costs seconds, not minutes)
+    race_max_samples = 200_000
+    #: after a secondary pool that cost over ``race_backoff`` times the run's
+    #: the gap to its next pool doubles (up to 16 times ``race_every``)
+    race_backoff = 4.0
     #: the race's pools: dicts of ln X, component, seconds, new points, cost
     race_history = ()
     #: ln X at which the pools switched to the secondary (None: not yet)
@@ -381,13 +387,34 @@ class MixtureProposalMixin:
         logger.info("Mixture: the pools are the secondary's from ln X %.2f on (live ln L "
                     "spread %.1f)", self.switched_at, logl.max() - logl.min())
 
+    def _race_gap(self, history):
+        """Pools of the run's proposal before the secondary's next: ``race_every
+        - 1``, doubled after each secondary pool that lost by over
+        ``race_backoff`` times (up to 16 times), reset by a closer one."""
+        gap, last_run = self.race_every - 1, None
+        for e in history:
+            if e["component"] == 0:
+                last_run = e["cost"]
+            elif last_run is not None and e["cost"] > self.race_backoff * last_run:
+                gap = min(2 * gap + 1, 16 * self.race_every - 1)
+            else:
+                gap = self.race_every - 1
+        return gap
+
     def _race(self, worst_point, n_samples, plot, r, max_samples):
-        """One pool of the race: the secondary's every ``race_every``-th."""
+        """One pool of the race: the secondary's after ``_race_gap`` of the
+        run's."""
         history = list(self.race_history)
-        k = 1 if len(history) % self.race_every == self.race_every - 1 else 0
+        since = 0
+        for e in reversed(history):
+            if e["component"] == 1:
+                break
+            since += 1
+        k = 1 if since >= self._race_gap(history) else 0
         st = datetime.datetime.now()
         if k:
-            self._secondary_pool(worst_point, n_samples, r, max_samples)
+            self._secondary_pool(worst_point, n_samples, r,
+                                 min(max_samples, getattr(self, "race_max_samples", max_samples)))
         else:
             super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
                              max_samples=max_samples)

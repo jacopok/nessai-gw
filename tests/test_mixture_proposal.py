@@ -221,7 +221,10 @@ def test_stage_switch_race(tmp_path):
         if prop.switched_at is not None:
             break
     h = prop.race_history
-    assert [e["component"] for e in h] == [i % 2 for i in range(len(h))]
+    # a secondary pool after each run's pool, unless one lost by over 4x
+    for i, e in enumerate(h):
+        if e["component"] == 1:
+            assert i > 0 and h[i - 1]["component"] == 0
     wins, switched = 0, None
     for i, e in enumerate(h):
         if e["component"] == 1:
@@ -235,3 +238,19 @@ def test_stage_switch_race(tmp_path):
         n = len(h)
         prop.populate(x[0], n_samples=200, plot=False)
         assert len(prop.race_history) == n  # no more racing
+
+
+def test_race_backoff():
+    cls = mixture_proposal_class(FlowProposal, FlowProposal, switch_race=True, race_every=4,
+                                 class_name="ToyBackoffFlowProposal")
+    prop = object.__new__(cls)
+    run = lambda c: dict(component=0, cost=c)
+    sec = lambda c: dict(component=1, cost=c)
+    assert prop._race_gap([]) == 3
+    assert prop._race_gap([run(1.0)] * 3 + [sec(10.0)]) == 7
+    assert prop._race_gap([run(1.0)] * 3 + [sec(10.0)] + [run(1.0)] * 7 + [sec(10.0)]) == 15
+    assert prop._race_gap([run(1.0)] * 3 + [sec(10.0)] + [run(1.0)] * 7 + [sec(2.0)]) == 3
+    many = []
+    for _ in range(8):
+        many += [run(1.0)] * 3 + [sec(100.0)]
+    assert prop._race_gap(many) == 63
