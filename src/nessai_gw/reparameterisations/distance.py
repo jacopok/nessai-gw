@@ -44,6 +44,7 @@ class DistanceReparameterisation(RescaleToBounds):
     def __init__(
         self,
         parameters=None,
+        input_parameters=None,
         allowed_bounds=["upper"],
         allow_both=False,
         converter_kwargs=None,
@@ -52,6 +53,17 @@ class DistanceReparameterisation(RescaleToBounds):
         rng=None,
         **kwargs,
     ):
+        # FlowProposal's generic reparameterisation-spec path (an explicit
+        # ``reparameterisations={"luminosity_distance": {...}}`` dict, as
+        # opposed to GWReparamMixin's own default-reparameterisation path,
+        # which calls ``ReparamClass(parameters=p, ...)`` directly) only ever
+        # fills in ``input_parameters``, never ``parameters`` -- any
+        # ``"parameters"`` key in the config is consumed as a synonym for
+        # ``input_parameters`` before this class ever sees it. Without this
+        # fallback, ``parameters`` stays ``None`` and the ``len()`` below
+        # raises a ``TypeError`` for every explicit "distance" spec.
+        if parameters is None:
+            parameters = input_parameters
         if isinstance(parameters, str):
             parameters = [parameters]
 
@@ -91,6 +103,14 @@ class DistanceReparameterisation(RescaleToBounds):
 
         self.detect_edges_kwargs["allowed_bounds"] = allowed_bounds
         self.detect_edges_kwargs["allow_both"] = allow_both
-        self.detect_edges_kwargs["x_range"] = self.prior_bounds[
-            self.parameters[0]
-        ]
+        # Use the local `prior_bounds`/`parameters` rather than
+        # `self.prior_bounds`/`self.parameters`: the latter are only
+        # populated as a side effect of `super().__init__` above, which
+        # relies on `self.parameters` being backed by the real
+        # `Reparameterisation.parameters` property. That property is not
+        # reconstructed on a mocked/autospecced instance (it becomes an
+        # independent, disconnected attribute), so indexing through `self`
+        # silently reads a stale Mock there instead of raising -- the local
+        # variables are exactly what was just passed to `super().__init__`
+        # and are correct in both cases.
+        self.detect_edges_kwargs["x_range"] = prior_bounds[parameters[0]]
