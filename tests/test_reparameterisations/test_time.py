@@ -136,6 +136,83 @@ class TestDetectorCenterTime:
         )
 
 
+
+class TestDetectorCenterTimeOffset:
+    """The time as ``geocent_time_offset`` from a fixed origin, which the
+    inverse pass does not round onto the ~0.24 us grid of GPS times."""
+
+    def _reparam(self, time_origin=None):
+        return DetectorCenterTimeReparameterisation(
+            parameters="geocent_time_offset",
+            prior_bounds={"geocent_time_offset": [-0.1, 0.1]},
+            vertex=ET_EMR_VERTEX,
+            reference_time=REFERENCE_TIME,
+            time_origin=time_origin,
+            scale=SCALE,
+        )
+
+    def _round_trip(self, reparam, name, values, ra, dec):
+        n = len(values)
+        x = dict_to_live_points({name: values, "ra": ra, "dec": dec})
+        x_prime = empty_structured_array(n, names=["t_det", "ra", "dec"])
+        x_prime["ra"], x_prime["dec"] = ra, dec
+        _, x_prime, _ = reparam.reparameterise(x, x_prime, np.zeros(n))
+        x_in = x.copy()
+        x_in[name] = np.nan
+        x_i, _, log_j = reparam.inverse_reparameterise(
+            x_in, x_prime.copy(), np.zeros(n)
+        )
+        return x_prime["t_det"], x_i[name], log_j
+
+    def test_matches_geocent_time(self):
+        rng = np.random.default_rng(4)
+        n = 25
+        ra = rng.uniform(0, 2 * np.pi, n)
+        dec = np.arcsin(rng.uniform(-1, 1, n))
+        offset = rng.uniform(-0.05, 0.05, n)
+        t_det, _, _ = self._round_trip(
+            self._reparam(), "geocent_time_offset", offset, ra, dec
+        )
+        t_det_gps, _, _ = self._round_trip(
+            TestDetectorCenterTime()._reparam(), "geocent_time",
+            REFERENCE_TIME + offset, ra, dec,
+        )
+        # up to the rounding of REFERENCE_TIME + offset
+        np.testing.assert_allclose(t_det, t_det_gps, atol=2.5e-7 / SCALE)
+        # an origin other than the reference time only shifts the coordinate
+        t_det_shifted, _, _ = self._round_trip(
+            self._reparam(time_origin=REFERENCE_TIME + 0.25),
+            "geocent_time_offset", offset - 0.25, ra, dec,
+        )
+        np.testing.assert_allclose(t_det_shifted, t_det, atol=1e-12)
+
+    def test_resolves_offsets_below_the_spacing_of_gps_times(self):
+        n = 4
+        ra, dec = np.full(n, 1.0), np.full(n, 0.3)
+        offsets = 1e-3 + 5e-8 * np.arange(n)
+        t_det, back, _ = self._round_trip(
+            self._reparam(), "geocent_time_offset", offsets, ra, dec
+        )
+        np.testing.assert_allclose(np.diff(t_det) * SCALE, 5e-8, rtol=1e-6)
+        np.testing.assert_allclose(back, offsets, rtol=0, atol=1e-15)
+        # as GPS times, the inverse pass rounds them together
+        _, back_gps, _ = self._round_trip(
+            TestDetectorCenterTime()._reparam(), "geocent_time",
+            REFERENCE_TIME + offsets, ra, dec,
+        )
+        assert len(np.unique(back_gps)) < n
+
+    def test_group_reparameterisations_use_the_offset(self):
+        from nessai_gw.group_mixture import triangular_group_reparameterisations
+
+        names = ["chirp_mass", "mass_ratio", "luminosity_distance", "theta_jn",
+                 "ra", "dec", "psi", "phase", "geocent_time_offset"]
+        reps = triangular_group_reparameterisations(names, REFERENCE_TIME)
+        assert "geocent_time" not in reps
+        assert (reps["geocent_time_offset"]["reparameterisation"]
+                == "detector-center-time")
+
+
 # --- time at a reference frequency -------------------------------------------
 
 from nessai_gw.reparameterisations.mass import doppler_factor  # noqa: E402

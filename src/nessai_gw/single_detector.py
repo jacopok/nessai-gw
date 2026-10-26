@@ -67,6 +67,7 @@ from .group_mixture import (
     _uvw,
     detector_vertex_from_geodetic,
 )
+from .reparameterisations.time import TIME_PARAMETERS
 
 logger = nessai_logger.getChild(__name__)
 
@@ -406,12 +407,13 @@ class SingleInterferometerGroupAction(TriangularDetectorGroupAction):
                 torch.remainder(point_dict["phi_jl"] + np.pi, _TWO_PI),
                 point_dict["phi_jl"],
             )
-        if "geocent_time" in point_dict:
-            out["geocent_time"] = (
-                point_dict["geocent_time"]
-                + self._geocenter_delay(ra, dec)
-                - self._geocenter_delay(ra_t, dec_t)
-            )
+        for key in TIME_PARAMETERS:
+            if key in point_dict:
+                out[key] = (
+                    point_dict[key]
+                    + self._geocenter_delay(ra, dec)
+                    - self._geocenter_delay(ra_t, dec_t)
+                )
         return out
 
     def in_fundamental_domain(self, point_dict: dict) -> torch.Tensor:

@@ -13,6 +13,11 @@ from .mass import doppler_factor
 
 logger = nessai_logger.getChild(__name__)
 
+#: The coalescence-time parameters: bilby's geocentric GPS time, or its offset
+#: from a fixed origin (bilby_xG's ``geocent_time_offset``), which is resolved
+#: below the ~0.24 us spacing of doubles at GPS times.
+TIME_PARAMETERS = ("geocent_time", "geocent_time_offset")
+
 #: G M_sun / c^3 in seconds.
 _SOLAR_MASS_TIME = 4.925490947641267e-06
 
@@ -124,12 +129,21 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
     masses, mass ratio and spins are then also read on the inverse pass, so
     they are inverted first.
 
+    **The time as an offset.**  A GPS time ~1e9 s is resolved in double
+    precision only to 2**-22 s ~ 0.24 us; written back as ``geocent_time``,
+    every inverse pass rounds the time onto that grid, a comb of only ~20
+    teeth across the timing posterior of an SNR ~ 700 signal.  The parameter
+    can instead be ``geocent_time_offset``, the time from a fixed
+    ``time_origin`` (bilby_xG's, which keeps the phase of the response
+    exact), so that no GPS time is ever formed.
+
     Parameters
     ----------
     parameters : Union[str, List[str]]
-        Name of the parameter; must be ``geocent_time``.
+        Name of the parameter: ``geocent_time`` or ``geocent_time_offset``
+        (see :data:`TIME_PARAMETERS`).
     prior_bounds : Union[list, dict], optional
-        Prior bounds for ``geocent_time``.  Unused -- the coordinate is always
+        Prior bounds for the time.  Unused -- the coordinate is always
         rescaled by the fixed ``scale`` / ``reference_time``.
     vertex : array_like
         Earth-fixed detector position in metres, shape ``(3,)`` (the triangle
@@ -138,6 +152,10 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         Geocentric GPS time of the event; its GMST rotates between the
         equatorial and Earth-fixed frames and it is the constant subtracted in
         prime space.
+    time_origin : float, optional
+        For ``geocent_time_offset``, the GPS time it is measured from
+        (default ``reference_time``).  It only centres the coordinate: the map
+        is exact, with unit Jacobian, for any value.
     scale : float, optional
         Prime-space scale in seconds (default ``5e-3``, matching
         :data:`nessai_gw.group_mixture._GEOCENT_SCALE`).
@@ -181,6 +199,7 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         prior_bounds=None,
         vertex=None,
         reference_time=None,
+        time_origin=None,
         scale=5e-3,
         reference_frequency=None,
         frequency_range=(8.0, 300.0),
@@ -206,11 +225,12 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
                 call[key] = value
         super().__init__(**call)
 
-        if self.parameters != ["geocent_time"]:
+        if len(self.parameters) != 1 or self.parameters[0] not in TIME_PARAMETERS:
             raise RuntimeError(
-                "DetectorCenterTimeReparameterisation must act on "
-                f"'geocent_time'; got {self.parameters}"
+                "DetectorCenterTimeReparameterisation must act on one of "
+                f"{TIME_PARAMETERS}; got {self.parameters}"
             )
+        self._time = self.parameters[0]
         if vertex is None or reference_time is None:
             raise ValueError(
                 "DetectorCenterTimeReparameterisation requires `vertex` and "
@@ -222,6 +242,11 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
                 f"`vertex` must be shape (3,), got {self._vertex.shape}."
             )
         self._reference_time = float(reference_time)
+        # what is added to the offset to measure it from reference_time
+        self._origin_shift = (
+            0.0 if time_origin is None
+            else float(time_origin) - self._reference_time
+        )
         self._gmst = greenwich_mean_sidereal_time(self._reference_time)
         self.scale = float(scale)
 
@@ -287,6 +312,19 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         merger's: the detector-centre time then stays invariant under the
         group acting in that epoch's frame."""
         self._gmst = float(gmst)
+
+    def _relative_time(self, x):
+        """The time from ``reference_time`` (s), without forming a GPS time
+        when the parameter is the offset."""
+        if self._time == "geocent_time":
+            return x["geocent_time"] - self._reference_time
+        return x[self._time] + self._origin_shift
+
+    def _set_relative_time(self, x, t):
+        if self._time == "geocent_time":
+            x["geocent_time"] = self._reference_time + t
+        else:
+            x[self._time] = t - self._origin_shift
 
     def _delay(self, x):
         return geocenter_time_delay(
@@ -387,7 +425,7 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         them."""
         if self.reference_frequency is None or len(x) < 2:
             return
-        t_det = (x["geocent_time"] - self._reference_time) + self._delay(x)
+        t_det = self._relative_time(x) + self._delay(x)
         params = self._params(x)
         waveform = self._waveform()
         if self.adaptive:
@@ -482,7 +520,8 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
             ("_spins", ("chi_1", "chi_2")), ("_tau_ref", None),
             ("_time_to_merger", None), ("_time_to_merger_fn", None),
             ("_tides", ("lambda_1", "lambda_2")), ("_correction_degree", 2),
-            ("_correction", None),
+            ("_correction", None), ("_time", "geocent_time"),
+            ("_origin_shift", 0.0),
         ):
             state.setdefault(key, value)
         self.__dict__.update(state)
@@ -491,8 +530,9 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         # Subtract the GPS epoch *before* adding the delay: at ~1e9 s a float64
         # only resolves ~0.24 us, so ``geocent_time + delay`` would round
         # ``t_det`` onto that grid -- a comb of only ~20 teeth across the
-        # timing posterior of an SNR ~ 700 signal.
-        t_det = (x["geocent_time"] - self._reference_time) + self._delay(x)
+        # timing posterior of an SNR ~ 700 signal.  (With ``geocent_time``
+        # the inverse pass still rounds it so; the offset does not.)
+        t_det = self._relative_time(x) + self._delay(x)
         x_prime[self.prime_parameters[0]] = (t_det - self._shift(x)) / self.scale
         return x, x_prime, log_j + self._log_j
 
@@ -502,5 +542,5 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
             shift = self._shift(x)
         t_det = x_prime[self.prime_parameters[0]] * self.scale + shift
-        x["geocent_time"] = self._reference_time + (t_det - self._delay(x))
+        self._set_relative_time(x, t_det - self._delay(x))
         return x, x_prime, log_j - self._log_j
