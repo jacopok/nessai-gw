@@ -379,6 +379,11 @@ class MixtureProposalMixin:
             return super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
                                     max_samples=max_samples)
         self._secondary_pool(worst_point, n_samples, r, max_samples)
+        if not self.samples.size:
+            logger.warning("Mixture: the secondary's pool is empty (max_samples %d); "
+                           "this pool is the run's proposal's", max_samples)
+            super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
+                             max_samples=max_samples)
 
     def _switch(self):
         lnx = self._live_lnx()
@@ -427,7 +432,12 @@ class MixtureProposalMixin:
         logger.info("Mixture race at ln X %.2f: %s pool %.1f s, %d of %d above the threshold, "
                     "%.3f s per new point", entry["lnx"], ("network", "secondary")[k], seconds,
                     n_new, entry["n_pool"], entry["cost"])
-        if k:
+        if k and not self.samples.size:
+            # nothing kept within race_max_samples: a lost pool (the backoff
+            # spaces the next), and the draws come from the run's proposal
+            super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
+                             max_samples=max_samples)
+        elif k:
             costs = {}
             wins = 0
             for e in history:

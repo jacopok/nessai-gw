@@ -254,3 +254,39 @@ def test_race_backoff():
     for _ in range(8):
         many += [run(1.0)] * 3 + [sec(100.0)]
     assert prop._race_gap(many) == 63
+
+
+def test_empty_secondary_pool_falls_back(tmp_path):
+    """A secondary pool that keeps nothing (race_max_samples reached with
+    every draw rejected): a lost race pool, and the pool is the run's
+    proposal's, in the race and after a switch."""
+    model = Box()
+    model.set_rng(np.random.default_rng(0))
+    cls = mixture_proposal_class(FlowProposal, FlowProposal,
+                                 dict(flow_config=FLOW, training_config=TRAINING),
+                                 switch_race=True, race_start_lnx=-0.5, race_every=1,
+                                 class_name="ToyEmptyRaceFlowProposal")
+    prop = cls(model, flow_config=FLOW, training_config=TRAINING, output=str(tmp_path),
+               poolsize=200, plot=False)
+    prop.rng = np.random.default_rng(6)
+    prop.initialise()
+    x = live_points(model, n=1000)
+    x["it"] = np.arange(1000)  # ln X -1: racing
+    x["logL"] = np.linspace(-1, 0, 1000)
+    prop.current_live_points = x
+    prop.train(x, plot=False)
+    sec = prop.secondary
+    populate = sec.populate
+
+    def empty(*args, **kwargs):
+        populate(*args, **kwargs)
+        sec.x, sec.samples = sec.x[:0], sec.samples[:0]
+
+    sec.populate = empty
+    prop.populate(x[0], n_samples=200, plot=False)
+    assert prop.race_history[-1]["component"] == 1 and prop.race_history[-1]["n_pool"] == 0
+    assert prop.samples.size == 200 and len(prop.indices) == 200 and prop.switched_at is None
+    prop.draw(x[0])
+    prop._switch()
+    prop.populate(x[0], n_samples=200, plot=False)
+    assert prop.samples.size == 200 and len(prop.indices) == 200
