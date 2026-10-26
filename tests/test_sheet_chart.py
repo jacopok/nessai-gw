@@ -113,6 +113,30 @@ def test_round_trip_and_branches():
     np.testing.assert_allclose(np.sort(chart.p_k), np.sort(SHARES), atol=0.05)
 
 
+def test_time_offset_same_chart():
+    """On ``geocent_time_offset`` (the time from ``reference_time``) the
+    chart is the one on ``geocent_time``, and its inverse writes the offset
+    without forming a GPS time."""
+    x, _ = sheet_points()
+    names = [n if n != "geocent_time" else "geocent_time_offset" for n in NAMES]
+    xo = numpy_array_to_live_points(np.zeros((len(x), len(names))), names)
+    for n in names:
+        xo[n] = x[n] if n != "geocent_time_offset" else x["geocent_time"] - T0
+    xo["logL"] = x["logL"]
+    chart = make_chart().fit(x)
+    offset = SheetChart(ET_EMR_PLANE_NORMAL, ET_EMR_VERTEX, T0, names).fit(xo)
+    assert offset.time_name == "geocent_time_offset"
+    y, k, log_j = chart.forward(x)
+    yo, ko, log_jo = offset.forward(xo)
+    np.testing.assert_allclose(yo, y, atol=1e-6)
+    np.testing.assert_array_equal(ko, k)
+    np.testing.assert_allclose(log_jo, log_j, atol=1e-8)
+    out, valid, _ = offset.inverse(yo, ko)
+    assert valid.all() and "geocent_time" not in out
+    # far below the GPS grid (~0.24 us), which the offset avoids
+    assert np.max(np.abs(out["geocent_time_offset"] - xo["geocent_time_offset"])) < 1e-12
+
+
 def test_residuals_narrow_and_whitened():
     x, _ = sheet_points(noise=0.01)
     chart = make_chart().fit(x)

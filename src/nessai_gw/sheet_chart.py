@@ -128,13 +128,14 @@ from .reparameterisations.mass import doppler_factor
 from .reparameterisations.phase import PolarisationPhaseReparameterisation
 from .reparameterisations.spin import EffectiveSpinReparameterisation
 from .reparameterisations.tides import EffectiveTidalDeformabilityReparameterisation
-from .reparameterisations.time import DetectorCenterTimeReparameterisation
+from .reparameterisations.time import TIME_PARAMETERS, DetectorCenterTimeReparameterisation
 
 # a child of nessai's logger, so the messages reach the run's log
 logger = nessai_logger.getChild(__name__)
 
 _TWO_PI = 2.0 * np.pi
-#: The physical parameters the chart replaces.
+#: The physical parameters the chart replaces, with the coalescence time
+#: (``geocent_time``, or ``geocent_time_offset``: see :attr:`_Chart.time_name`).
 EXTRINSIC = (
     "ra",
     "dec",
@@ -204,17 +205,43 @@ class _Chart:
     _tides = None
     _time = None
     _phase = None
+    #: the coalescence-time parameter: ``geocent_time_offset`` (bilby_xG's
+    #: time from a fixed origin, the injection's time: no GPS time is
+    #: formed, so none is rounded to the ~0.24 us grid of doubles) when the
+    #: model samples it, else ``geocent_time``. The chart's times are
+    #: relative to ``reference_time``, which is the origin.
+    time_name = "geocent_time"
+    #: :data:`EXTRINSIC` with the time parameter (charts pickled before it:
+    #: ``geocent_time``)
+    extrinsic = EXTRINSIC
+
+    def _time_rel(self, x):
+        """The coalescence time relative to ``reference_time`` (s)."""
+        t = np.asarray(x[self.time_name], float)
+        return t if self.time_name != "geocent_time" else t - self.reference_time
+
+    def _time_out(self, t_rel):
+        """``{time parameter: value}`` for a time relative to
+        ``reference_time``."""
+        if self.time_name != "geocent_time":
+            return {self.time_name: t_rel}
+        return {self.time_name: self.reference_time + t_rel}
 
     def _set_names(self, names, phase_sign, extrinsic_columns):
         self.names = list(names)
-        missing = sorted(set(EXTRINSIC) - set(self.names))
+        self.time_name = next(
+            (n for n in reversed(TIME_PARAMETERS) if n in self.names), "geocent_time"
+        )
+        required = [self.time_name if n == "geocent_time" else n for n in EXTRINSIC]
+        self.extrinsic = required
+        missing = sorted(set(required) - set(self.names))
         if missing:
             raise ValueError(f"the chart needs {missing} in the model parameters")
         if phase_sign not in (None, -1, 1):
             raise ValueError("phase_sign must be None, -1 or 1")
         self.fixed_phase_sign = phase_sign
         self.phase_sign = -1 if phase_sign is None else phase_sign
-        self.intrinsic = [n for n in self.names if n not in EXTRINSIC]
+        self.intrinsic = [n for n in self.names if n not in self.extrinsic]
         self._extrinsic_columns = list(extrinsic_columns)
         self._set_columns()
         self.fitted = False
@@ -298,8 +325,8 @@ class _Chart:
         )
         self._time = (
             DetectorCenterTimeReparameterisation(
-                parameters=["geocent_time"],
-                prior_bounds={"geocent_time": bounds["geocent_time"]},
+                parameters=[self.time_name],
+                prior_bounds={self.time_name: bounds[self.time_name]},
                 vertex=self._timing_vertex,
                 reference_time=self.reference_time,
                 reference_frequency=time_reference_frequency,
@@ -622,7 +649,7 @@ class SheetChart(_Chart):
         cols += [
             _wrap(ra - self.ra_centre),
             np.sin(dec),
-            (np.asarray(x["geocent_time"], float) - self.reference_time) + delay
+            self._time_rel(x) + delay
             - self._time_shift(x),
         ]
         log_j += np.log(np.cos(dec))
@@ -671,7 +698,7 @@ class SheetChart(_Chart):
         out.update(
             ra=ra,
             dec=dec,
-            geocent_time=self.reference_time + t + t_shift - delay,
+            **self._time_out(t + t_shift - delay),
             theta_jn=theta,
             luminosity_distance=dist,
             psi=psi,
@@ -938,7 +965,7 @@ class RingChart(_Chart):
         i = self._fiducial_index(x)
         self._update_coordinates(x)
         phase = x["phase"] + self._phase_shift(x)
-        self.fiducial = {n: float(x[n][i]) for n in EXTRINSIC}
+        self.fiducial = {n: float(x[n][i]) for n in self.extrinsic}
         z = self._response(x["ra"], x["dec"])
         signs = (self.fixed_phase_sign,) if self.fixed_phase_sign else (-1, 1)
         spread = {}
@@ -974,7 +1001,7 @@ class RingChart(_Chart):
         psi = np.asarray(x["psi"], float)
         phase = np.asarray(x["phase"], float) + self._phase_shift(x)
         azimuth, cos_alpha = self._ring(ra, dec)
-        time = (np.asarray(x["geocent_time"], float) - self.reference_time) + (
+        time = self._time_rel(x) + (
             geocenter_time_delay(self.vertices[0], self.gmst, ra, dec)
         ) - self._time_shift(x)
         z = self._response(ra, dec)
@@ -1044,9 +1071,9 @@ class RingChart(_Chart):
         out.update(
             ra=ra,
             dec=dec,
-            geocent_time=self.reference_time + t + t_shift - geocenter_time_delay(
+            **self._time_out(t + t_shift - geocenter_time_delay(
                 self.vertices[0], self.gmst, ra, dec
-            ),
+            )),
             theta_jn=theta,
             luminosity_distance=dist,
             psi=np.remainder(psi_c + LATTICE[k, 0], np.pi),
@@ -1163,7 +1190,7 @@ class SingleChart(_Chart):
         i = self._fiducial_index(x)
         self._update_coordinates(x)
         phase = x["phase"] + self._phase_shift(x)
-        self.fiducial = {n: float(x[n][i]) for n in EXTRINSIC}
+        self.fiducial = {n: float(x[n][i]) for n in self.extrinsic}
         z = self._response(x["ra"], x["dec"])
         signs = (self.fixed_phase_sign,) if self.fixed_phase_sign else (-1, 1)
         spread = {}
@@ -1200,7 +1227,7 @@ class SingleChart(_Chart):
         cols += [
             _wrap(ra - self.ra_centre),
             np.sin(dec),
-            (np.asarray(x["geocent_time"], float) - self.reference_time)
+            self._time_rel(x)
             + geocenter_time_delay(self.vertex, self.gmst, ra, dec)
             - self._time_shift(x),
             np.cos(theta),
@@ -1244,9 +1271,9 @@ class SingleChart(_Chart):
         out.update(
             ra=ra,
             dec=dec,
-            geocent_time=self.reference_time + t + t_shift - geocenter_time_delay(
+            **self._time_out(t + t_shift - geocenter_time_delay(
                 self.vertex, self.gmst, ra, dec
-            ),
+            )),
             theta_jn=theta,
             luminosity_distance=dist,
             psi=np.remainder(psi0 + LATTICE[k, 0], np.pi),
@@ -1573,6 +1600,23 @@ def single_chart_proposal_class(
         coordinates=_coordinates(coordinates),
     )
     return _bound_proposal_class(SingleChartFlowProposal, geometry, class_name)
+
+
+def sheet_chart_proposal_class(
+    plane_normal, vertex, reference_time, phase_sign=None, coordinates=None,
+    class_name="BoundSheetChartFlowProposal",
+):
+    """A :class:`SheetChartFlowProposal` subclass with the triangle's
+    geometry bound (see :func:`ring_chart_proposal_class`), e.g. as the
+    edge-on component of :func:`nessai_gw.mixture_proposal.mixture_proposal_class`."""
+    geometry = dict(
+        plane_normal=[float(v) for v in plane_normal],
+        vertex=[float(v) for v in vertex],
+        reference_time=float(reference_time),
+        phase_sign=phase_sign,
+        coordinates=_coordinates(coordinates),
+    )
+    return _bound_proposal_class(SheetChartFlowProposal, geometry, class_name)
 
 
 def ring_chart_proposal_class(

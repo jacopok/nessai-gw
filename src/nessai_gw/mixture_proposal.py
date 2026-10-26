@@ -10,6 +10,14 @@ is the union of theirs: where one flow under-covers the live points (the
 ring chart at face-on, where its prior piles up) the other still proposes.
 There is no partition of the prior: one set of live points, one evidence.
 
+With ``split_activate`` the mixture starts at the run's diagonal split
+(:class:`nessai_gw.partition.DiagonalSplitTrigger`'s condition and line, as
+a partitioned run's split): until then the pools are the run's proposal's
+alone; from then on the run's proposal keeps the expert of the face-on side
+of the line and trains on that side's points, the secondary (the sheet chart)
+trains on the edge-on side's, and the pools are the mixture's. The same
+components as the partitioned run's two regions, without the partition.
+
 Rejection sampling is against the clip-mode weight cap ``c`` (the
 ``quantile`` of ``log prior - log q`` over the current live points, as the
 prior-relative log-proposal threshold): a draw is kept with probability
@@ -111,6 +119,16 @@ class MixtureProposalMixin:
     race_history = ()
     #: ln X at which the pools switched to the secondary (None: not yet)
     switched_at = None
+    #: start the mixture at the run's diagonal split (see the module notes)
+    split_activate = False
+    #: the secondary's side: the one whose live points' median |cos
+    #: theta_jn| is below this (as :class:`nessai_gw.sheet_chart.SheetChartRegions`)
+    split_max_abs_cos = 0.5
+    #: the split is used only if each side holds this share of the live
+    #: points (as the partition's ``n_min = nlive // 5``)
+    split_min_share = 0.2
+    #: the frozen split: ``(coordinates, cut, label of the run's side)``
+    split = None
     #: settings of the run's proposal the secondary shares
     copied = ("drawsize", "accumulate_weights", "check_acceptance",
               "threshold_from_live_points", "clip_population_weights",
@@ -178,6 +196,8 @@ class MixtureProposalMixin:
     # -- training ---------------------------------------------------------
     def train(self, x, plot=True):
         live = getattr(self, "current_live_points", None)
+        if self.split_activate:
+            return self._train_split(x, live, plot)
         if self.switched_at is not None:
             # after the switch only the secondary's flow is used
             self.secondary.current_live_points = live
@@ -194,6 +214,82 @@ class MixtureProposalMixin:
         self.secondary.current_live_points = live
         self.secondary.train(x, plot=False)
         self._fit_mixture_weight(live if live is not None and len(live) else x)
+
+    # -- split activation -------------------------------------------------
+    def _side(self, x):
+        """Whether each point of ``x`` is on the run's proposal's side of the
+        frozen split."""
+        coordinates, cut, label = self.split
+        return cut.classify(coordinates(x)) == label
+
+    def _train_split(self, x, live, plot):
+        if self.split is None:
+            super().train(x, plot=plot)
+            if live is not None and len(live):
+                self._try_split(live, x, plot)
+            return
+        mine = self._side(x)
+        live_mine = None if live is None else self._side(live)
+        # each component trains as a partitioned run's region would: on its
+        # side's points, seeing its side's live points (the population cap
+        # and the mixture weight then use all of them)
+        if live is not None:
+            self.current_live_points = live[live_mine]
+        try:
+            super().train(x[mine], plot=plot)
+        finally:
+            self.current_live_points = live
+        self.secondary.current_live_points = None if live is None else live[~live_mine]
+        self.secondary.train(x[~mine], plot=False)
+        self._fit_mixture_weight(live if live is not None and len(live) else x)
+
+    def _try_split(self, live, x, plot):
+        """Start the mixture once the diagonal split is active with both
+        experts trained (the partition's ``DiagonalSplitTrigger``)."""
+        from .partition import DiagonalSplitTrigger, SkyCoordinates
+
+        if getattr(self, "populating", False):
+            return
+        try:
+            coordinates = SkyCoordinates(["cos_theta_jn", "sky_v"], fold="plane")
+            coordinates.configure(self.model)
+            coordinates = coordinates.freeze(self)
+            cut = DiagonalSplitTrigger().propose(
+                coordinates(live), coordinates.period_list(), points=live, proposal=self)
+        except Exception as e:  # the check changes nothing: no mixture yet
+            logger.warning("Mixture: split check failed, not starting: %r", e)
+            return
+        if cut is None:
+            return
+        labels = cut.classify(coordinates(live))
+        counts = np.bincount(labels, minlength=2)
+        if counts.min() < self.split_min_share * len(live):
+            logger.info("Mixture: diagonal split leaves %s live points per side "
+                        "(< %.2f of them): not starting", counts.tolist(),
+                        self.split_min_share)
+            return
+        cos = np.abs(np.cos(np.asarray(live["theta_jn"], float)))
+        median = [float(np.median(cos[labels == k])) for k in (0, 1)]
+        edge = int(np.argmin(median))
+        if median[edge] >= self.split_max_abs_cos:
+            logger.info("Mixture: neither side of the diagonal split is edge-on "
+                        "(median |cos theta_jn| %.2f, %.2f): not starting", *median)
+            return
+        mine = 1 - edge
+        self.split = (coordinates, cut, mine)
+        lnx = self._live_lnx()
+        logger.info(
+            "Mixture: starts at the diagonal split %s (ln X %.2f): the run's proposal "
+            "keeps the side of %d live points (median |cos theta_jn| %.2f), the "
+            "secondary the edge-on side's %d (%.2f)", cut.describe(),
+            np.nan if lnx is None else lnx, counts[mine], median[mine],
+            counts[edge], median[edge])
+        restrict = getattr(self, "restrict_to_region", None)
+        if restrict is not None:
+            restrict(live[labels == mine])
+        self.populated = False
+        self.indices = []
+        self._train_split(x, live, plot)
 
     @property
     def _staged(self):
@@ -292,6 +388,9 @@ class MixtureProposalMixin:
         rejection against the weight cap (see the module notes)."""
         if self._staged:
             return self._populate_stage(worst_point, n_samples, plot, r, max_samples)
+        if self.split_activate and self.split is None:
+            return super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
+                                    max_samples=max_samples)
         st = datetime.datetime.now()
         if not self.initialised:
             raise RuntimeError("Proposal has not been initialised.")
@@ -471,7 +570,9 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
                            mixture_weight=0.5, min_weight=0.05, mixture_quantile=None,
                            reset_secondary=False, switch_lnx=None, switch_warmup=2.0,
                            switch_spread=None, switch_race=False, race_start_lnx=-5.0,
-                           race_every=4, race_wins=2, class_name="MixtureFlowProposal"):
+                           race_every=4, race_wins=2, split_activate=False,
+                           split_max_abs_cos=0.5, split_min_share=0.2,
+                           class_name="MixtureFlowProposal"):
     """``primary_class`` (the run's proposal) mixed with a second proposal
     (see :class:`MixtureProposalMixin`), published at module scope as
     ``class_name`` so checkpoints unpickle (build it again before resuming).
@@ -498,7 +599,13 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
         switch when the secondary's measured cost per new point beats the
         run's at ``race_wins`` of its pools in a row (see
         :class:`MixtureProposalMixin`).
+    split_activate, split_max_abs_cos, split_min_share : optional
+        Instead, the mixture from the run's diagonal split on, each
+        component on its side of the line (see the module notes).
     """
+    if split_activate and (switch_lnx is not None or switch_spread is not None
+                           or switch_race):
+        raise ValueError("split_activate takes no switch or race")
     attrs = dict(
         secondary_class=secondary_class,
         secondary_kwargs=dict(secondary_kwargs or {}),
@@ -513,6 +620,9 @@ def mixture_proposal_class(primary_class, secondary_class, secondary_kwargs=None
         race_start_lnx=float(race_start_lnx),
         race_every=int(race_every),
         race_wins=int(race_wins),
+        split_activate=bool(split_activate),
+        split_max_abs_cos=float(split_max_abs_cos),
+        split_min_share=float(split_min_share),
         __module__=__name__,
         __qualname__=class_name,
     )
