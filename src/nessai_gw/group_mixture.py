@@ -774,8 +774,11 @@ class PrimeSpaceTriangularGroupAction:
     """
 
     def __init__(self, action, prime_names, ellipse=None, ellipse_scale=1.0,
-                 ellipse_coordinate="angle"):
+                 ellipse_coordinate="angle", sheet=None):
         self._action = action
+        # ``sheet-residual``: psi and phase are carried relative to the
+        # SheetPhase prediction at the sky position.
+        self._sheet = sheet
         # ``polarisation-ellipse``: the theta_jn prime is the residual
         # ``cos theta_jn - cos iota*(n)``, so ``sign(cos theta_jn)`` -- which the
         # delta_phase coordinate needs -- is no longer just ``-sign(u)``.  The
@@ -845,6 +848,17 @@ class PrimeSpaceTriangularGroupAction:
         if "arg_alpha" in names and "arg_beta" in names:
             self._arg_ab = ("arg_alpha", "arg_beta")
 
+        # sheet-residual: psi and phase minus the SheetPhase prediction at the
+        # sky (SheetResidualReparameterisation).  They replace psi and
+        # delta_phase; decoded to (psi, phase) at the original sky and
+        # re-encoded at the mapped one.
+        self._sheet_res = None
+        if "psi_res" in names and "sigma_res" in names:
+            if self._sheet is None:
+                raise RuntimeError("psi_res / sigma_res need the `sheet`")
+            self._sheet_res = ("psi_res", "sigma_res")
+        self._joint = self._arg_ab is not None or self._sheet_res is not None
+
         # delta_phase: single linear polarisation-phase coordinate
         self._delta_phase = None
         for cand in ("delta_phase", "delta_phase_prime"):
@@ -883,7 +897,7 @@ class PrimeSpaceTriangularGroupAction:
         missing = []
         if self._sky2d is None:
             missing.append("sky_u/sky_v")
-        if self._arg_ab is None:
+        if not self._joint:
             if "psi" not in self._pair and not self._psi_single:
                 missing.append("psi (psi_x/_y or psi_prime)")
             if self._delta_phase is None:
@@ -948,6 +962,13 @@ class PrimeSpaceTriangularGroupAction:
                 e1 > e0, torch.remainder(ph0 + np.pi, _TWO_PI), ph0
             )
             r_psi = torch.ones_like(ra)
+        elif self._sheet_res is not None:
+            psi_s, phase_s = self._sheet.predict_torch(ra, sin_dec)
+            r_psi = (point_dict[self._sheet_res[0]] + 1.0) * (0.5 * np.pi)
+            r_sum = (point_dict[self._sheet_res[1]] + 1.0) * np.pi
+            psi = torch.remainder(r_psi + psi_s, np.pi)
+            phase = torch.remainder(r_sum - r_psi + phase_s, _TWO_PI)
+            r_psi = torch.ones_like(ra)
         elif self._psi_single:
             ang = point_dict["psi_prime"]
             psi = torch.remainder(
@@ -996,7 +1017,7 @@ class PrimeSpaceTriangularGroupAction:
         # ``phase`` itself is group-invariant, so recover the invariant piece and
         # let :meth:`_encode` rebuild delta_phase from the group-transformed psi
         # and cos(theta_jn) sign.
-        if self._arg_ab is None:
+        if not self._joint:
             delta_phase = torch.remainder(
                 (point_dict[self._delta_phase] + 1.0)
                 * np.pi
@@ -1042,8 +1063,8 @@ class PrimeSpaceTriangularGroupAction:
         out[self._sky2d[0]] = lam_f / _TWO_PI
         out[self._sky2d[1]] = 0.5 * (1.0 - z_f)
 
-        if self._arg_ab is not None:
-            pass  # psi is not a flow coordinate on this path
+        if self._joint:
+            pass  # psi is not a flow coordinate on these paths
         elif self._psi_single:
             a = torch.remainder(
                 mapped["psi"] * _ANGLE_SCALE["psi"], _TWO_PI
@@ -1074,6 +1095,16 @@ class PrimeSpaceTriangularGroupAction:
             av = torch.remainder(mapped["phase"] + mapped["psi"], _TWO_PI)
             out[self._arg_ab[0]] = au / np.pi - 1.0
             out[self._arg_ab[1]] = av / np.pi - 1.0
+            return {n: out[n] for n in self._prime_names}
+        if self._sheet_res is not None:
+            # relative to the prediction at the mapped sky
+            psi_s, phase_s = self._sheet.predict_torch(ra_t, sin_dec_t)
+            r_psi = torch.remainder(mapped["psi"] - psi_s, np.pi)
+            out[self._sheet_res[0]] = r_psi * (2.0 / np.pi) - 1.0
+            out[self._sheet_res[1]] = (
+                torch.remainder(r_psi + mapped["phase"] - phase_s, _TWO_PI)
+                / np.pi - 1.0
+            )
             return {n: out[n] for n in self._prime_names}
 
         # delta_phase = phase_invariant + sign(cos theta_jn)_out * psi_out.
@@ -1134,6 +1165,21 @@ class PrimeSpaceTriangularGroupAction:
             # base predicate's raw psi / phase cuts (psi in [0, pi/2), phase in
             # [0, pi)) are genuine half-plane cuts in (arg_alpha, arg_beta) and
             # select exactly one image per orbit.
+            return self._action.in_fundamental_domain(acted)
+        if self._sheet_res is not None:
+            # The base predicate's polarisation/phase clauses
+            # ((psi - polarisation_offset) mod pi < pi/2, phase mod 2 pi < pi)
+            # applied to the residuals (r_psi, r_psi + r_phase), as
+            # delta_phase stands in for phase below: at the canonical sky
+            # image the four images of the quarter turn differ in them by
+            # (pi/2, 0) and (0, pi) steps, so exactly one is in the cell, and
+            # it does not depend on where the prediction's principal value
+            # jumps.
+            acted["psi"] = (
+                (point_dict[self._sheet_res[0]] + 1.0) * (0.5 * np.pi)
+                + self._action.polarisation_offset
+            )
+            acted["phase"] = (point_dict[self._sheet_res[1]] + 1.0) * np.pi
             return self._action.in_fundamental_domain(acted)
         if self._action.phase_reflection:
             # The base action folds the phase-reflection Z2 by testing
@@ -2150,6 +2196,12 @@ def _time_parameter(sampling_parameters):
                 "geocent_time")
 
 
+#: ``phase_coordinates`` choices of the triangle group proposal.
+PHASE_COORDINATES = ("polarisation-phase", "arg-alpha-beta", "sheet-residual")
+#: The choices that replace both ``psi`` and ``phase`` by a pair.
+_JOINT_PHASE_COORDINATES = ("arg-alpha-beta", "sheet-residual")
+
+
 def triangular_group_reparameterisations(
     sampling_parameters,
     reference_time,
@@ -2175,6 +2227,7 @@ def triangular_group_reparameterisations(
     waveform_phase=None,
     amplitudes=False,
     amplitude_tensors=None,
+    sheet_phase=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2277,16 +2330,19 @@ def triangular_group_reparameterisations(
         Earth-fixed detector position (metres) for the ``detector-center-time``
         reparameterisation.  Defaults to :data:`ET_EMR_VERTEX`; pass the value
         from :func:`detector_vertex` for a different geometry.
-    phase_coordinates : {"polarisation-phase", "arg-alpha-beta"}, optional
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "sheet-residual"}, optional
         ``"polarisation-phase"`` (default): the single ``delta_phase`` coordinate
         described above, ``psi`` carried separately (``angle-pi`` /
         ``SingleAngle``).  ``"arg-alpha-beta"``: replace **both** ``psi`` and
         ``phase`` with the two circular-polarisation phases ``arg_alpha =
         (phase - psi)`` and ``arg_beta = (phase + psi)``
         (:class:`~nessai_gw.reparameterisations.phase.ArgAlphaBetaReparameterisation`),
-        which put the likelihood ridge on a flow axis.  Must match the
-        ``phase_coordinates`` passed to
-        :func:`make_triangular_group_flow_proposal`.
+        which put the likelihood ridge on a flow axis.  ``"sheet-residual"``:
+        replace both with ``psi`` and ``phase`` minus the values the sky
+        position predicts on the edge-on sheet
+        (:class:`~nessai_gw.reparameterisations.phase.SheetResidualReparameterisation`,
+        needs ``sheet_phase``).  Must match the ``phase_coordinates`` passed
+        to :func:`make_triangular_group_flow_proposal`.
     chirp_distance : bool, optional
         Reparameterise ``luminosity_distance`` as the Roulet et al. chirp
         distance instead of the default ``distance`` reparameterisation.
@@ -2372,6 +2428,9 @@ def triangular_group_reparameterisations(
         frequency).  Excludes ``chirp_distance`` and ``arg-alpha-beta``.
         Use with ``amplitudes=True`` in
         :func:`make_triangular_group_flow_proposal`.  Default ``False``.
+    sheet_phase : :class:`~nessai_gw._ellipse.SheetPhase`, optional
+        The prediction for ``phase_coordinates="sheet-residual"``; the same
+        instance must go to :func:`make_triangular_group_flow_proposal`.
     amplitude_tensors : array_like, optional
         With ``amplitudes``: the ``(3, 3, 3)`` tensors of the triangle (its
         A and E channels are used) or ``(2, 3, 3)`` of two sites.  Defaults
@@ -2450,10 +2509,15 @@ def triangular_group_reparameterisations(
             "doppler_vector needs 'ra' and 'dec' in the sampling parameters "
             "(the Doppler factor depends on the sky position)."
         )
-    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta"):
+    if phase_coordinates not in PHASE_COORDINATES:
         raise ValueError(
-            "phase_coordinates must be 'polarisation-phase' or "
-            f"'arg-alpha-beta'; got {phase_coordinates!r}"
+            f"phase_coordinates must be one of {PHASE_COORDINATES}; "
+            f"got {phase_coordinates!r}"
+        )
+    if (phase_coordinates == "sheet-residual") != (sheet_phase is not None):
+        raise ValueError(
+            "phase_coordinates='sheet-residual' goes with sheet_phase, and "
+            "sheet_phase only with it"
         )
 
     # ``polarisation-phase`` reads x-space ``psi`` and ``theta_jn`` on its
@@ -2514,11 +2578,12 @@ def triangular_group_reparameterisations(
         raise ValueError("time_to_merger needs time_reference_frequency")
     if waveform_phase is not None:
         missing = {"chirp_mass", "mass_ratio", "phase"} - set(sampling_parameters)
-        if missing or phase_coordinates != "polarisation-phase":
+        if missing or phase_coordinates == "arg-alpha-beta":
             raise ValueError(
                 "waveform_phase needs phase_coordinates='polarisation-phase' "
-                "and 'phase', 'chirp_mass' and 'mass_ratio' in the sampling "
-                f"parameters; missing {sorted(missing)}"
+                "or 'sheet-residual' and 'phase', 'chirp_mass' and "
+                "'mass_ratio' in the sampling parameters; missing "
+                f"{sorted(missing)}"
             )
         # The phase at a frequency reads the chirp mass, mass ratio, spins
         # and tides on its inverse, as the time at a frequency does.
@@ -2635,7 +2700,7 @@ def triangular_group_reparameterisations(
                         else None
                     )
         elif name == "phase":
-            if phase_coordinates == "arg-alpha-beta":
+            if phase_coordinates in _JOINT_PHASE_COORDINATES:
                 # arg_alpha = (phase - psi), arg_beta = (phase + psi): both
                 # circular-polarisation phases on the flow axes.  Keyed by the
                 # reparameterisation name (not "phase") with an explicit
@@ -2672,6 +2737,31 @@ def triangular_group_reparameterisations(
 
     if phase_coordinates == "arg-alpha-beta" and "phase" in sampling_parameters:
         reps["arg-alpha-beta"] = {"parameters": ["psi", "phase"]}
+    if phase_coordinates == "sheet-residual" and "phase" in sampling_parameters:
+        # reads ra / dec (default-added, so behind every explicit entry) and,
+        # with waveform_phase, the intrinsic parameters on its inverse:
+        # ahead of them (check_order inverts in reverse)
+        entry = {"parameters": ["psi", "phase"], "sheet": sheet_phase}
+        if waveform_phase is not None:
+            entry |= dict(
+                waveform_phase=waveform_phase,
+                frequency_range=[float(f) for f in time_frequency_range],
+                spins=(["chi_1", "chi_2"]
+                       if {"chi_1", "chi_2"} <= set(sampling_parameters)
+                       else None),
+                tides=(["lambda_1", "lambda_2"]
+                       if {"lambda_1", "lambda_2"} <= set(sampling_parameters)
+                       else None),
+            )
+            if doppler_chirp_mass:
+                entry["doppler_vector"] = [
+                    float(v) for v in np.asarray(doppler_vector, dtype=float)
+                ]
+        # chirp-distance reads psi on its inverse, so it goes ahead
+        head = {k: v for k, v in reps.items()
+                if v.get("reparameterisation") == "chirp-distance"}
+        reps = {**head, "sheet-residual": entry,
+                **{k: v for k, v in reps.items() if k not in head}}
     return reps
 
 
@@ -2772,6 +2862,7 @@ def _prime_parameter_names(
     time_to_merger=None,
     chirp_distance_inversion=False,
     waveform_phase=None,
+    sheet_phase=None,
 ):
     """Prime-parameter names *and order* nessai produces for this wiring.
 
@@ -2840,6 +2931,7 @@ def _prime_parameter_names(
                 time_to_merger=time_to_merger,
                 chirp_distance_inversion=chirp_distance_inversion,
                 waveform_phase=waveform_phase,
+                sheet_phase=sheet_phase,
             ),
             fallback_reparameterisation="zscore",
         )
@@ -2852,7 +2944,7 @@ def _prime_parameter_names(
             # place so the pre-bind placeholder has the right count/order.
             prime = _swap_sky_triple_for_pair(prime)
             if (
-                phase_coordinates != "arg-alpha-beta"
+                phase_coordinates not in _JOINT_PHASE_COORDINATES
                 and psi_single
                 and "psi_x" in prime
                 and "psi_y" in prime
@@ -2891,11 +2983,13 @@ def _prime_parameter_names(
                 # arg-alpha-beta consumes both psi and phase -> emit the pair
                 # here and skip psi below.
                 out += ["arg_alpha", "arg_beta"]
+            elif phase_coordinates == "sheet-residual":
+                out += ["psi_res", "sigma_res"]
             else:
                 # single ``delta_phase`` polarisation-phase coordinate
                 out.append("delta_phase")
-        elif name == "psi" and phase_coordinates == "arg-alpha-beta":
-            continue  # folded into (arg_alpha, arg_beta)
+        elif name == "psi" and phase_coordinates in _JOINT_PHASE_COORDINATES:
+            continue  # folded into the pair
         elif name in TIME_PARAMETERS:
             # detector-center-time: single ``t_det`` coordinate (no suffix)
             out.append("t_det")
@@ -3131,7 +3225,7 @@ def _make_group_proposal_class(
             rep = self._reparameterisation
             model_names = set(self.model.names)
             if (
-                phase_coordinates != "arg-alpha-beta"
+                phase_coordinates not in _JOINT_PHASE_COORDINATES
                 and psi_single
                 and "psi" in model_names
                 and "psi" not in set(rep.parameters)
@@ -3182,6 +3276,16 @@ def _make_group_proposal_class(
             (possibly wrong) predicted order, scrambling which physical
             quantity landed in which prime-vector column.
             """
+            # sheet-residual: the action reads the reparameterisation's
+            # SheetPhase -- after a resume that is the unpickled, fitted one,
+            # not the instance the class was built with
+            from .reparameterisations.phase import (
+                SheetResidualReparameterisation,
+            )
+
+            for rep in (getattr(self, "_reparameterisation", None) or {}).values():
+                if isinstance(rep, SheetResidualReparameterisation):
+                    action._sheet = rep.sheet
             model = getattr(self.flow, "model", None)
             prime = list(getattr(self, "prime_parameters", []) or [])
             if model is not None and prime:
@@ -3345,6 +3449,7 @@ def make_triangular_group_flow_proposal(
     reference_epoch=None,
     base_action=None,
     amplitudes=False,
+    sheet_phase=None,
 ):
     """Build a ``FlowProposal`` subclass wired for the triangular-detector group mixture.
 
@@ -3420,7 +3525,10 @@ def make_triangular_group_flow_proposal(
         posterior straddles it, points fold to different ``phase_step``
         images and the ``(psi, phase)`` corner looks like two offset ridges
         rather than one.  Prefer ``adaptive_domain``.  Default ``0.0``.
-    phase_coordinates : {"polarisation-phase", "arg-alpha-beta"}, optional
+    phase_coordinates : {"polarisation-phase", "arg-alpha-beta", "sheet-residual"}, optional
+        ``"sheet-residual"``: ``psi`` and ``phase`` minus the sky's prediction
+        (``sheet_phase``), the quarter turn folded on the residual; needs
+        ``polarisation_quarter``.
         ``"polarisation-phase"`` (default): ``delta_phase = phase + sign(cos
         theta_jn) psi`` + a separate ``psi`` coordinate.  ``"arg-alpha-beta"``:
         carry both circular-polarisation phases ``arg_alpha = (phase - psi)``
@@ -3592,10 +3700,15 @@ def make_triangular_group_flow_proposal(
         flow_model_factory,
     )
 
-    if phase_coordinates not in ("polarisation-phase", "arg-alpha-beta"):
+    if phase_coordinates not in PHASE_COORDINATES:
         raise ValueError(
-            "phase_coordinates must be 'polarisation-phase' or "
-            f"'arg-alpha-beta'; got {phase_coordinates!r}"
+            f"phase_coordinates must be one of {PHASE_COORDINATES}; "
+            f"got {phase_coordinates!r}"
+        )
+    if (phase_coordinates == "sheet-residual") != (sheet_phase is not None):
+        raise ValueError(
+            "phase_coordinates='sheet-residual' goes with sheet_phase, and "
+            "sheet_phase only with it"
         )
     names = list(sampling_parameters)
     missing = sorted(
@@ -3644,11 +3757,18 @@ def make_triangular_group_flow_proposal(
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,
         waveform_phase=waveform_phase,
+        sheet_phase=sheet_phase,
     )
+    if sheet_phase is not None and not base_action.polarisation_quarter:
+        raise ValueError(
+            "phase_coordinates='sheet-residual' needs polarisation_quarter: "
+            "the sheet's prediction is defined only up to the quarter turn"
+        )
     action = PrimeSpaceTriangularGroupAction(
         base_action, prime_names, ellipse=polarisation_ellipse,
         ellipse_scale=polarisation_ellipse_scale,
         ellipse_coordinate=polarisation_ellipse_coordinate,
+        sheet=sheet_phase,
     )
     gm_kwargs = {}
     import inspect as _inspect
@@ -3712,7 +3832,7 @@ def make_triangular_group_flow_proposal(
             bad.append("polarisation_quarter=False")
         if not phase_reflection:
             bad.append("phase_reflection=False")
-        if phase_coordinates != "polarisation-phase":
+        if phase_coordinates == "arg-alpha-beta":
             bad.append(f"phase_coordinates={phase_coordinates!r}")
         if polarisation_offset:
             bad.append("polarisation_offset != 0")
@@ -3727,10 +3847,13 @@ def make_triangular_group_flow_proposal(
                 "circular_psi_phase requires a version of nessai whose "
                 "make_group_mixture_flow accepts `circular_parameters`."
             )
-        circles = {
-            "psi_prime": POLARISATION_PHASE_CIRCLE,
-            action._delta_phase: POLARISATION_PHASE_CIRCLE,
-        }
+        if action._sheet_res is not None:
+            circles = {n: POLARISATION_PHASE_CIRCLE for n in action._sheet_res}
+        else:
+            circles = {
+                "psi_prime": POLARISATION_PHASE_CIRCLE,
+                action._delta_phase: POLARISATION_PHASE_CIRCLE,
+            }
         gm_kwargs["canonical_transform"] = CircularCanonicalTransform(
             circles, prime_names,
             inner=gm_kwargs.get("canonical_transform"),
@@ -3974,6 +4097,7 @@ def make_et_group_flow_proposal(
     waveform_phase=None,
     reference_epoch=None,
     amplitudes=False,
+    sheet_phase=None,
 ):
     """:func:`make_triangular_group_flow_proposal` with the ET-EMR geometry."""
     return make_triangular_group_flow_proposal(
@@ -4015,4 +4139,5 @@ def make_et_group_flow_proposal(
         waveform_phase=waveform_phase,
         reference_epoch=reference_epoch,
         amplitudes=amplitudes,
+        sheet_phase=sheet_phase,
     )

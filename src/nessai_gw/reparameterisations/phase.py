@@ -378,8 +378,15 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         phase and refit its offset on ``x`` (the training points)."""
         if self._waveform() is None or len(x) < 2:
             return
+        self.fit_offset(x, x["phase"] + self._psi_sign(x) * x["psi"])
+
+    def fit_offset(self, x, base):
+        """Choose the reference frequency and fit the offset so that
+        ``base + a(theta) / 2`` (the coordinate at the merger) is the most
+        concentrated on ``x``."""
+        if self._waveform() is None or len(x) < 2:
+            return
         params = self._params(x)
-        base = x["phase"] + self._psi_sign(x) * x["psi"]
         low, high = self.frequency_range
         freqs = np.geomspace(low, high, 33)
         offsets = self._tangent_intercepts(params, freqs)
@@ -582,6 +589,161 @@ class ArgAlphaBetaReparameterisation(Reparameterisation):
         x["phase"] = np.where(e1 > e0, np.mod(phase + np.pi, _TWO_PI), phase)
         x["psi"] = psi
         return x, x_prime, log_j - self._log_j
+
+
+class SheetResidualReparameterisation(Reparameterisation):
+    r"""``psi`` and ``phase`` minus what the sky position predicts.
+
+    With ``r_psi = (psi - psi*(n)) mod pi`` and ``r_phase = phase - phase*(n)``::
+
+        psi_res   = r_psi * 2/pi - 1                     in [-1, 1)
+        sigma_res = ((r_psi + r_phase) mod 2 pi) / pi - 1 in [-1, 1)
+
+    The second is the residual of ``psi + phase`` (as ``delta_phase`` is
+    ``phase + psi`` for the face-on branch): the polarisation/phase quarter
+    turn leaves it unchanged and shifts ``r_psi`` by ``pi/2``, so the folded
+    cell ``[-1, 0)^2`` has straight gluings, a product torus that
+    ``circular_psi_phase`` can map to two independent circles.
+
+    with ``(psi*, phase*)`` from a shared
+    :class:`~nessai_gw._ellipse.SheetPhase`.  At fixed sky this is a shift
+    of the ``(psi, phase)`` torus, so the Jacobian is the constant of the
+    rescaling.  On the edge-on sheet of a triangular detector ``psi`` and
+    ``phase`` are functions of the sky that wind about the face-on points;
+    the residual removes them.  The prediction is defined only up to the
+    polarisation/phase quarter turn, so this is meant for the triangle
+    group proposal with ``polarisation_quarter`` (see :class:`SheetPhase`).
+
+    :meth:`update` refits the prediction's fiducial and centring to the
+    live points (:meth:`SheetPhase.refit`).
+
+    With ``waveform_phase`` the phase is measured at a reference frequency
+    as in :class:`PolarisationPhaseReparameterisation` (same arguments):
+    ``phase + a(theta) / 2`` stands for ``phase`` above, the frequency
+    chosen to concentrate ``sigma_res``.  The offset depends only on the
+    intrinsic parameters, so the Jacobian and the group action are
+    unchanged; those parameters are read on the inverse pass.
+
+    Parameters
+    ----------
+    parameters : list of str
+        Must be ``["psi", "phase"]`` (in any order).
+    sheet : :class:`~nessai_gw._ellipse.SheetPhase`
+        The prediction, shared with the group action.
+    waveform_phase, frequency_range, correction_degree, doppler_vector, \
+    chirp_mass, mass_ratio, spins, tides : optional
+        As for :class:`PolarisationPhaseReparameterisation`.
+    """
+
+    one_to_one = False
+
+    def __init__(
+        self,
+        parameters=None,
+        prior_bounds=None,
+        sheet=None,
+        waveform_phase=None,
+        frequency_range=(8.0, 300.0),
+        correction_degree=4,
+        doppler_vector=None,
+        chirp_mass="chirp_mass",
+        mass_ratio="mass_ratio",
+        spins=("chi_1", "chi_2"),
+        tides=("lambda_1", "lambda_2"),
+        prior=None,
+        rng=None,
+        **kwargs,
+    ):
+        parent_params = inspect.signature(
+            Reparameterisation.__init__
+        ).parameters
+        call = dict(parameters=parameters, prior_bounds=prior_bounds)
+        if "rng" in parent_params:
+            call["rng"] = rng
+        for key, value in kwargs.items():
+            if key in parent_params:
+                call[key] = value
+        super().__init__(**call)
+
+        if set(self.parameters) != {"psi", "phase"}:
+            raise RuntimeError(
+                "SheetResidualReparameterisation must act on ['psi', 'phase']; "
+                f"got {self.parameters}"
+            )
+        if sheet is None:
+            raise ValueError("SheetResidualReparameterisation needs `sheet`")
+        if isinstance(
+            getattr(type(self), "parameters", None), property
+        ):
+            self.input_parameters = ["psi", "phase"]
+        else:
+            self.parameters = ["psi", "phase"]
+        self.sheet = sheet
+        self.prime_parameters = ["psi_res", "sigma_res"]
+        if hasattr(self, "output_parameters"):
+            self.output_parameters = list(self.prime_parameters)
+        self.requires = ["ra", "dec"]
+        #: the phase at a reference frequency: its offset model
+        self._phase_ref = None
+        if waveform_phase is not None:
+            self._phase_ref = PolarisationPhaseReparameterisation(
+                parameters=["phase"],
+                prior_bounds={"phase": [0.0, _TWO_PI]},
+                waveform_phase=waveform_phase,
+                frequency_range=frequency_range,
+                correction_degree=correction_degree,
+                doppler_vector=doppler_vector,
+                chirp_mass=chirp_mass, mass_ratio=mass_ratio,
+                spins=spins, tides=tides,
+            )
+            self.requires += [
+                n for n in self._phase_ref.requires
+                if n not in ("psi", "theta_jn", *self.requires)
+            ]
+        if hasattr(self, "inverse_input_parameters"):
+            self.inverse_input_parameters = list(
+                dict.fromkeys(
+                    list(self.inverse_input_parameters or []) + self.requires
+                )
+            )
+        # (2 / pi) * (1 / pi)
+        self._log_j = float(np.log(2.0) - 2.0 * np.log(np.pi))
+
+    def _shift(self, x):
+        """``a(theta) / 2``, the phase's offset at the reference frequency."""
+        if getattr(self, "_phase_ref", None) is None:
+            return 0.0
+        return self._phase_ref._shift(x)
+
+    def reparameterise(self, x, x_prime, log_j, **kwargs):
+        psi_s, phase_s = self.sheet.predict(x["ra"], x["dec"])
+        r_psi = np.mod(x["psi"] - psi_s, np.pi)
+        x_prime[self.prime_parameters[0]] = r_psi * 2.0 / np.pi - 1.0
+        x_prime[self.prime_parameters[1]] = (
+            np.mod(r_psi + x["phase"] + self._shift(x) - phase_s, _TWO_PI)
+            / np.pi - 1.0
+        )
+        return x, x_prime, log_j + self._log_j
+
+    def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
+        psi_s, phase_s = self.sheet.predict(x["ra"], x["dec"])
+        r_psi = (x_prime[self.prime_parameters[0]] + 1.0) * np.pi / 2.0
+        r_sum = (x_prime[self.prime_parameters[1]] + 1.0) * np.pi
+        x["psi"] = np.mod(r_psi + psi_s, np.pi)
+        x["phase"] = np.mod(r_sum - r_psi + phase_s - self._shift(x), _TWO_PI)
+        return x, x_prime, log_j - self._log_j
+
+    def update(self, x, x_prime=None):
+        """Refit the phase's reference frequency and offset (to concentrate
+        ``sigma_res`` about the current prediction), then the prediction to
+        the phase measured there."""
+        if getattr(self, "_phase_ref", None) is not None and len(x):
+            psi_s, phase_s = self.sheet.predict(x["ra"], x["dec"])
+            self._phase_ref.fit_offset(
+                x, x["psi"] + x["phase"] - psi_s - phase_s)
+            x = x.copy()
+            x["phase"] = x["phase"] + self._shift(x)
+        self.sheet.refit(x)
 
 
 class FittedPhaseRotation(Reparameterisation):

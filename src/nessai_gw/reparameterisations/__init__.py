@@ -17,6 +17,7 @@ from .phase import (
     DeltaPhaseReparameterisation,
     FittedPhaseRotation,
     PolarisationPhaseReparameterisation,
+    SheetResidualReparameterisation,
     SingleAngleReparameterisation,
 )
 from .sky import EqualAreaSky
@@ -115,6 +116,11 @@ known_reparameterisations.add_reparameterisation(
 known_reparameterisations.add_reparameterisation(
     "arg-alpha-beta",
     ArgAlphaBetaReparameterisation,
+    {},
+)
+known_reparameterisations.add_reparameterisation(
+    "sheet-residual",
+    SheetResidualReparameterisation,
     {},
 )
 known_reparameterisations.add_reparameterisation(
