@@ -290,3 +290,29 @@ def test_empty_secondary_pool_falls_back(tmp_path):
     prop._switch()
     prop.populate(x[0], n_samples=200, plot=False)
     assert prop.samples.size == 200 and len(prop.indices) == 200
+
+
+@pytest.mark.parametrize("survivor", [0, 1])
+def test_split_collapse(mixture, survivor):
+    """A side of the split below ``split_collapse_share`` of the training
+    points: the mixture collapses to the other side's component, which
+    trains on all the points and alone fills the pool."""
+    prop, model, x = mixture
+    prop.split_activate = True
+    prop.split = "stub"
+    edge = x["x"] < -0.99  # ~0.5% of the points
+    prop._side = lambda y: (y["x"] >= -0.99) if survivor == 0 else (y["x"] < -0.99)
+    assert 0 < edge.mean() < prop.split_collapse_share
+    count = prop.training_count
+    prop.train(x, plot=False)
+    assert prop.split_survivor == survivor
+    assert prop.training_count == count + 1
+    assert np.exp(prop.mixture_log_weights[1]) == survivor
+    prop.populate(x[0], n_samples=500, plot=False)
+    assert prop.samples.size == 500
+    if survivor == 1:
+        assert prop.mixture_population_history[-1]["drawn"][0] == 0
+    # the collapse is for good
+    prop._side = lambda y: y["x"] > 0
+    prop.train(x, plot=False)
+    assert prop.split_survivor == survivor

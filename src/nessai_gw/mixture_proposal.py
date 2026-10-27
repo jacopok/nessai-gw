@@ -17,6 +17,10 @@ alone; from then on the run's proposal keeps the expert of the face-on side
 of the line and trains on that side's points, the secondary (the sheet chart)
 trains on the edge-on side's, and the pools are the mixture's. The same
 components as the partitioned run's two regions, without the partition.
+Once a side holds less than ``split_collapse_share`` of the training points
+(the clustered diagonal split's ``min_branch_fraction_floor``, at which its
+two experts collapse to one) the mixture collapses for good to the other
+side's component, trained on all the points.
 
 Rejection sampling is against the clip-mode weight cap ``c`` (the
 ``quantile`` of ``log prior - log q`` over the current live points, as the
@@ -129,6 +133,12 @@ class MixtureProposalMixin:
     split_min_share = 0.2
     #: the frozen split: ``(coordinates, cut, label of the run's side)``
     split = None
+    #: collapse the split once a side holds less than this share of the
+    #: training points (DiagonalSplitClusterWrapper.min_branch_fraction_floor)
+    split_collapse_share = 0.01
+    #: the component left after the collapse (0: the run's proposal, 1: the
+    #: secondary; None: not collapsed)
+    split_survivor = None
     #: settings of the run's proposal the secondary shares
     copied = ("drawsize", "accumulate_weights", "check_acceptance",
               "threshold_from_live_points", "clip_population_weights",
@@ -228,6 +238,17 @@ class MixtureProposalMixin:
             if live is not None and len(live):
                 self._try_split(live, x, plot)
             return
+        if self.split_survivor is None:
+            self._check_collapse(x)
+        if self.split_survivor == 0:
+            super().train(x, plot=plot)
+            return
+        if self.split_survivor == 1:
+            self.secondary.current_live_points = live
+            self.secondary.train(x, plot=False)
+            self.training_count += 1
+            self.populated = False
+            return
         mine = self._side(x)
         live_mine = None if live is None else self._side(live)
         # each component trains as a partitioned run's region would: on its
@@ -242,6 +263,23 @@ class MixtureProposalMixin:
         self.secondary.current_live_points = None if live is None else live[~live_mine]
         self.secondary.train(x[~mine], plot=False)
         self._fit_mixture_weight(live if live is not None and len(live) else x)
+
+    def _check_collapse(self, x):
+        """Collapse to one component once a side of the split holds less
+        than ``split_collapse_share`` of the training points ``x``."""
+        n_mine = int(self._side(x).sum())
+        counts = (n_mine, len(x) - n_mine)
+        if min(counts) >= self.split_collapse_share * len(x):
+            return
+        self.split_survivor = 0 if counts[0] >= counts[1] else 1
+        self.mixture_log_weights = np.where(np.arange(2) == self.split_survivor, 0.0, -np.inf)
+        lnx = self._live_lnx()
+        logger.info(
+            "Mixture: collapses at ln X %.2f to the %s alone (%d and %d training points "
+            "on the run's and the secondary's sides, < %.2f of them)",
+            np.nan if lnx is None else lnx,
+            "secondary" if self.split_survivor else "run's proposal",
+            counts[0], counts[1], self.split_collapse_share)
 
     def _try_split(self, live, x, plot):
         """Start the mixture once the diagonal split is active with both
@@ -388,7 +426,7 @@ class MixtureProposalMixin:
         rejection against the weight cap (see the module notes)."""
         if self._staged:
             return self._populate_stage(worst_point, n_samples, plot, r, max_samples)
-        if self.split_activate and self.split is None:
+        if self.split_activate and (self.split is None or self.split_survivor == 0):
             return super().populate(worst_point, n_samples=n_samples, plot=plot, r=r,
                                     max_samples=max_samples)
         st = datetime.datetime.now()
@@ -418,9 +456,10 @@ class MixtureProposalMixin:
                     continue
                 x, log_q_own, log_p, log_a1 = x[keep], log_q_own[keep], log_p[keep], log_a1[keep]
                 counts[k, 1] += len(x)
-                other = self.secondary if k == 0 else self
-                log_q = np.logaddexp(log_w_k[k] + log_q_own,
-                                     log_w_k[1 - k] + _component_log_q(other, x))
+                log_q = log_w_k[k] + log_q_own
+                if np.isfinite(log_w_k[1 - k]):
+                    other = self.secondary if k == 0 else self
+                    log_q = np.logaddexp(log_q, log_w_k[1 - k] + _component_log_q(other, x))
                 log_w = log_p - log_q
                 log_a = np.minimum(log_w - log_cap, 0.0)
                 keep = np.log(self.rng.random(len(x))) < log_a - log_a1
