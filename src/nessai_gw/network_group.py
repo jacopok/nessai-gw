@@ -887,10 +887,11 @@ def network_group_reparameterisations(
         which replaces ``chirp_distance`` and ``delta_phase``.  Needs two
         sites with one interferometer each.  Must match
         :func:`make_network_group_flow_proposal`.  Default ``False``.
-    observed_phase : :class:`~nessai_gw._ellipse.ObservedPhase`, optional
-        Take the phase the detectors observe out of ``delta_phase`` (its
-        ``sign h``, fitted at every training).  ``h`` is unchanged by the
-        quarter turn, so the group action is the same.  Not with
+    observed_phase : :class:`~nessai_gw._ellipse.ObservedPhase` or :class:`~nessai_gw._ellipse.ResponseFit`, optional
+        Take the predicted phase out of ``delta_phase`` (its ``term``, fitted
+        at every training) and, for a ResponseFit with ``psi_mode = "sky"``,
+        the sky's ``psi*(n)`` out of ``psi``.  Both predictions are unchanged
+        by the quarter turn, so the group action is the same.  Not with
         ``network_amplitudes``.  Default None.
     """
     if network_amplitudes and observed_phase is not None:
@@ -926,6 +927,10 @@ def network_group_reparameterisations(
     )
     if observed_phase is not None and "phase" in reps:
         reps["phase"]["observed"] = observed_phase
+        if getattr(observed_phase, "psi_mode", "none") != "none" and "psi" in sampling_parameters:
+            # psi relative to the sky's prediction (a ResponseFit): after the
+            # phase, which reads psi on its inverse, ahead of the sky
+            reps["psi"] = {"reparameterisation": "single-angle", "offset": observed_phase}
     return reps
 
 

@@ -383,6 +383,17 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             np.abs(np.mean(np.exp(1j * k * angle), axis=0)) for k in (1, 2)
         ])
 
+    def _psi_for_delta(self, x):
+        """``psi`` in ``delta_phase = phase + s psi``: with an ``observed``
+        that shifts ``psi`` by the sky's ``psi*(n)`` (ResponseFit), ``psi*
+        + (psi - psi*) mod pi``, so ``delta_phase`` wraps with the ``psi``
+        coordinate the group action sees (a wrap moves it by ``s pi``)."""
+        obs = getattr(self, "_observed", None)
+        if obs is None or getattr(obs, "psi_mode", "none") == "none":
+            return x["psi"]
+        psi_s = obs.psi_star(x["ra"], x["dec"])
+        return psi_s + np.mod(x["psi"] - psi_s, np.pi)
+
     def _observed_term(self, x):
         """``sign h`` of ``observed`` at ``x`` (0 without it)."""
         if getattr(self, "_observed", None) is None:
@@ -462,7 +473,7 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
 
     def reparameterise(self, x, x_prime, log_j, **kwargs):
         angle = np.mod(
-            (x["phase"] + self._psi_sign(x) * x["psi"] + self._shift(x)
+            (x["phase"] + self._psi_sign(x) * self._psi_for_delta(x) + self._shift(x)
              + self._observed_term(x)) * self.scale, _TWO_PI
         )
         x_prime[self.prime_parameters[0]] = angle / np.pi - 1.0
@@ -473,8 +484,8 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             (x_prime[self.prime_parameters[0]] + 1.0) * np.pi, _TWO_PI
         )
         x["phase"] = np.mod(
-            angle / self.scale - self._psi_sign(x) * x["psi"] - self._shift(x)
-            - self._observed_term(x),
+            angle / self.scale - self._psi_sign(x) * self._psi_for_delta(x)
+            - self._shift(x) - self._observed_term(x),
             _TWO_PI,
         )
         return x, x_prime, log_j - self._log_j
@@ -942,6 +953,10 @@ class SingleAngleReparameterisation(Reparameterisation):
     scale : float, optional
         ``2.0`` (default) -> period ``pi`` (``psi``); ``1.0`` -> period
         ``2*pi``.
+    offset : optional
+        An object whose ``psi_star(ra, dec)`` is subtracted from the angle
+        before the map (e.g. :class:`~nessai_gw._ellipse.ResponseFit`: ``psi``
+        relative to what the sky predicts); needs ``ra`` and ``dec``.
     prior : optional
         Accepted for registry compatibility and ignored.
     """
@@ -954,6 +969,7 @@ class SingleAngleReparameterisation(Reparameterisation):
         parameters=None,
         prior_bounds=None,
         scale=2.0,
+        offset=None,
         prior=None,
         rng=None,
         **kwargs,
@@ -977,16 +993,26 @@ class SingleAngleReparameterisation(Reparameterisation):
         self.scale = float(scale)
         base = self.parameters[0]
         self.prime_parameters = [f"{base}_prime"]
+        self._offset_fn = offset
+        if offset is not None:
+            self.requires = list(getattr(self, "requires", []) or []) + ["ra", "dec"]
+            if hasattr(self, "inverse_input_parameters"):
+                self.inverse_input_parameters = list(dict.fromkeys(
+                    list(self.inverse_input_parameters or []) + ["ra", "dec"]))
         self.output_parameters = [f"{base}_prime"]
         self._period = _TWO_PI / self.scale
         self._log_j = float(np.log(self.scale / np.pi))
 
+    def _offset(self, x):
+        fn = getattr(self, "_offset_fn", None)
+        return 0.0 if fn is None else fn.psi_star(x["ra"], x["dec"])
+
     def reparameterise(self, x, x_prime, log_j, **kwargs):
-        angle = np.mod(x[self.parameters[0]] * self.scale, _TWO_PI)
+        angle = np.mod((x[self.parameters[0]] - self._offset(x)) * self.scale, _TWO_PI)
         x_prime[self.prime_parameters[0]] = angle / np.pi - 1.0
         return x, x_prime, log_j + self._log_j
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
         angle = np.mod((x_prime[self.prime_parameters[0]] + 1.0) * np.pi, _TWO_PI)
-        x[self.parameters[0]] = np.mod(angle / self.scale, self._period)
+        x[self.parameters[0]] = np.mod(angle / self.scale + self._offset(x), self._period)
         return x, x_prime, log_j - self._log_j

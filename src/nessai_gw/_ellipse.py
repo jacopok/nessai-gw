@@ -604,3 +604,226 @@ class ObservedPhase:
         m_sum = np.angle(np.mean(np.exp(2j * r_sum)))
         self.offset_psi = float((m_psi - np.pi) / 4.0)
         self.offset_sum = float((m_sum - np.pi) / 2.0)
+
+
+class ResponseFit:
+    """Residual (psi, phase) predictions from the network's helicity fit.
+
+    In the dominant mode, at frozen detectors, detector ``k`` sees
+
+        D_k = conj(a_k(n)) alpha_R + a_k(n) alpha_L,
+        alpha_R = c_+ e^{2i(phase + psi)} / d,  alpha_L = c_- e^{2i(phase - psi)} / d,
+
+    ``a_k = F_+,k + i F_x,k`` at ``psi = 0`` and ``c_+- = (1 +- cos theta_jn)^2 / 4``:
+    the orientation is the pair of helicity amplitudes ``v = (alpha_R,
+    alpha_L)`` and ``A(n) = [conj a(n), a(n)]`` the network's response to
+    them.  For a reference data vector ``D`` (the response at the fiducial
+    point, the best live point at the last :meth:`refit`) the profile fit at
+    a sky is
+
+        v*(n) = (A^H A)^{-1} A^H D,
+
+    whose angles predict ``4 psi*(n) = arg alpha_R* - arg alpha_L*``,
+    ``2 (phase + psi)* = arg alpha_R*``, ``2 (phase - psi)* = arg alpha_L*``;
+    at the point's own ``(n, theta_jn, psi)`` the phase alone is best fitted
+    by ``2 phase* = arg sum_k conj(Z_k) D_k`` (``Z_k`` the response without
+    the phase).  The residual coordinates subtract, in the order
+    ``n -> psi -> phase``,
+
+    * ``psi_mode = "sky"``: ``psi*(n)``; ``"none"``: a constant;
+    * ``phase_mode = "sky"``: ``m = 1/2 arg alpha_s*(n)`` from ``delta_phase =
+      phase + s psi`` (``s = sign(cos theta_jn)``, ``alpha_+ = alpha_R``,
+      ``alpha_- = alpha_L``); ``"conditional"``: ``m = 1/2 arg(G e^{2 i s
+      psi})``, ``G = sum_k conj(Z_k) D_k``, the conditional fit given the
+      point's ``theta_jn`` and ``psi``.
+
+    Both ``m`` are unchanged by the polarisation/phase quarter turn and
+    ``psi*`` depends on the sky alone, so on a network whose group acts on
+    ``(psi, phase)`` alone the residuals are shifts of ``psi`` and
+    ``delta_phase`` (:meth:`psi_star`, :meth:`term`); as a :class:`SheetPhase`
+    stand-in (:meth:`predict`, :meth:`phase`, their torch versions) they go
+    through the triangle's residual path.  The principal-value cuts of
+    ``psi*`` and ``m`` are moved away from the points by :meth:`refit`.
+    :class:`ObservedPhase` is the same construction with ``D`` replaced by a
+    surrogate built from the point itself (``|Z_k| e^{i delta_k}``) and no
+    ``psi`` shift.  The fit is unweighted (detectors of one noise curve).
+
+    Parameters
+    ----------
+    tensors : array_like
+        ``(n_det, 3, 3)`` Earth-fixed detector tensors.
+    gmst : float
+        Greenwich mean sidereal time (rad) the responses are evaluated at.
+    psi_mode : {"sky", "none"}
+    phase_mode : {"sky", "conditional"}
+    """
+
+    orientation_dependent = True
+
+    def __init__(self, tensors, gmst, psi_mode="sky", phase_mode="sky"):
+        if psi_mode not in ("sky", "none") or phase_mode not in ("sky", "conditional"):
+            raise ValueError(f"psi_mode {psi_mode!r} / phase_mode {phase_mode!r}")
+        self.tensors = np.asarray(tensors, dtype=float)
+        self.gmst = float(gmst)
+        self.psi_mode, self.phase_mode = psi_mode, phase_mode
+        #: the reference data vector D (n_det,), complex; None before refit
+        self.data = None
+        self.branch_psi = 0.0
+        self.branch = 0.0
+        self.offset_psi = 0.0
+        self.offset_sum = 0.0
+
+    def __deepcopy__(self, memo):
+        return self
+
+    # -- the fit (numpy) --------------------------------------------------
+    def _w(self, ra, dec):
+        return _complex_response(self.tensors, ra, dec, self.gmst)
+
+    @staticmethod
+    def _z(w, cos_theta_jn, psi):
+        """``Z_k``: the response without the phase, ``(..., n_det)``."""
+        c = np.asarray(cos_theta_jn, dtype=float)[..., None]
+        a = w * np.exp(-2j * np.asarray(psi, dtype=float))[..., None]
+        return np.conj(a) * (1 + c) ** 2 / 4 + a * (1 - c) ** 2 / 4
+
+    def _helicities(self, w):
+        """``(alpha_R*, alpha_L*)`` of the profile fit at each sky."""
+        a = np.stack([np.conj(w), w], axis=-1)                   # (N, K, 2)
+        gram = np.einsum("nki,nkj->nij", np.conj(a), a)
+        rhs = np.einsum("nki,k->ni", np.conj(a), self.data)
+        v = np.linalg.solve(gram, rhs[..., None])[..., 0]
+        return v[:, 0], v[:, 1]
+
+    def _psi_raw(self, ar, al):
+        return 0.25 * np.angle(ar * np.conj(al) * np.exp(-1j * self.branch_psi)) \
+            + 0.25 * self.branch_psi
+
+    def _m_raw(self, w, cos_theta_jn, psi):
+        """``2 m`` as a complex phase factor (before the cut)."""
+        s = np.where(np.asarray(cos_theta_jn) >= 0, 1.0, -1.0)
+        if self.phase_mode == "sky":
+            ar, al = self._helicities(w)
+            return np.where(s > 0, ar, al)
+        g = np.sum(np.conj(self._z(w, cos_theta_jn, psi)) * self.data, axis=-1)
+        return g * np.exp(2j * s * np.asarray(psi))
+
+    def psi_star(self, ra, dec):
+        """``psi*(n)`` (0 with ``psi_mode = "none"``), numpy."""
+        if self.psi_mode == "none" or self.data is None:
+            return np.zeros(np.shape(ra))
+        return self._psi_raw(*self._helicities(self._w(ra, dec)))
+
+    def m(self, ra, dec, cos_theta_jn, psi):
+        """The prediction ``m`` of ``delta_phase`` (numpy)."""
+        if self.data is None:
+            return np.zeros(np.shape(ra))
+        z = self._m_raw(self._w(ra, dec), cos_theta_jn, psi)
+        return 0.5 * np.angle(z * np.exp(-1j * self.branch)) + 0.5 * self.branch
+
+    def term(self, ra, dec, cos_theta_jn, psi):
+        """What the network's ``delta_phase`` adds: ``-m``."""
+        return -self.m(ra, dec, cos_theta_jn, psi)
+
+    # -- the triangle's residual path ---------------------------------------
+    def predict(self, ra, dec):
+        """``(psi*, phase*)`` without the orientation-dependent part."""
+        psi = self.psi_star(ra, dec) + self.offset_psi
+        return psi, self.offset_sum - psi
+
+    def phase(self, ra, dec, cos_theta_jn, psi):
+        """``phase*`` with the residual of ``psi + phase`` equal to
+        ``delta_phase - m`` minus a constant (numpy)."""
+        s = np.where(np.asarray(cos_theta_jn) >= 0, 1.0, -1.0)
+        return ((1 - s) * psi - self.psi_star(ra, dec)
+                + self.m(ra, dec, cos_theta_jn, psi)
+                + self.offset_sum - self.offset_psi)
+
+    def _torch_parts(self, ra, sin_dec):
+        import torch
+
+        wr, wi = _complex_response_torch(self.tensors, ra, sin_dec, self.gmst)
+        return torch.complex(wr, wi)
+
+    def _helicities_torch(self, w):
+        import torch
+
+        a = torch.stack([torch.conj(w), w], dim=-1)
+        data = torch.as_tensor(self.data, dtype=a.dtype)
+        gram = torch.einsum("nki,nkj->nij", torch.conj(a), a)
+        rhs = torch.einsum("nki,k->ni", torch.conj(a), data)
+        v = torch.linalg.solve(gram, rhs[..., None])[..., 0]
+        return v[:, 0], v[:, 1]
+
+    def _psi_star_torch(self, w):
+        import torch
+
+        if self.psi_mode == "none" or self.data is None:
+            return torch.zeros(w.shape[0], dtype=w.real.dtype)
+        ar, al = self._helicities_torch(w)
+        z = ar * torch.conj(al) * np.exp(-1j * self.branch_psi)
+        return 0.25 * torch.angle(z) + 0.25 * self.branch_psi
+
+    def predict_torch(self, ra, sin_dec):
+        """:meth:`predict` for torch tensors."""
+        psi = self._psi_star_torch(self._torch_parts(ra, sin_dec)) + self.offset_psi
+        return psi, self.offset_sum - psi
+
+    def phase_torch(self, ra, sin_dec, cos_theta_jn, psi):
+        """:meth:`phase` for torch tensors, from ``ra`` and ``sin(dec)``."""
+        import torch
+
+        w = self._torch_parts(ra, sin_dec)
+        s = torch.where(cos_theta_jn >= 0, torch.ones_like(psi), -torch.ones_like(psi))
+        if self.data is None:
+            m = torch.zeros_like(psi)
+        else:
+            if self.phase_mode == "sky":
+                ar, al = self._helicities_torch(w)
+                z = torch.where(s > 0, ar, al)
+            else:
+                c = cos_theta_jn[..., None]
+                a = w * torch.exp(-2j * psi.to(w.dtype))[..., None]
+                zk = torch.conj(a) * (1 + c) ** 2 / 4 + a * (1 - c) ** 2 / 4
+                data = torch.as_tensor(self.data, dtype=zk.dtype)
+                g = torch.sum(torch.conj(zk) * data, dim=-1)
+                z = g * torch.exp(2j * (s * psi).to(g.dtype))
+            m = 0.5 * torch.angle(z * np.exp(-1j * self.branch)) + 0.5 * self.branch
+        return ((1 - s) * psi - self._psi_star_torch(w) + m
+                + self.offset_sum - self.offset_psi)
+
+    # -- refit ------------------------------------------------------------
+    def set_fiducial(self, point):
+        """The reference data vector: the response at ``point`` (a mapping
+        with ra, dec, theta_jn, psi, phase)."""
+        w = self._w(np.atleast_1d(point["ra"]), np.atleast_1d(point["dec"]))
+        z = self._z(w, np.atleast_1d(np.cos(point["theta_jn"])),
+                    np.atleast_1d(point["psi"]))[0]
+        self.data = z * np.exp(2j * float(point["phase"]))
+
+    def refit(self, x):
+        """Fiducial: the highest-likelihood point of ``x``; cuts: the circular
+        means of ``4 psi*`` and ``2 m`` over ``x``; offsets: the residuals'
+        circular means moved to the canonical cell's centre."""
+        if len(x) == 0:
+            return
+        names = x.dtype.names
+        logl = x["logL"] if "logL" in names else np.zeros(len(x))
+        i = int(np.nanargmax(np.where(np.isfinite(logl), logl, -np.inf))) \
+            if np.any(np.isfinite(logl)) else 0
+        self.set_fiducial({k: x[k][i] for k in ("ra", "dec", "theta_jn", "psi", "phase")})
+        w = self._w(x["ra"], x["dec"])
+        c = np.cos(x["theta_jn"])
+        self.branch_psi = self.branch = 0.0
+        if self.psi_mode == "sky":
+            ar, al = self._helicities(w)
+            z = ar * np.conj(al)
+            self.branch_psi = float(np.angle(np.mean(z / np.maximum(np.abs(z), 1e-300))))
+        z = self._m_raw(w, c, x["psi"])
+        self.branch = float(np.angle(np.mean(z / np.maximum(np.abs(z), 1e-300))))
+        self.offset_psi = self.offset_sum = 0.0
+        psi_s, _ = self.predict(x["ra"], x["dec"])
+        r_psi = x["psi"] - psi_s
+        r_sum = r_psi + x["phase"] - self.phase(x["ra"], x["dec"], c, x["psi"])
+        self.offset_psi = float((np.angle(np.mean(np.exp(4j * r_psi))) - np.pi) / 4.0)
+        self.offset_sum = float((np.angle(np.mean(np.exp(2j * r_sum))) - np.pi) / 2.0)

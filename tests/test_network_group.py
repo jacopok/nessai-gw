@@ -1004,3 +1004,75 @@ def test_network_proposal_observed_phase(geometry, tmp_path):
     proposal.populate(worst, n_samples=200)
     assert len(proposal.samples) > 0
     assert np.all(np.isfinite(model.log_prior(proposal.samples)))
+
+
+@requires_group_mixture
+@pytest.mark.parametrize("modes", [("sky", "sky"), ("sky", "conditional"),
+                                   ("none", "conditional")])
+def test_network_proposal_response_fit(geometry, tmp_path, modes):
+    """A ResponseFit as observed_phase: psi and delta_phase shifted by the
+    sky's / the conditional prediction; the points round-trip, the
+    quarter turn moves the coordinates as without it, a proposal trains and
+    draws."""
+    from nessai.livepoint import numpy_array_to_live_points
+    from nessai_gw._ellipse import ResponseFit
+    from nessai_gw._geometry import greenwich_mean_sidereal_time
+
+    rf = ResponseFit(TENSORS, greenwich_mean_sidereal_time(REFERENCE_TIME),
+                     psi_mode=modes[0], phase_mode=modes[1])
+    bounds = {
+        "chirp_mass": [1.19, 1.21], "mass_ratio": [0.5, 1.0],
+        "chi_1": [-0.05, 0.05], "chi_2": [-0.05, 0.05],
+        "luminosity_distance": [25.0, 4000.0], "theta_jn": [0.0, np.pi],
+        "psi": [0.0, np.pi], "phase": [0.0, 2 * np.pi],
+        "ra": [0.0, 2 * np.pi], "dec": [-np.pi / 2, np.pi / 2],
+        "geocent_time": [REFERENCE_TIME - 0.1, REFERENCE_TIME + 0.1],
+    }
+    model = _stub_model(PARAMETERS, {k: np.asarray(v) for k, v in bounds.items()})
+    model.set_rng(np.random.default_rng(0))
+    reps = network_group_reparameterisations(PARAMETERS, geometry, observed_phase=rf)
+    assert ("psi" in reps) == (modes[0] == "sky")
+    cls = make_network_group_flow_proposal(
+        PARAMETERS, geometry, circular_psi_phase=True, circular_sky_u=True)
+    proposal = cls(
+        model, output=str(tmp_path), poolsize=200, reparameterisations=reps,
+        flow_config={"n_blocks": 2, "n_neurons": 8, "n_layers": 1, "ftype": "circular"},
+        training_config={"max_epochs": 3, "patience": 3},
+    )
+    proposal.initialise()
+    rng = np.random.default_rng(7)
+    theta = np.column_stack([rng.uniform(*bounds[n], 1000) for n in PARAMETERS])
+    theta[:, PARAMETERS.index("dec")] = np.arcsin(rng.uniform(-1, 1, 1000))
+    live = numpy_array_to_live_points(theta, PARAMETERS)
+    live["logL"] = rng.normal(size=1000)
+    live["logL"][3] = 10.0
+    live["logP"] = model.log_prior(live)
+    rf.refit(live)
+    assert rf.data is not None
+    x_prime, log_j = proposal.rescale(live)
+    back, log_j_inv = proposal.inverse_rescale(x_prime)
+    n = len(live)
+    for name in ("psi", "phase", "ra", "dec", "theta_jn"):
+        d = np.mod(back[name][:n] - live[name] + np.pi, 2 * np.pi) - np.pi
+        assert np.abs(d).max() < 1e-8, name
+    np.testing.assert_allclose(log_j[:n], -log_j_inv[:n], atol=1e-8)
+    # the quarter turn moves psi_prime by one and delta_phase by
+    # -pi/2 + s (pi/2 - pi [the psi coordinate wraps]), as the group action
+    # assumes; the wrap is that of psi - psi*(n), the coordinate it sees
+    turned = live.copy()
+    turned["psi"] = np.mod(turned["psi"] + np.pi / 2, np.pi)
+    turned["phase"] = np.mod(turned["phase"] - np.pi / 2, 2 * np.pi)
+    xt, _ = proposal.rescale(turned)
+    s = np.sign(np.cos(live["theta_jn"]))
+    r = np.mod(live["psi"] - rf.psi_star(live["ra"], live["dec"]), np.pi)
+    wrap = (r + np.pi / 2 >= np.pi).astype(float)
+    d_psi = np.mod(xt["psi_prime"][:n] - x_prime["psi_prime"][:n] - 1.0 + 1, 2) - 1
+    d_del = np.mod(xt["delta_phase"][:n] - x_prime["delta_phase"][:n]
+                   - (-0.5 + s * (0.5 - wrap)) + 1, 2) - 1
+    assert np.abs(d_psi).max() < 1e-8 and np.abs(d_del).max() < 1e-8
+    proposal.train(live)
+    worst = live[:1].copy()
+    worst["logL"] = -np.inf
+    proposal.populate(worst, n_samples=200)
+    assert len(proposal.samples) > 0
+    assert np.all(np.isfinite(model.log_prior(proposal.samples)))

@@ -694,3 +694,154 @@ def test_et_proposal_observed_phase_end_to_end(tmp_path):
     circ = _check_trained_proposal(
         proposal, model, _prior_live_points(model, 1000))
     assert set(circ) == {"psi_res", "delta_phase_res"}
+
+
+# -- ResponseFit: residuals from the network's helicity fit -------------------
+
+RESPONSE_MODES = [("sky", "sky"), ("sky", "conditional"), ("none", "conditional")]
+
+
+def _response(psi_mode="sky", phase_mode="sky", fiducial=None):
+    from nessai_gw._ellipse import ResponseFit
+    from nessai_gw._geometry import greenwich_mean_sidereal_time
+    from nessai_gw.group_mixture import ET_EMR_DETECTOR_TENSORS
+
+    rf = ResponseFit(ET_EMR_DETECTOR_TENSORS,
+                     greenwich_mean_sidereal_time(REFERENCE_TIME),
+                     psi_mode=psi_mode, phase_mode=phase_mode)
+    rf.set_fiducial(fiducial or dict(FIDUCIAL, phase=0.8))
+    rf.branch_psi, rf.branch, rf.offset_psi, rf.offset_sum = 0.3, -0.5, 0.2, -0.9
+    return rf
+
+
+def _on_profile(rf, n, seed):
+    """Points that reproduce the reference data exactly: at random skies,
+    the orientation of the profile fit v*(n) (the triangle spans the data
+    for every sky)."""
+    x = _physical(n, seed=seed)
+    ar, al = rf._helicities(rf._w(x["ra"], x["dec"]))
+    # |alpha_R| / |alpha_L| = c_+ / c_- = ((1 + c) / (1 - c))^2
+    r = np.sqrt(np.abs(ar) / np.abs(al))
+    x["theta_jn"] = np.arccos((r - 1) / (r + 1))
+    x["psi"] = np.mod(0.25 * (np.angle(ar) - np.angle(al)), np.pi)
+    x["phase"] = np.mod(0.5 * np.angle(ar) - x["psi"], 2 * np.pi)
+    return x
+
+
+@pytest.mark.parametrize("modes", RESPONSE_MODES)
+def test_response_fit_torch_matches_numpy(modes):
+    rf = _response(*modes)
+    x = _physical(1500)
+    c = np.cos(x["theta_jn"])
+    t = lambda a: torch.as_tensor(a)  # noqa: E731
+    want_psi, _ = rf.predict(x["ra"], x["dec"])
+    got_psi, _ = rf.predict_torch(t(x["ra"]), t(np.sin(x["dec"])))
+    assert _circ(got_psi.numpy() - want_psi, np.pi).max() < 1e-9
+    want = rf.phase(x["ra"], x["dec"], c, x["psi"])
+    got = rf.phase_torch(t(x["ra"]), t(np.sin(x["dec"])), t(c), t(x["psi"])).numpy()
+    assert _circ(got - want, 2 * np.pi).max() < 1e-9
+
+
+@pytest.mark.parametrize("modes", RESPONSE_MODES)
+def test_response_fit_quarter_turn_invariant(modes):
+    rf = _response(*modes)
+    x = _physical(1500)
+    c = np.cos(x["theta_jn"])
+    m0 = rf.m(x["ra"], x["dec"], c, x["psi"])
+    m1 = rf.m(x["ra"], x["dec"], c, x["psi"] + np.pi / 2)
+    assert _circ(m1 - m0, 2 * np.pi).max() < 1e-9
+
+
+@pytest.mark.parametrize("modes", RESPONSE_MODES)
+def test_response_fit_reparam_round_trip_and_jacobian(modes):
+    rep = _reparam(sheet=_response(*modes))
+    x = _physical(2000)
+    xp, lj = _apply(rep, x)
+    y = x.copy()
+    y["psi"] = y["phase"] = np.nan
+    y, _, lj_inv = rep.inverse_reparameterise(y, xp, np.zeros(len(x)))
+    assert _circ(y["psi"] - x["psi"], np.pi).max() < 1e-9
+    assert _circ(y["phase"] - x["phase"], 2 * np.pi).max() < 1e-9
+    np.testing.assert_allclose(lj, -lj_inv)
+    eps = 1e-6
+    cols = []
+    for k in ("psi", "phase"):
+        z = x[:200].copy()
+        z[k] = z[k] + eps
+        zp, _ = _apply(rep, z)
+        cols.append(np.stack([(zp[n] - xp[:200][n] + 1) % 2 - 1
+                              for n in rep.prime_parameters], -1) / eps)
+    np.testing.assert_allclose(
+        np.log(np.abs(np.linalg.det(np.stack(cols, -1)))), lj[:200], atol=1e-5)
+
+
+@pytest.mark.parametrize("modes", RESPONSE_MODES)
+def test_response_fit_pins_points_on_the_profile(modes):
+    """Points whose orientation reproduces the reference data at their sky:
+    the residuals the mode predicts are pinned after a refit."""
+    truth = _response("sky", "sky")
+    x = _on_profile(truth, 3000, seed=8)
+    x["logL"] = 0.0
+    x["logL"][0] = 1.0  # the fiducial: one of the points, so D is theirs
+    rf = _response(*modes)
+    rep = _reparam(sheet=rf)
+    rep.update(x)
+    xp, _ = _apply(rep, x)
+    # modulo the group's steps: (2, 2) reflection (one in delta_phase_res)
+    # and quarter turn (one in psi_res)
+    conc = lambda a: np.abs(np.mean(np.exp(2j * np.pi * a)))  # noqa: E731
+    before = conc((np.mod(x["phase"] + np.sign(np.cos(x["theta_jn"])) * x["psi"],
+                          2 * np.pi)) / np.pi)
+    assert before < 0.5
+    assert conc(xp["delta_phase_res"]) > 0.99
+    if modes[0] == "sky":
+        assert conc(xp["psi_res"]) > 0.99
+
+
+@pytest.fixture(scope="module", params=RESPONSE_MODES, ids=lambda m: "-".join(m))
+def response_action(request):
+    base = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, polarisation_quarter=True,
+        phase_reflection=True)
+    return PrimeSpaceTriangularGroupAction(base, PRIME_NAMES,
+                                           sheet=_response(*request.param))
+
+
+def test_response_action_matches_physical(response_action, prime_points):
+    action = response_action
+    rep = _reparam(sheet=action._sheet)
+    n = len(prime_points["t_det"])
+    acted, _ = action._decode(prime_points)
+    cos0 = -torch.sin(prime_points["theta_jn_prime"] * (0.5 * np.pi))
+    phys0 = {"ra": acted["ra"], "sin_dec": acted["sin_dec"], "cos_theta_jn": cos0,
+             "psi": acted["psi"], "phase": acted["phase"]}
+    base = action._action
+    for g in range(base.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        phys = base(phys0, modes)
+        x = np.zeros(n, dtype=[(k, "f8") for k in ("ra", "dec", "psi", "phase",
+                                                    "theta_jn")])
+        x["ra"] = phys["ra"].numpy()
+        x["dec"] = np.arcsin(phys["sin_dec"].numpy())
+        x["psi"] = phys["psi"].numpy()
+        x["phase"] = phys["phase"].numpy()
+        x["theta_jn"] = np.arccos(np.clip(phys["cos_theta_jn"].numpy(), -1, 1))
+        want, _ = _apply(rep, x)
+        fwd = action(prime_points, modes)
+        for name in ("psi_res", "delta_phase_res"):
+            d = torch.remainder(fwd[name] - torch.as_tensor(want[name]), 2.0)
+            assert torch.minimum(d, 2.0 - d).max() < 1e-6, (g, name)
+
+
+def test_response_action_round_trip_and_domain(response_action, prime_points):
+    n = len(prime_points["t_det"])
+    count = torch.zeros(n)
+    for g in range(response_action._action.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        fwd = response_action(prime_points, modes)
+        back = response_action(fwd, modes, inverse=True)
+        for name in ("psi_res", "delta_phase_res"):
+            d = torch.remainder(back[name] - prime_points[name], 2.0)
+            assert torch.minimum(d, 2.0 - d).max() < 1e-8, (g, name)
+        count += response_action.in_fundamental_domain(fwd).float()
+    assert torch.all(count == 1), count.unique(return_counts=True)
