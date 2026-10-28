@@ -691,6 +691,10 @@ class ResponseFit:
         """``(alpha_R*, alpha_L*)`` of the profile fit at each sky."""
         a = np.stack([np.conj(w), w], axis=-1)                   # (N, K, 2)
         gram = np.einsum("nki,nkj->nij", np.conj(a), a)
+        # singular where the two helicities' responses are parallel (the
+        # triangle's plane, the 2L sky where Z_1 conj(Z_2) is real): floored,
+        # as SheetPhase's determinant
+        gram = gram + 1e-9 * np.trace(gram, axis1=-2, axis2=-1).real[:, None, None] * np.eye(2)
         rhs = np.einsum("nki,k->ni", np.conj(a), self.data)
         v = np.linalg.solve(gram, rhs[..., None])[..., 0]
         return v[:, 0], v[:, 1]
@@ -751,6 +755,8 @@ class ResponseFit:
         a = torch.stack([torch.conj(w), w], dim=-1)
         data = torch.as_tensor(self.data, dtype=a.dtype)
         gram = torch.einsum("nki,nkj->nij", torch.conj(a), a)
+        trace = torch.diagonal(gram, dim1=-2, dim2=-1).sum(-1).real
+        gram = gram + 1e-9 * trace[:, None, None] * torch.eye(2, dtype=gram.dtype)
         rhs = torch.einsum("nki,k->ni", torch.conj(a), data)
         v = torch.linalg.solve(gram, rhs[..., None])[..., 0]
         return v[:, 0], v[:, 1]

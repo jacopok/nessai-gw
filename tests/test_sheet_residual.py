@@ -845,3 +845,21 @@ def test_response_action_round_trip_and_domain(response_action, prime_points):
             assert torch.minimum(d, 2.0 - d).max() < 1e-8, (g, name)
         count += response_action.in_fundamental_domain(fwd).float()
     assert torch.all(count == 1), count.unique(return_counts=True)
+
+
+def test_response_fit_finite_on_the_detector_plane():
+    """The fit is floored where the helicities' responses are parallel."""
+    from nessai_gw._geometry import greenwich_mean_sidereal_time
+
+    rf = _response("sky", "conditional")
+    # a sky in the detector plane: Z real there
+    normal = np.asarray(ET_EMR_PLANE_NORMAL, dtype=float)
+    v = np.cross(normal, [0.0, 0.0, 1.0])
+    v /= np.linalg.norm(v)
+    gmst = greenwich_mean_sidereal_time(REFERENCE_TIME)
+    ra = np.array([np.arctan2(v[1], v[0]) + gmst])
+    dec = np.array([np.arcsin(v[2])])
+    assert np.all(np.isfinite(rf.psi_star(ra, dec)))
+    got = rf.phase_torch(torch.as_tensor(ra), torch.as_tensor(np.sin(dec)),
+                         torch.as_tensor([0.3]), torch.as_tensor([0.7]))
+    assert torch.all(torch.isfinite(got))
