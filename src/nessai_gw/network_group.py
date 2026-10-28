@@ -812,6 +812,7 @@ def network_group_reparameterisations(
     chirp_distance_inversion=False,
     waveform_phase=None,
     network_amplitudes=False,
+    observed_phase=None,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -886,7 +887,14 @@ def network_group_reparameterisations(
         which replaces ``chirp_distance`` and ``delta_phase``.  Needs two
         sites with one interferometer each.  Must match
         :func:`make_network_group_flow_proposal`.  Default ``False``.
+    observed_phase : :class:`~nessai_gw._ellipse.ObservedPhase`, optional
+        Take the phase the detectors observe out of ``delta_phase`` (its
+        ``sign h``, fitted at every training).  ``h`` is unchanged by the
+        quarter turn, so the group action is the same.  Not with
+        ``network_amplitudes``.  Default None.
     """
+    if network_amplitudes and observed_phase is not None:
+        raise ValueError("observed_phase is not for network_amplitudes")
     if network_amplitudes:
         return _network_amplitude_reparameterisations(
             sampling_parameters, geometry,
@@ -897,7 +905,7 @@ def network_group_reparameterisations(
             time_reference_frequency=time_reference_frequency,
             time_to_merger=time_to_merger, waveform_phase=waveform_phase,
         )
-    return triangular_group_reparameterisations(
+    reps = triangular_group_reparameterisations(
         sampling_parameters,
         geometry.reference_time,
         vertex=geometry.timing_vertex,
@@ -916,6 +924,9 @@ def network_group_reparameterisations(
             chirp_distance and "luminosity_distance" in sampling_parameters,
         ),
     )
+    if observed_phase is not None and "phase" in reps:
+        reps["phase"]["observed"] = observed_phase
+    return reps
 
 
 def _network_amplitude_reparameterisations(sampling_parameters, geometry,

@@ -209,6 +209,7 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         parameters=None,
         prior_bounds=None,
         scale=1.0,
+        observed=None,
         waveform_phase=None,
         frequency_range=(8.0, 300.0),
         correction_degree=4,
@@ -248,6 +249,14 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         # psi and theta_jn are needed both to build delta_phase (forward) and to
         # recover phase (inverse).
         self.requires = ["psi", "theta_jn"]
+        #: an ObservedPhase whose ``sign h`` is added to delta_phase: the
+        #: phase the detectors observe taken out (only where the group acts on
+        #: psi and phase alone, as the network's quarter turn, which leaves
+        #: ``h`` unchanged; the triangle's sky elements need the residual
+        #: path, SheetResidualReparameterisation)
+        self._observed = observed
+        if observed is not None:
+            self.requires += ["ra", "dec"]
         self._waveform_phase = waveform_phase
         self._waveform_phase_fn = None
         self.frequency_range = tuple(float(f) for f in frequency_range)
@@ -374,12 +383,32 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             np.abs(np.mean(np.exp(1j * k * angle), axis=0)) for k in (1, 2)
         ])
 
+    def _observed_term(self, x):
+        """``sign h`` of ``observed`` at ``x`` (0 without it)."""
+        if getattr(self, "_observed", None) is None:
+            return 0.0
+        return self._observed.term(x["ra"], x["dec"], np.cos(x["theta_jn"]), x["psi"])
+
+    def _refit_observed(self, x):
+        """Refit ``observed`` on ``x``'s phase at the reference frequency."""
+        y = x.copy()
+        y["phase"] = y["phase"] + self._shift(x)
+        self._observed.refit(y)
+
     def update(self, x, x_prime=None):
         """With ``waveform_phase``, choose the reference frequency of the
-        phase and refit its offset on ``x`` (the training points)."""
-        if self._waveform() is None or len(x) < 2:
+        phase and refit its offset on ``x`` (the training points); with
+        ``observed``, refit it before and after."""
+        if len(x) < 2:
             return
-        self.fit_offset(x, x["phase"] + self._psi_sign(x) * x["psi"])
+        if getattr(self, "_observed", None) is not None:
+            self._refit_observed(x)
+        if self._waveform() is None:
+            return
+        self.fit_offset(x, x["phase"] + self._psi_sign(x) * x["psi"]
+                        + self._observed_term(x))
+        if getattr(self, "_observed", None) is not None:
+            self._refit_observed(x)
 
     def fit_offset(self, x, base):
         """Choose the reference frequency and fit the offset so that
@@ -433,8 +462,8 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
 
     def reparameterise(self, x, x_prime, log_j, **kwargs):
         angle = np.mod(
-            (x["phase"] + self._psi_sign(x) * x["psi"] + self._shift(x))
-            * self.scale, _TWO_PI
+            (x["phase"] + self._psi_sign(x) * x["psi"] + self._shift(x)
+             + self._observed_term(x)) * self.scale, _TWO_PI
         )
         x_prime[self.prime_parameters[0]] = angle / np.pi - 1.0
         return x, x_prime, log_j + self._log_j
@@ -444,7 +473,8 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             (x_prime[self.prime_parameters[0]] + 1.0) * np.pi, _TWO_PI
         )
         x["phase"] = np.mod(
-            angle / self.scale - self._psi_sign(x) * x["psi"] - self._shift(x),
+            angle / self.scale - self._psi_sign(x) * x["psi"] - self._shift(x)
+            - self._observed_term(x),
             _TWO_PI,
         )
         return x, x_prime, log_j - self._log_j
@@ -466,7 +496,7 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             ("doppler_vector", None), ("_chirp_mass", "chirp_mass"),
             ("_mass_ratio", "mass_ratio"), ("_spins", ("chi_1", "chi_2")),
             ("_tides", ("lambda_1", "lambda_2")),
-            ("reference_frequency", None), ("_offset", None),
+            ("reference_frequency", None), ("_offset", None), ("_observed", None),
         ):
             state.setdefault(key, value)
         self.__dict__.update(state)

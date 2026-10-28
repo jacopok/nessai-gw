@@ -939,3 +939,68 @@ def test_amplitude_proposal_initialise_train_and_draw(geometry, tmp_path):
     assert sorted(prime[i] for i in flow.circular_features) == sorted(
         ["arg_amp_1", "arg_amp_2", "sky_u"]
     )
+
+
+@requires_group_mixture
+def test_network_proposal_observed_phase(geometry, tmp_path):
+    """observed_phase: delta_phase with the detectors' observed phase taken
+    out; the points round-trip, the quarter turn moves it as plain
+    delta_phase (h is unchanged by it), training refits it and the proposal
+    draws in-bounds points."""
+    from nessai.livepoint import numpy_array_to_live_points
+    from nessai_gw._ellipse import ObservedPhase
+    from nessai_gw._geometry import greenwich_mean_sidereal_time
+
+    obs = ObservedPhase(TENSORS, greenwich_mean_sidereal_time(REFERENCE_TIME),
+                        sites=[0, 1])
+    bounds = {
+        "chirp_mass": [1.19, 1.21], "mass_ratio": [0.5, 1.0],
+        "chi_1": [-0.05, 0.05], "chi_2": [-0.05, 0.05],
+        "luminosity_distance": [25.0, 4000.0], "theta_jn": [0.0, np.pi],
+        "psi": [0.0, np.pi], "phase": [0.0, 2 * np.pi],
+        "ra": [0.0, 2 * np.pi], "dec": [-np.pi / 2, np.pi / 2],
+        "geocent_time": [REFERENCE_TIME - 0.1, REFERENCE_TIME + 0.1],
+    }
+    model = _stub_model(PARAMETERS, {k: np.asarray(v) for k, v in bounds.items()})
+    model.set_rng(np.random.default_rng(0))
+    reps = network_group_reparameterisations(PARAMETERS, geometry, observed_phase=obs)
+    assert reps["phase"]["observed"] is obs
+    cls = make_network_group_flow_proposal(
+        PARAMETERS, geometry, circular_psi_phase=True, circular_sky_u=True)
+    proposal = cls(
+        model, output=str(tmp_path), poolsize=200, reparameterisations=reps,
+        flow_config={"n_blocks": 2, "n_neurons": 8, "n_layers": 1, "ftype": "circular"},
+        training_config={"max_epochs": 3, "patience": 3},
+    )
+    proposal.initialise()
+    rng = np.random.default_rng(7)
+    theta = np.column_stack([rng.uniform(*bounds[n], 1000) for n in PARAMETERS])
+    theta[:, PARAMETERS.index("dec")] = np.arcsin(rng.uniform(-1, 1, 1000))
+    live = numpy_array_to_live_points(theta, PARAMETERS)
+    live["logL"] = 0.0
+    live["logP"] = model.log_prior(live)
+    obs.sign, obs.hemisphere, obs.branch, obs.site_phase[1] = -1.0, True, 0.4, 1.1
+    x_prime, log_j = proposal.rescale(live)
+    back, log_j_inv = proposal.inverse_rescale(x_prime)
+    n = len(live)
+    for name in ("psi", "phase", "ra", "dec", "theta_jn"):
+        d = np.mod(back[name][:n] - live[name] + np.pi, 2 * np.pi) - np.pi
+        assert np.abs(d).max() < 1e-8, name
+    np.testing.assert_allclose(log_j[:n], -log_j_inv[:n], atol=1e-8)
+    # the quarter turn: psi + pi/2, phase - pi/2 moves delta_phase as without
+    # the observed phase
+    (rep,) = [r for r in proposal._reparameterisation.values()
+              if getattr(r, "_observed", None) is obs]
+    turned = live.copy()
+    turned["psi"] = np.mod(turned["psi"] + np.pi / 2, np.pi)
+    turned["phase"] = np.mod(turned["phase"] - np.pi / 2, 2 * np.pi)
+    term = rep._observed_term(live)
+    np.testing.assert_allclose(
+        np.mod(rep._observed_term(turned) - term + np.pi / 2, np.pi) - np.pi / 2,
+        0.0, atol=1e-9)
+    proposal.train(live)
+    worst = live[:1].copy()
+    worst["logL"] = -np.inf
+    proposal.populate(worst, n_samples=200)
+    assert len(proposal.samples) > 0
+    assert np.all(np.isfinite(model.log_prior(proposal.samples)))

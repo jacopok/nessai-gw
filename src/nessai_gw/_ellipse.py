@@ -526,6 +526,14 @@ class ObservedPhase:
                            cos_theta_jn, psi)
         return 0.5 * np.angle(g * np.exp(-1j * self.branch)) + 0.5 * self.branch
 
+    def term(self, ra, dec, cos_theta_jn, psi):
+        """``sign h`` (``sign s h`` with ``hemisphere``): what
+        :class:`~nessai_gw.reparameterisations.PolarisationPhaseReparameterisation`
+        adds to ``delta_phase`` with ``observed`` (numpy)."""
+        s = np.where(np.asarray(cos_theta_jn) >= 0, 1.0, -1.0)
+        sign = self.sign * (s if getattr(self, "hemisphere", False) else 1.0)
+        return sign * self.observed(ra, dec, cos_theta_jn, psi)
+
     def phase(self, ra, dec, cos_theta_jn, psi):
         """``phase*`` at the point (numpy)."""
         s = np.where(np.asarray(cos_theta_jn) >= 0, 1.0, -1.0)
