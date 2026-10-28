@@ -163,3 +163,31 @@ class DopplerChirpMassReparameterisation(Reparameterisation):
 
     def reset(self):
         self.bounds = self._initial_bounds
+
+
+def check_spin_names(spins):
+    """``spins`` as a tuple: two aligned-spin names (``chi_1``, ``chi_2``) or
+    four precessing ones (``a_1``, ``tilt_1``, ``a_2``, ``tilt_2``); None
+    stays None."""
+    if spins is None:
+        return None
+    spins = tuple(spins)
+    if len(spins) not in (2, 4):
+        raise ValueError("`spins` must name two aligned spins or (a_1, tilt_1, "
+                         f"a_2, tilt_2); got {spins}")
+    return spins
+
+
+def aligned_spins(x, spins):
+    """``(chi_1, chi_2)`` from ``x``: the named aligned spins, or with four
+    names the components along the orbital angular momentum ``a_i cos
+    tilt_i`` (the coprecessing frame's aligned spins); zeros where absent."""
+    n = len(x)
+    if spins is None or not set(spins) <= set(x.dtype.names):
+        return np.zeros(n), np.zeros(n)
+    if len(spins) == 2:
+        return (np.asarray(x[spins[0]], dtype=float),
+                np.asarray(x[spins[1]], dtype=float))
+    return tuple(np.asarray(x[spins[2 * i]], dtype=float)
+                 * np.cos(np.asarray(x[spins[2 * i + 1]], dtype=float))
+                 for i in (0, 1))

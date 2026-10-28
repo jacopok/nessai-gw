@@ -9,7 +9,7 @@ from nessai.reparameterisations import Reparameterisation
 
 from .. import nessai_logger
 from .._geometry import geocenter_time_delay, greenwich_mean_sidereal_time
-from .mass import doppler_factor
+from .mass import aligned_spins, check_spin_names, doppler_factor
 
 logger = nessai_logger.getChild(__name__)
 
@@ -280,9 +280,7 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
                 f"`doppler_vector` must have 3 components; got {doppler_vector}"
             )
         self._chirp_mass, self._mass_ratio = chirp_mass, mass_ratio
-        self._spins = None if spins is None else tuple(spins)
-        if self._spins is not None and len(self._spins) != 2:
-            raise ValueError(f"`spins` must name two parameters; got {spins}")
+        self._spins = check_spin_names(spins)
         self._tau_ref = None
         self._time_to_merger = time_to_merger
         self._time_to_merger_fn = None
@@ -342,12 +340,13 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         zeros = np.zeros_like(chirp_mass)
         params = dict(chirp_mass=chirp_mass,
                       mass_ratio=np.asarray(x[self._mass_ratio], dtype=float))
-        for key, names in (("chi", self._spins), ("lambda", self._tides)):
-            for i in (0, 1):
-                params[f"{key}_{i + 1}"] = (
-                    zeros if names is None or names[i] not in x.dtype.names
-                    else np.asarray(x[names[i]], dtype=float)
-                )
+        params["chi_1"], params["chi_2"] = aligned_spins(x, self._spins)
+        for i in (0, 1):
+            names = self._tides
+            params[f"lambda_{i + 1}"] = (
+                zeros if names is None or names[i] not in x.dtype.names
+                else np.asarray(x[names[i]], dtype=float)
+            )
         return params
 
     def _tau_2pn(self, params, frequency):

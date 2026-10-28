@@ -567,3 +567,39 @@ def test_triangular_wiring_waveform_phase():
         triangular_group_reparameterisations(
             [n for n in names if n != "mass_ratio"], 1187008882.4,
             waveform_phase="pkg.mod:phase")
+
+
+def test_waveform_phase_precessing_spins_along_l():
+    """With (a_1, tilt_1, a_2, tilt_2) the waveform sees a_i cos tilt_i, the
+    coprecessing frame's aligned spins."""
+    x = empty_structured_array(
+        3, names=["chirp_mass", "mass_ratio", "a_1", "tilt_1", "a_2", "tilt_2"])
+    x["chirp_mass"], x["mass_ratio"] = 1.2, 0.9
+    x["a_1"], x["tilt_1"] = [0.05, 0.1, 0.0], [0.0, np.pi / 3, 1.0]
+    x["a_2"], x["tilt_2"] = [0.02, 0.0, 0.08], [np.pi, 0.4, np.pi / 2]
+    reparam = PolarisationPhaseReparameterisation(
+        parameters="phase", waveform_phase="pkg.mod:phase",
+        spins=["a_1", "tilt_1", "a_2", "tilt_2"], tides=None)
+    assert {"a_1", "tilt_1", "a_2", "tilt_2"} <= set(reparam.requires)
+    params = reparam._params(x)
+    np.testing.assert_allclose(params["chi_1"], x["a_1"] * np.cos(x["tilt_1"]))
+    np.testing.assert_allclose(params["chi_2"], x["a_2"] * np.cos(x["tilt_2"]))
+    with pytest.raises(ValueError, match="two aligned spins"):
+        PolarisationPhaseReparameterisation(
+            parameters="phase", waveform_phase="pkg.mod:phase", spins=["a_1"])
+
+
+def test_triangular_wiring_waveform_phase_precessing():
+    from nessai_gw.group_mixture import triangular_group_reparameterisations
+
+    names = ["chirp_mass", "mass_ratio", "a_1", "a_2", "tilt_1", "tilt_2",
+             "phi_12", "phi_jl", "lambda_1", "lambda_2", "ra", "dec",
+             "theta_jn", "psi", "phase", "geocent_time"]
+    reps = triangular_group_reparameterisations(
+        names, 1187008882.4, precessing_spin=True, waveform_phase="pkg.mod:phase",
+        time_reference_frequency="adaptive")
+    assert reps["phase"]["spins"] == ["a_1", "tilt_1", "a_2", "tilt_2"]
+    order = list(reps)
+    for key in [k for k in order if k != "phase" and (
+            {"a_1", "tilt_1"} & set(reps[k].get("parameters", [k])))]:
+        assert order.index("phase") < order.index(key), key

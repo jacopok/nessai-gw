@@ -8,7 +8,7 @@ from nessai.reparameterisations import (
 )
 
 from .. import nessai_logger
-from .mass import doppler_factor
+from .mass import aligned_spins, check_spin_names, doppler_factor
 
 logger = nessai_logger.getChild(__name__)
 
@@ -268,9 +268,9 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
                 f"`doppler_vector` must have 3 components; got {doppler_vector}"
             )
         self._chirp_mass, self._mass_ratio = chirp_mass, mass_ratio
-        self._spins = None if spins is None else tuple(spins)
+        self._spins = check_spin_names(spins)
         self._tides = None if tides is None else tuple(tides)
-        for key, names in (("spins", self._spins), ("tides", self._tides)):
+        for key, names in (("tides", self._tides),):
             if names is not None and len(names) != 2:
                 raise ValueError(f"`{key}` must name two parameters; got {names}")
         #: frequency (Hz) the phase is measured at; None: the merger
@@ -329,12 +329,13 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         zeros = np.zeros_like(chirp_mass)
         params = dict(chirp_mass=chirp_mass,
                       mass_ratio=np.asarray(x[self._mass_ratio], dtype=float))
-        for key, names in (("chi", self._spins), ("lambda", self._tides)):
-            for i in (0, 1):
-                params[f"{key}_{i + 1}"] = (
-                    zeros if names is None or names[i] not in x.dtype.names
-                    else np.asarray(x[names[i]], dtype=float)
-                )
+        params["chi_1"], params["chi_2"] = aligned_spins(x, self._spins)
+        for i in (0, 1):
+            names = self._tides
+            params[f"lambda_{i + 1}"] = (
+                zeros if names is None or names[i] not in x.dtype.names
+                else np.asarray(x[names[i]], dtype=float)
+            )
         return params
 
     def _tangent_intercepts(self, params, frequencies, step=1e-3):
@@ -597,7 +598,7 @@ class SheetResidualReparameterisation(Reparameterisation):
     With ``r_psi = (psi - psi*(n)) mod pi`` and ``r_phase = phase - phase*(n)``::
 
         psi_res   = r_psi * 2/pi - 1                     in [-1, 1)
-        sigma_res = ((r_psi + r_phase) mod 2 pi) / pi - 1 in [-1, 1)
+        delta_phase_res = ((r_psi + r_phase) mod 2 pi) / pi - 1 in [-1, 1)
 
     The second is the residual of ``psi + phase`` (as ``delta_phase`` is
     ``phase + psi`` for the face-on branch): the polarisation/phase quarter
@@ -620,7 +621,7 @@ class SheetResidualReparameterisation(Reparameterisation):
     With ``waveform_phase`` the phase is measured at a reference frequency
     as in :class:`PolarisationPhaseReparameterisation` (same arguments):
     ``phase + a(theta) / 2`` stands for ``phase`` above, the frequency
-    chosen to concentrate ``sigma_res``.  The offset depends only on the
+    chosen to concentrate ``delta_phase_res``.  The offset depends only on the
     intrinsic parameters, so the Jacobian and the group action are
     unchanged; those parameters are read on the inverse pass.
 
@@ -679,10 +680,13 @@ class SheetResidualReparameterisation(Reparameterisation):
         else:
             self.parameters = ["psi", "phase"]
         self.sheet = sheet
-        self.prime_parameters = ["psi_res", "sigma_res"]
+        self.prime_parameters = ["psi_res", "delta_phase_res"]
         if hasattr(self, "output_parameters"):
             self.output_parameters = list(self.prime_parameters)
         self.requires = ["ra", "dec"]
+        if getattr(sheet, "orientation_dependent", False):
+            # ObservedPhase: phase* depends on theta_jn and psi as well
+            self.requires.append("theta_jn")
         #: the phase at a reference frequency: its offset model
         self._phase_ref = None
         if waveform_phase is not None:
@@ -715,8 +719,16 @@ class SheetResidualReparameterisation(Reparameterisation):
             return 0.0
         return self._phase_ref._shift(x)
 
+    def _phase_star(self, x, psi, phase_s):
+        """``phase*`` at ``psi``: the sheet's, or the orientation-dependent
+        one of an :class:`~nessai_gw._ellipse.ObservedPhase`."""
+        if not getattr(self.sheet, "orientation_dependent", False):
+            return phase_s
+        return self.sheet.phase(x["ra"], x["dec"], np.cos(x["theta_jn"]), psi)
+
     def reparameterise(self, x, x_prime, log_j, **kwargs):
         psi_s, phase_s = self.sheet.predict(x["ra"], x["dec"])
+        phase_s = self._phase_star(x, x["psi"], phase_s)
         r_psi = np.mod(x["psi"] - psi_s, np.pi)
         x_prime[self.prime_parameters[0]] = r_psi * 2.0 / np.pi - 1.0
         x_prime[self.prime_parameters[1]] = (
@@ -730,15 +742,20 @@ class SheetResidualReparameterisation(Reparameterisation):
         r_psi = (x_prime[self.prime_parameters[0]] + 1.0) * np.pi / 2.0
         r_sum = (x_prime[self.prime_parameters[1]] + 1.0) * np.pi
         x["psi"] = np.mod(r_psi + psi_s, np.pi)
+        phase_s = self._phase_star(x, x["psi"], phase_s)
         x["phase"] = np.mod(r_sum - r_psi + phase_s - self._shift(x), _TWO_PI)
         return x, x_prime, log_j - self._log_j
 
     def update(self, x, x_prime=None):
         """Refit the phase's reference frequency and offset (to concentrate
-        ``sigma_res`` about the current prediction), then the prediction to
+        ``delta_phase_res`` about the current prediction), then the prediction to
         the phase measured there."""
         if getattr(self, "_phase_ref", None) is not None and len(x):
+            if getattr(self.sheet, "orientation_dependent", False):
+                # its sign and site phases first, on the phase as it is
+                self.sheet.refit(x)
             psi_s, phase_s = self.sheet.predict(x["ra"], x["dec"])
+            phase_s = self._phase_star(x, x["psi"], phase_s)
             self._phase_ref.fit_offset(
                 x, x["psi"] + x["phase"] - psi_s - phase_s)
             x = x.copy()

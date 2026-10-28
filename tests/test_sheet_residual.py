@@ -53,7 +53,7 @@ def float64():
 REFERENCE_TIME = 1187008882.4
 #: an edge-on fiducial, so the sheet's vortices are generic
 FIDUCIAL = {"ra": 3.4462, "dec": -0.4081, "psi": 1.57, "theta_jn": 1.3}
-PRIME_NAMES = ["sky_u", "sky_v", "psi_res", "sigma_res", "theta_jn_prime",
+PRIME_NAMES = ["sky_u", "sky_v", "psi_res", "delta_phase_res", "theta_jn_prime",
                "t_det"]
 
 
@@ -176,7 +176,7 @@ def test_reparam_log_jacobian_numerical():
 
 def test_reparam_quarter_turn_glues_straight():
     """The polarisation/phase quarter turn moves psi_res by one (half its
-    range) and leaves sigma_res, so the folded cell is a product torus."""
+    range) and leaves delta_phase_res, so the folded cell is a product torus."""
     rep = _reparam()
     x = _physical(3000)
     xp, _ = _apply(rep, x)
@@ -185,9 +185,9 @@ def test_reparam_quarter_turn_glues_straight():
     y["phase"] = np.mod(y["phase"] - np.pi / 2, 2 * np.pi)
     yp, _ = _apply(rep, y)
     assert _circ(yp["psi_res"] - xp["psi_res"] - 1.0, 2.0).max() < 1e-9
-    # sigma_res is unchanged, or shifted by the half turn (one) when psi_res
+    # delta_phase_res is unchanged, or shifted by the half turn (one) when psi_res
     # wraps
-    d = _circ(yp["sigma_res"] - xp["sigma_res"], 1.0)
+    d = _circ(yp["delta_phase_res"] - xp["delta_phase_res"], 1.0)
     assert d.max() < 1e-9
 
 
@@ -217,7 +217,7 @@ def prime_points():
         "sky_u": torch.as_tensor(rng.uniform(0, 1, n)),
         "sky_v": torch.as_tensor(rng.uniform(0, 1, n)),
         "psi_res": torch.as_tensor(rng.uniform(-1, 1, n)),
-        "sigma_res": torch.as_tensor(rng.uniform(-1, 1, n)),
+        "delta_phase_res": torch.as_tensor(rng.uniform(-1, 1, n)),
         "theta_jn_prime": torch.as_tensor(rng.uniform(-1, 1, n)),
         "t_det": torch.as_tensor(rng.uniform(-20, 20, n)),
     }
@@ -228,7 +228,7 @@ def test_action_round_trip(action, prime_points):
     for g in range(action._action.group_size):
         modes = torch.full((n,), g, dtype=torch.long)
         back = action(action(prime_points, modes), modes, inverse=True)
-        for name in ("psi_res", "sigma_res"):
+        for name in ("psi_res", "delta_phase_res"):
             d = torch.remainder(back[name] - prime_points[name], 2.0)
             d = torch.minimum(d, 2.0 - d)
             assert d.max() < 1e-8, (g, name)
@@ -255,7 +255,7 @@ def test_action_matches_physical(action, prime_points):
         x["phase"] = phys["phase"].numpy()
         want, _ = _apply(rep, x)
         fwd = action(prime_points, modes)
-        for name in ("psi_res", "sigma_res"):
+        for name in ("psi_res", "delta_phase_res"):
             d = torch.remainder(fwd[name] - torch.as_tensor(want[name]), 2.0)
             d = torch.minimum(d, 2.0 - d)
             assert d.max() < 1e-6, (g, name)
@@ -274,7 +274,7 @@ def test_fundamental_domain_partitions_orbit(action, prime_points):
 def test_fundamental_domain_is_the_residual_cell(action, prime_points):
     inside = action.in_fundamental_domain(prime_points)
     pts = {k: v[inside] for k, v in prime_points.items()}
-    assert (pts["psi_res"] < 0).all() and (pts["sigma_res"] < 0).all()
+    assert (pts["psi_res"] < 0).all() and (pts["delta_phase_res"] < 0).all()
 
 
 # -- factory wiring -----------------------------------------------------------
@@ -289,7 +289,7 @@ def test_reparameterisations_and_prime_names():
     prime = _prime_parameter_names(
         BNS_PARAMETERS, REFERENCE_TIME, psi_single=True,
         phase_coordinates="sheet-residual", sheet_phase=sheet)
-    assert "psi_res" in prime and "sigma_res" in prime
+    assert "psi_res" in prime and "delta_phase_res" in prime
     assert not {"psi_prime", "delta_phase", "psi_x"} & set(prime)
 
 
@@ -313,7 +313,7 @@ def test_needs_polarisation_quarter():
 @requires_circular
 @pytest.mark.parametrize("standardise", [False, True])
 def test_et_proposal_circular_end_to_end(tmp_path, standardise):
-    """sheet-residual on the circular torus: psi_res and sigma_res are the
+    """sheet-residual on the circular torus: psi_res and delta_phase_res are the
     circles, and a proposal trains and samples."""
     sheet = _sheet()
     cls = make_et_group_flow_proposal(
@@ -324,7 +324,7 @@ def test_et_proposal_circular_end_to_end(tmp_path, standardise):
         circular_standardisation=standardise,
     )
     fm = cls._FlowModelClass
-    assert fm.circular_parameters == ["psi_res", "sigma_res"]
+    assert fm.circular_parameters == ["psi_res", "delta_phase_res"]
     assert isinstance(fm.canonical_transform, CircularCanonicalTransform)
     model = _stub_model()
     proposal = cls(
@@ -340,7 +340,7 @@ def test_et_proposal_circular_end_to_end(tmp_path, standardise):
     proposal.initialise()
     circ = _check_trained_proposal(
         proposal, model, _prior_live_points(model, 1000))
-    assert set(circ) == {"psi_res", "sigma_res"}
+    assert set(circ) == {"psi_res", "delta_phase_res"}
 
 
 def test_et_proposal_plain_end_to_end(tmp_path):
@@ -363,7 +363,7 @@ def test_et_proposal_plain_end_to_end(tmp_path):
         training_config={"max_epochs": 3, "patience": 3},
     )
     proposal.initialise()
-    assert {"psi_res", "sigma_res"} <= set(proposal.prime_parameters)
+    assert {"psi_res", "delta_phase_res"} <= set(proposal.prime_parameters)
     live = _prior_live_points(model, 1000)
     proposal.train(live)
     flow = proposal.flow.model
@@ -448,11 +448,11 @@ def test_waveform_phase_on_the_sheet():
     plain = _reparam(sheet=_sheet(offsets=(0.0, 0.0)))
     xp0, lj0 = _apply(plain, x)
     conc = lambda v: abs(np.mean(np.exp(2j * np.pi * (v + 1))))  # noqa: E731
-    assert conc(xp0["sigma_res"]) < 0.3        # winds with the chirp mass
+    assert conc(xp0["delta_phase_res"]) < 0.3        # winds with the chirp mass
     rep.update(x)
     assert rep._phase_ref.reference_frequency == pytest.approx(_F_TRUE)
     xp, lj = _apply(rep, x)
-    assert conc(xp["sigma_res"]) > 0.9
+    assert conc(xp["delta_phase_res"]) > 0.9
     np.testing.assert_allclose(lj, lj0)
     y = x.copy()
     y["psi"] = y["phase"] = np.nan
@@ -518,3 +518,179 @@ def test_et_proposal_waveform_phase_end_to_end(tmp_path, chirp_distance):
         if period:
             d = _circ(d, period)
         assert np.abs(d).max() < 1e-7, k
+
+
+# -- ObservedPhase: the phase the detectors observe ---------------------------
+
+def _observed(offsets=(0.4, -0.7), sign=-1.0, branch=0.9, hemisphere=False):
+    from nessai_gw._ellipse import ObservedPhase
+    from nessai_gw._geometry import greenwich_mean_sidereal_time
+    from nessai_gw.group_mixture import ET_EMR_DETECTOR_TENSORS
+
+    obs = ObservedPhase(ET_EMR_DETECTOR_TENSORS,
+                        greenwich_mean_sidereal_time(REFERENCE_TIME))
+    obs.offset_psi, obs.offset_sum = offsets
+    obs.sign, obs.branch, obs.hemisphere = sign, branch, hemisphere
+    return obs
+
+
+@pytest.mark.parametrize("hemisphere", [False, True])
+def test_observed_phase_torch_matches_numpy(hemisphere):
+    obs = _observed(hemisphere=hemisphere)
+    x = _physical(2000)
+    c = np.cos(x["theta_jn"])
+    want = obs.phase(x["ra"], x["dec"], c, x["psi"])
+    got = obs.phase_torch(torch.as_tensor(x["ra"]), torch.as_tensor(np.sin(x["dec"])),
+                          torch.as_tensor(c), torch.as_tensor(x["psi"])).numpy()
+    assert _circ(got - want, 2 * np.pi).max() < 1e-9
+
+
+def test_observed_phase_quarter_turn_invariant():
+    """h is unchanged by the polarisation/phase quarter turn (mod pi)."""
+    obs = _observed()
+    x = _physical(2000)
+    c = np.cos(x["theta_jn"])
+    h0 = obs.observed(x["ra"], x["dec"], c, x["psi"])
+    h1 = obs.observed(x["ra"], x["dec"], c, x["psi"] + np.pi / 2)
+    assert _circ(h1 - h0, np.pi).max() < 1e-9
+
+
+def test_observed_reparam_round_trip_and_quarter_turn():
+    rep = _reparam(sheet=_observed())
+    assert "theta_jn" in rep.requires
+    x = _physical(3000)
+    xp, lj = _apply(rep, x)
+    y = x.copy()
+    y["psi"] = y["phase"] = np.nan
+    y, _, lj_inv = rep.inverse_reparameterise(y, xp, np.zeros(len(x)))
+    assert _circ(y["psi"] - x["psi"], np.pi).max() < 1e-9
+    assert _circ(y["phase"] - x["phase"], 2 * np.pi).max() < 1e-9
+    np.testing.assert_allclose(lj, -lj_inv)
+    y = x.copy()
+    y["psi"] = np.mod(y["psi"] + np.pi / 2, np.pi)
+    y["phase"] = np.mod(y["phase"] - np.pi / 2, 2 * np.pi)
+    yp, _ = _apply(rep, y)
+    assert _circ(yp["psi_res"] - xp["psi_res"] - 1.0, 2.0).max() < 1e-9
+    assert _circ(yp["delta_phase_res"] - xp["delta_phase_res"], 1.0).max() < 1e-9
+
+
+def test_observed_reparam_log_jacobian_numerical():
+    rep = _reparam(sheet=_observed())
+    x = _physical(200)
+    xp, lj = _apply(rep, x)
+    eps = 1e-6
+    cols = []
+    for k in ("psi", "phase"):
+        y = x.copy()
+        y[k] = y[k] + eps
+        yp, _ = _apply(rep, y)
+        cols.append(np.stack([(yp[n] - xp[n] + 1) % 2 - 1
+                              for n in rep.prime_parameters], -1) / eps)
+    np.testing.assert_allclose(
+        np.log(np.abs(np.linalg.det(np.stack(cols, -1)))), lj, atol=1e-5)
+
+
+def test_observed_refit_concentrates_a_wound_phase():
+    """Points whose phase follows the observed phase of their sky and
+    orientation: delta_phase winds, the residual is pinned."""
+    truth = _observed(offsets=(0.0, 0.0), sign=1.0, branch=0.0)
+    x = _physical(4000, seed=5)
+    c = np.cos(x["theta_jn"])
+    s = np.where(c >= 0, 1.0, -1.0)
+    rng = np.random.default_rng(1)
+    target = 1.0 + 0.05 * rng.normal(size=len(x))
+    x["phase"] = np.mod(target - s * x["psi"]
+                        - truth.observed(x["ra"], x["dec"], c, x["psi"]), 2 * np.pi)
+    conc = lambda a: np.abs(np.mean(np.exp(2j * a)))
+    assert conc(x["phase"] + s * x["psi"]) < 0.3
+    rep = _reparam(sheet=_observed())
+    rep.update(x)
+    assert rep.sheet.sign == 1.0
+    xp, _ = _apply(rep, x)
+    assert conc(xp["delta_phase_res"] * np.pi) > 0.95
+
+
+@pytest.fixture(scope="module", params=[False, True], ids=["fixed", "hemisphere"])
+def observed_action(request):
+    base = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, polarisation_quarter=True,
+        phase_reflection=True)
+    return PrimeSpaceTriangularGroupAction(
+        base, PRIME_NAMES, sheet=_observed(hemisphere=request.param))
+
+
+def test_observed_action_round_trip(observed_action, prime_points):
+    n = len(prime_points["t_det"])
+    for g in range(observed_action._action.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        back = observed_action(observed_action(prime_points, modes), modes, inverse=True)
+        for name in ("psi_res", "delta_phase_res"):
+            d = torch.remainder(back[name] - prime_points[name], 2.0)
+            assert torch.minimum(d, 2.0 - d).max() < 1e-8, (g, name)
+
+
+def test_observed_action_matches_physical(observed_action, prime_points):
+    """With theta_jn's angle-sine coordinate u = 2 theta_jn / pi - 1: the
+    prime action equals the physical action through the reparameterisation."""
+    action = observed_action
+    rep = _reparam(sheet=action._sheet)
+    n = len(prime_points["t_det"])
+    acted, _ = action._decode(prime_points)
+    cos0 = -torch.sin(prime_points["theta_jn_prime"] * (0.5 * np.pi))
+    phys0 = {"ra": acted["ra"], "sin_dec": acted["sin_dec"], "cos_theta_jn": cos0,
+             "psi": acted["psi"], "phase": acted["phase"]}
+    base = action._action
+    for g in range(base.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        phys = base(phys0, modes)
+        x = np.zeros(n, dtype=[(k, "f8") for k in ("ra", "dec", "psi", "phase",
+                                                    "theta_jn")])
+        x["ra"] = phys["ra"].numpy()
+        x["dec"] = np.arcsin(phys["sin_dec"].numpy())
+        x["psi"] = phys["psi"].numpy()
+        x["phase"] = phys["phase"].numpy()
+        x["theta_jn"] = np.arccos(np.clip(phys["cos_theta_jn"].numpy(), -1, 1))
+        want, _ = _apply(rep, x)
+        fwd = action(prime_points, modes)
+        for name in ("psi_res", "delta_phase_res"):
+            d = torch.remainder(fwd[name] - torch.as_tensor(want[name]), 2.0)
+            assert torch.minimum(d, 2.0 - d).max() < 1e-6, (g, name)
+
+
+def test_observed_fundamental_domain_partitions_orbit(observed_action, prime_points):
+    n = len(prime_points["t_det"])
+    count = torch.zeros(n)
+    for g in range(observed_action._action.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        count += observed_action.in_fundamental_domain(
+            observed_action(prime_points, modes)).float()
+    assert torch.all(count == 1), count.unique(return_counts=True)
+
+
+@requires_circular
+def test_et_proposal_observed_phase_end_to_end(tmp_path):
+    """An ObservedPhase in place of the sheet: a proposal trains and samples,
+    and its training refits the prediction."""
+    obs = _observed(offsets=(0.0, 0.0), sign=1.0, branch=0.0)
+    cls = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
+        polarisation_quarter=True, psi_single=True,
+        phase_coordinates="sheet-residual", sheet_phase=obs,
+        circular_psi_phase=True, log_mass_ratio=False,
+        circular_standardisation=True,
+    )
+    model = _stub_model()
+    proposal = cls(
+        model, output=str(tmp_path), poolsize=200,
+        reparameterisations=triangular_group_reparameterisations(
+            BNS_PARAMETERS, REFERENCE_TIME, log_mass_ratio=False,
+            phase_coordinates="sheet-residual", sheet_phase=obs),
+        flow_config={"ftype": "circular", "n_blocks": 2, "n_neurons": 8,
+                     "n_layers": 1, "real_transform": "affine"},
+        training_config={"max_epochs": 3, "patience": 3},
+        latent_temperature=1.4,
+    )
+    proposal.initialise()
+    circ = _check_trained_proposal(
+        proposal, model, _prior_live_points(model, 1000))
+    assert set(circ) == {"psi_res", "delta_phase_res"}

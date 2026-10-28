@@ -853,10 +853,10 @@ class PrimeSpaceTriangularGroupAction:
         # delta_phase; decoded to (psi, phase) at the original sky and
         # re-encoded at the mapped one.
         self._sheet_res = None
-        if "psi_res" in names and "sigma_res" in names:
+        if "psi_res" in names and "delta_phase_res" in names:
             if self._sheet is None:
-                raise RuntimeError("psi_res / sigma_res need the `sheet`")
-            self._sheet_res = ("psi_res", "sigma_res")
+                raise RuntimeError("psi_res / delta_phase_res need the `sheet`")
+            self._sheet_res = ("psi_res", "delta_phase_res")
         self._joint = self._arg_ab is not None or self._sheet_res is not None
 
         # delta_phase: single linear polarisation-phase coordinate
@@ -967,6 +967,14 @@ class PrimeSpaceTriangularGroupAction:
             r_psi = (point_dict[self._sheet_res[0]] + 1.0) * (0.5 * np.pi)
             r_sum = (point_dict[self._sheet_res[1]] + 1.0) * np.pi
             psi = torch.remainder(r_psi + psi_s, np.pi)
+            if getattr(self._sheet, "orientation_dependent", False):
+                # ObservedPhase: phase* depends on theta_jn and psi; the
+                # angle-sine coordinate u = 2 theta_jn / pi - 1
+                if self._ellipse is not None:
+                    raise RuntimeError("an orientation-dependent sheet needs "
+                                       "the plain theta_jn coordinate")
+                cos_ct = -torch.sin(point_dict[self._theta_jn] * (0.5 * np.pi))
+                phase_s = self._sheet.phase_torch(ra, sin_dec, cos_ct, psi)
             phase = torch.remainder(r_sum - r_psi + phase_s, _TWO_PI)
             r_psi = torch.ones_like(ra)
         elif self._psi_single:
@@ -1099,6 +1107,11 @@ class PrimeSpaceTriangularGroupAction:
         if self._sheet_res is not None:
             # relative to the prediction at the mapped sky
             psi_s, phase_s = self._sheet.predict_torch(ra_t, sin_dec_t)
+            if getattr(self._sheet, "orientation_dependent", False):
+                # the reflection sends cos theta_jn -> -cos theta_jn
+                u = point_dict[self._theta_jn]
+                cos_ct = -torch.sin(torch.where(aux["reflected"], -u, u) * (0.5 * np.pi))
+                phase_s = self._sheet.phase_torch(ra_t, sin_dec_t, cos_ct, mapped["psi"])
             r_psi = torch.remainder(mapped["psi"] - psi_s, np.pi)
             out[self._sheet_res[0]] = r_psi * (2.0 / np.pi) - 1.0
             out[self._sheet_res[1]] = (
@@ -2196,6 +2209,20 @@ def _time_parameter(sampling_parameters):
                 "geocent_time")
 
 
+def _spin_names(sampling_parameters):
+    """The spins the waveform's time and phase are fitted on: the aligned
+    ``chi_1``, ``chi_2``, or the precessing ``(a_1, tilt_1, a_2, tilt_2)``,
+    whose components along L are the coprecessing frame's aligned spins
+    (:func:`~nessai_gw.reparameterisations.mass.aligned_spins`); None
+    without spins."""
+    names = set(sampling_parameters)
+    if {"chi_1", "chi_2"} <= names:
+        return ["chi_1", "chi_2"]
+    if {"a_1", "tilt_1", "a_2", "tilt_2"} <= names:
+        return ["a_1", "tilt_1", "a_2", "tilt_2"]
+    return None
+
+
 #: ``phase_coordinates`` choices of the triangle group proposal.
 PHASE_COORDINATES = ("polarisation-phase", "arg-alpha-beta", "sheet-residual")
 #: The choices that replace both ``psi`` and ``phase`` by a pair.
@@ -2684,10 +2711,7 @@ def triangular_group_reparameterisations(
                 reps[name]["frequency_range"] = [
                     float(f) for f in time_frequency_range
                 ]
-                reps[name]["spins"] = (
-                    ["chi_1", "chi_2"]
-                    if {"chi_1", "chi_2"} <= set(sampling_parameters) else None
-                )
+                reps[name]["spins"] = _spin_names(sampling_parameters)
                 if doppler_chirp_mass:
                     reps[name]["doppler_vector"] = [
                         float(v) for v in np.asarray(doppler_vector, dtype=float)
@@ -2719,11 +2743,7 @@ def triangular_group_reparameterisations(
                     reps[name]["frequency_range"] = [
                         float(f) for f in time_frequency_range
                     ]
-                    reps[name]["spins"] = (
-                        ["chi_1", "chi_2"]
-                        if {"chi_1", "chi_2"} <= set(sampling_parameters)
-                        else None
-                    )
+                    reps[name]["spins"] = _spin_names(sampling_parameters)
                     reps[name]["tides"] = (
                         ["lambda_1", "lambda_2"]
                         if {"lambda_1", "lambda_2"} <= set(sampling_parameters)
@@ -2746,9 +2766,7 @@ def triangular_group_reparameterisations(
             entry |= dict(
                 waveform_phase=waveform_phase,
                 frequency_range=[float(f) for f in time_frequency_range],
-                spins=(["chi_1", "chi_2"]
-                       if {"chi_1", "chi_2"} <= set(sampling_parameters)
-                       else None),
+                spins=_spin_names(sampling_parameters),
                 tides=(["lambda_1", "lambda_2"]
                        if {"lambda_1", "lambda_2"} <= set(sampling_parameters)
                        else None),
@@ -2984,7 +3002,7 @@ def _prime_parameter_names(
                 # here and skip psi below.
                 out += ["arg_alpha", "arg_beta"]
             elif phase_coordinates == "sheet-residual":
-                out += ["psi_res", "sigma_res"]
+                out += ["psi_res", "delta_phase_res"]
             else:
                 # single ``delta_phase`` polarisation-phase coordinate
                 out.append("delta_phase")

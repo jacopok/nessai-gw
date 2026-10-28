@@ -415,3 +415,184 @@ class SheetPhase:
         # 4 psi = pi and 2 (psi + phase) = pi
         self.offset_psi = float((m_psi - np.pi) / 4.0)
         self.offset_sum = float((m_sum - np.pi) / 2.0)
+
+
+def _complex_response_torch(tensors, ra, sin_dec, gmst):
+    """:func:`_complex_response` for torch tensors, from ``ra`` and
+    ``sin(dec)``: real and imaginary parts, each of shape ``(..., n_det)``."""
+    import torch
+
+    t = torch.as_tensor(tensors, dtype=ra.dtype)
+    ct = torch.clamp(sin_dec, -1.0, 1.0)  # cos(theta) = sin(dec)
+    st = torch.sqrt(torch.clamp(1.0 - ct * ct, min=0.0))
+    phi = ra - gmst
+    sp, cp = torch.sin(phi), torch.cos(phi)
+    u = torch.stack([cp * ct, ct * sp, -st], dim=-1)
+    v = torch.stack([-sp, cp, torch.zeros_like(cp)], dim=-1)
+    m, n = -v, -u
+    ep = m[..., :, None] * m[..., None, :] - n[..., :, None] * n[..., None, :]
+    ec = m[..., :, None] * n[..., None, :] + n[..., :, None] * m[..., None, :]
+    return (torch.einsum('dij,...ij->...d', t, ep),
+            torch.einsum('dij,...ij->...d', t, ec))
+
+
+class ObservedPhase:
+    """The phase the detectors observe, for a residual coordinate.
+
+    With ``a_k = F_+,k + i F_x,k`` of detector ``k`` at the point's ``psi``
+    and ``c = cos theta_jn``, the (2, 2) response is (up to the waveform's
+    own phase and ``e^{2i phase}``)
+
+        Z_k = conj(a_k) (1 + c)^2 / 4 + a_k (1 - c)^2 / 4,
+
+    and the data fix ``2 phase + arg Z_k`` at each detector.  The phase the
+    network observes is
+
+        h(n, theta_jn, psi) = 1/2 arg sum_k |Z_k| Z_k e^{-2 i s psi} e^{i delta_k},
+
+    ``s = sign(c)``: ``e^{-2 i s psi}`` takes out the ``psi`` of the
+    dominant helicity, so ``h`` is unchanged by the polarisation/phase quarter
+    turn, and ``delta_k`` is a constant phase between sites (zero within a
+    site).  As a :class:`SheetPhase` stand-in for
+    :class:`~nessai_gw.reparameterisations.phase.SheetResidualReparameterisation`
+    the prediction is
+
+        psi* = offset_psi,
+        phase* = (1 - s) psi - sign h + offset_sum - offset_psi,
+
+    so the residual of ``psi + phase`` is ``phase + s psi + sign h`` minus a
+    constant: ``delta_phase`` with the sky's (and the inclination's) share of
+    the observed phase taken out, from the standard parameters alone.
+    ``sign`` (the phase convention), whether it flips with ``s``
+    (``hemisphere``: ``sign s h``; the 2L runs' live points prefer it, the
+    triangle's a fixed sign) and ``delta_k`` are fitted by :meth:`refit`,
+    which also moves the principal-value cut of ``h`` away from the points
+    (``branch``).  Either way ``sign h`` is unchanged by the quarter turn.
+
+    Parameters
+    ----------
+    tensors : array_like
+        ``(n_det, 3, 3)`` Earth-fixed detector tensors.
+    gmst : float
+        Greenwich mean sidereal time (rad) the responses are evaluated at.
+    sites : array_like of int, optional
+        The site of each detector (default: one site).
+    """
+
+    #: the prediction depends on ``theta_jn`` and ``psi`` (:meth:`phase`)
+    orientation_dependent = True
+
+    def __init__(self, tensors, gmst, sites=None):
+        self.tensors = np.asarray(tensors, dtype=float)
+        self.gmst = float(gmst)
+        n_det = len(self.tensors)
+        self.sites = (np.zeros(n_det, dtype=int) if sites is None
+                      else np.asarray(sites, dtype=int))
+        self.site_phase = np.zeros(self.sites.max() + 1)
+        self.sign = 1.0
+        self.hemisphere = False
+        self.branch = 0.0
+        self.offset_psi = 0.0
+        self.offset_sum = 0.0
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def predict(self, ra, dec):
+        """``(psi*, phase*)`` without the orientation-dependent part."""
+        ra = np.asarray(ra, dtype=float)
+        psi = np.full_like(ra, self.offset_psi)
+        return psi, np.full_like(ra, self.offset_sum) - psi
+
+    def predict_torch(self, ra, sin_dec):
+        """:meth:`predict` for torch tensors."""
+        import torch
+
+        psi = torch.full_like(ra, self.offset_psi)
+        return psi, torch.full_like(ra, self.offset_sum) - psi
+
+    def _combined(self, w, cos_theta_jn, psi):
+        """``sum_k |Z_k| Z_k e^{-2 i s psi} e^{i delta_k}`` (numpy)."""
+        c = np.asarray(cos_theta_jn, dtype=float)[..., None]
+        s = np.where(c >= 0, 1.0, -1.0)
+        a = w * np.exp(-2j * np.asarray(psi, dtype=float))[..., None]
+        z = np.conj(a) * (1 + c) ** 2 / 4 + a * (1 - c) ** 2 / 4
+        g = np.abs(z) * z * np.exp(-2j * s * np.asarray(psi)[..., None])
+        return np.sum(g * np.exp(1j * self.site_phase[self.sites]), axis=-1)
+
+    def observed(self, ra, dec, cos_theta_jn, psi):
+        """``h``, its principal-value cut at ``branch + pi`` (numpy)."""
+        g = self._combined(_complex_response(self.tensors, ra, dec, self.gmst),
+                           cos_theta_jn, psi)
+        return 0.5 * np.angle(g * np.exp(-1j * self.branch)) + 0.5 * self.branch
+
+    def phase(self, ra, dec, cos_theta_jn, psi):
+        """``phase*`` at the point (numpy)."""
+        s = np.where(np.asarray(cos_theta_jn) >= 0, 1.0, -1.0)
+        h = self.observed(ra, dec, cos_theta_jn, psi)
+        sign = self.sign * (s if getattr(self, "hemisphere", False) else 1.0)
+        return (1 - s) * psi - sign * h + self.offset_sum - self.offset_psi
+
+    def phase_torch(self, ra, sin_dec, cos_theta_jn, psi):
+        """:meth:`phase` for torch tensors, from ``ra`` and ``sin(dec)``."""
+        import torch
+
+        wr, wi = _complex_response_torch(self.tensors, ra, sin_dec, self.gmst)
+        c = cos_theta_jn[..., None]
+        s = torch.where(c >= 0, torch.ones_like(c), -torch.ones_like(c))
+        p = psi[..., None]
+        # a = w e^{-2 i psi}
+        cr, ci = torch.cos(2 * p), torch.sin(2 * p)
+        ar, ai = wr * cr + wi * ci, wi * cr - wr * ci
+        kp, km = (1 + c) ** 2 / 4, (1 - c) ** 2 / 4
+        zr, zi = (kp + km) * ar, (km - kp) * ai
+        mod = torch.sqrt(zr * zr + zi * zi)
+        # times e^{-2 i s psi + i delta_k - i branch}
+        ang = (-2 * s * p + torch.as_tensor(self.site_phase[self.sites], dtype=ra.dtype)
+               - self.branch)
+        er, ei = torch.cos(ang), torch.sin(ang)
+        gr = torch.sum(mod * (zr * er - zi * ei), dim=-1)
+        gi = torch.sum(mod * (zr * ei + zi * er), dim=-1)
+        h = 0.5 * torch.atan2(gi, gr) + 0.5 * self.branch
+        s1 = s[..., 0]
+        sign = self.sign * (s1 if getattr(self, "hemisphere", False) else 1.0)
+        return (1 - s1) * psi - sign * h + self.offset_sum - self.offset_psi
+
+    def refit(self, x, n_site_phase=72):
+        """Fit ``sign``, the site phases and the cut of ``h`` to concentrate
+        ``phase + s psi + sign h`` on ``x``, then centre the residuals in the
+        canonical cell (``4 psi = pi``, ``2 (psi + phase) = pi``)."""
+        if len(x) == 0:
+            return
+        c = np.cos(x["theta_jn"])
+        s = np.where(c >= 0, 1.0, -1.0)
+        w = _complex_response(self.tensors, x["ra"], x["dec"], self.gmst)
+        self.site_phase = np.zeros_like(self.site_phase)
+        self.branch = 0.0
+        base = x["phase"] + s * x["psi"]
+        n_sites = len(self.site_phase)
+        grid = (np.linspace(0, 2 * np.pi, n_site_phase, endpoint=False)
+                if n_sites > 1 else [0.0])
+        best = None
+        for d in grid:
+            self.site_phase = np.zeros(n_sites)
+            self.site_phase[1:] = d
+            g = self._combined(w, c, x["psi"])
+            h = 0.5 * np.angle(g)
+            for hemisphere in (False, True):
+                for sign in (1.0, -1.0):
+                    k = sign * (s if hemisphere else 1.0)
+                    r = np.abs(np.mean(np.exp(2j * (base + k * h))))
+                    if best is None or r > best[0]:
+                        best = (r, sign, hemisphere, d, g)
+        _, self.sign, self.hemisphere, d, g = best
+        self.site_phase = np.zeros(n_sites)
+        self.site_phase[1:] = d
+        self.branch = float(np.angle(np.mean(g / np.maximum(np.abs(g), 1e-300))))
+        self.offset_psi = self.offset_sum = 0.0
+        r_psi = x["psi"]
+        r_sum = r_psi + x["phase"] - self.phase(x["ra"], x["dec"], c, x["psi"])
+        m_psi = np.angle(np.mean(np.exp(4j * r_psi)))
+        m_sum = np.angle(np.mean(np.exp(2j * r_sum)))
+        self.offset_psi = float((m_psi - np.pi) / 4.0)
+        self.offset_sum = float((m_sum - np.pi) / 2.0)
