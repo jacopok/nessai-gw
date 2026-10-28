@@ -606,6 +606,11 @@ class ObservedPhase:
         self.offset_sum = float((m_sum - np.pi) / 2.0)
 
 
+#: relative floor of the helicity fit's normal matrix (its trace times this
+#: on the diagonal): finite where the two helicities' responses are parallel
+_GRAM_FLOOR = 1e-6
+
+
 class ResponseFit:
     """Residual (psi, phase) predictions from the network's helicity fit.
 
@@ -694,7 +699,7 @@ class ResponseFit:
         # singular where the two helicities' responses are parallel (the
         # triangle's plane, the 2L sky where Z_1 conj(Z_2) is real): floored,
         # as SheetPhase's determinant
-        gram = gram + 1e-9 * np.trace(gram, axis1=-2, axis2=-1).real[:, None, None] * np.eye(2)
+        gram = gram + _GRAM_FLOOR * np.trace(gram, axis1=-2, axis2=-1).real[:, None, None] * np.eye(2)
         rhs = np.einsum("nki,k->ni", np.conj(a), self.data)
         v = np.linalg.solve(gram, rhs[..., None])[..., 0]
         return v[:, 0], v[:, 1]
@@ -752,14 +757,17 @@ class ResponseFit:
     def _helicities_torch(self, w):
         import torch
 
+        # in double precision: in single the floor is below the rounding
+        dtype = w.dtype
+        w = w.to(torch.complex128)
         a = torch.stack([torch.conj(w), w], dim=-1)
         data = torch.as_tensor(self.data, dtype=a.dtype)
         gram = torch.einsum("nki,nkj->nij", torch.conj(a), a)
         trace = torch.diagonal(gram, dim1=-2, dim2=-1).sum(-1).real
-        gram = gram + 1e-9 * trace[:, None, None] * torch.eye(2, dtype=gram.dtype)
+        gram = gram + _GRAM_FLOOR * trace[:, None, None] * torch.eye(2, dtype=gram.dtype)
         rhs = torch.einsum("nki,k->ni", torch.conj(a), data)
         v = torch.linalg.solve(gram, rhs[..., None])[..., 0]
-        return v[:, 0], v[:, 1]
+        return v[:, 0].to(dtype), v[:, 1].to(dtype)
 
     def _psi_star_torch(self, w):
         import torch

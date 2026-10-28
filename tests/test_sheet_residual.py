@@ -860,6 +860,12 @@ def test_response_fit_finite_on_the_detector_plane():
     ra = np.array([np.arctan2(v[1], v[0]) + gmst])
     dec = np.array([np.arcsin(v[2])])
     assert np.all(np.isfinite(rf.psi_star(ra, dec)))
-    got = rf.phase_torch(torch.as_tensor(ra), torch.as_tensor(np.sin(dec)),
-                         torch.as_tensor([0.3]), torch.as_tensor([0.7]))
-    assert torch.all(torch.isfinite(got))
+    for dtype in (torch.float64, torch.float32):
+        got = rf.phase_torch(torch.as_tensor(ra, dtype=dtype),
+                             torch.as_tensor(np.sin(dec), dtype=dtype),
+                             torch.as_tensor([0.3], dtype=dtype),
+                             torch.as_tensor([0.7], dtype=dtype))
+        assert torch.all(torch.isfinite(got)) and got.dtype == dtype
+        psi, _ = rf.predict_torch(torch.as_tensor(ra, dtype=dtype),
+                                  torch.as_tensor(np.sin(dec), dtype=dtype))
+        assert torch.all(torch.isfinite(psi))
