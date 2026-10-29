@@ -444,13 +444,10 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
                             "lambda_1", "lambda_2") if np.std(params[k]) > 0]
         n_terms = len(list(combinations_with_replacement(
             range(len(keys) + 1), self._correction_degree)))
-        # a gain within the noise of the best of many frequencies is chance
-        # (uniform phases: 2 N R^2 ~ chi^2_2, so ~e^-16 per frequency)
-        if r[i] <= r_merger + 4.0 / np.sqrt(len(x)) or len(x) < 2 * n_terms:
+        if len(x) < 2 * n_terms:
             logger.info(
-                "Phase measured at the merger (concentration %.3f; best %.3f "
-                "at %.1f Hz, %d points for %d terms)", r_merger, r[i],
-                freqs[i], len(x), n_terms,
+                "Phase measured at the merger (%d points for %d terms)",
+                len(x), n_terms,
             )
             self.reference_frequency, self._offset = None, None
             return
@@ -461,14 +458,27 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         design = self._features(params)
         beta, *_ = np.linalg.lstsq(design, target, rcond=None)
         self._offset["beta"] = beta
+        r_fit = float(self._concentration(base + self._shift(x)))
+        # compare circular variances 1 - R (~ sigma^2 / 2 when concentrated),
+        # whose relative noise is ~ sqrt(2 / N) at any width: a difference of
+        # R would call the two references equal once both are near 1
+        gain = np.log(max(1.0 - r_merger, 1e-300) / max(1.0 - r_fit, 1e-300))
+        if gain <= 4.0 * np.sqrt(2.0 / len(x)):
+            logger.info(
+                "Phase measured at the merger (1 - concentration %.3g; %.3g "
+                "at %.1f Hz after the fit, log ratio %.3g <= %.3g)",
+                1.0 - r_merger, 1.0 - r_fit, freqs[i], gain,
+                4.0 * np.sqrt(2.0 / len(x)),
+            )
+            self.reference_frequency, self._offset = None, None
+            return
         self.reference_frequency = float(freqs[i])
         residual = target - design @ beta
         logger.info(
             "Phase measured at %.1f Hz: offset spread %.3g rad, fit residual "
-            "%.3g rad (%d terms); concentration of delta_phase %.3f (%.3f at "
-            "the merger)", self.reference_frequency, np.std(target),
-            np.std(residual), len(beta),
-            self._concentration(base + self._shift(x)), r_merger,
+            "%.3g rad (%d terms); 1 - concentration of delta_phase %.3g (%.3g "
+            "at the merger)", self.reference_frequency, np.std(target),
+            np.std(residual), len(beta), 1.0 - r_fit, 1.0 - r_merger,
         )
 
     def reparameterise(self, x, x_prime, log_j, **kwargs):

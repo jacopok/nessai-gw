@@ -603,3 +603,27 @@ def test_triangular_wiring_waveform_phase_precessing():
     for key in [k for k in order if k != "phase" and (
             {"a_1", "tilt_1"} & set(reps[k].get("parameters", [k])))]:
         assert order.index("phase") < order.index(key), key
+
+
+def test_waveform_phase_kept_when_the_merger_is_concentrated_too():
+    """Late in a run the merger phase alone is concentrated (R ~ 0.97) but a
+    reference frequency is far tighter: the choice compares 1 - R, so the
+    phase stays at that frequency (a difference of R, ~0.03, would not)."""
+    x = _helix_points(12500, 7)
+    rng = np.random.default_rng(8)
+    x["chirp_mass"] = 1.2 + rng.normal(0, 1.5e-5, len(x))
+    x["lambda_1"] = 400 + rng.normal(0, 1.0, len(x))
+    x["chi_1"] = rng.normal(0, 1e-3, len(x))
+    x["chi_2"] = rng.normal(0, 1e-3, len(x))
+    reparam = _waveform_reparam()
+    a = _intercept(reparam._params(x), _F_TRUE)
+    sign = np.sign(np.cos(x["theta_jn"]))
+    x["phase"] = np.mod(np.pi - sign * x["psi"] - a / 2
+                        + rng.normal(0, 3e-3, len(x)), 2 * np.pi)
+    base = x["phase"] + sign * x["psi"]
+    r_merger = reparam._concentration(base)
+    assert 0.9 < r_merger and 1 - r_merger < 4.0 / np.sqrt(len(x))
+
+    reparam.update(x)
+    assert reparam.reference_frequency == pytest.approx(_F_TRUE)
+    assert 1 - reparam._concentration(base + reparam._shift(x)) < 1e-4
