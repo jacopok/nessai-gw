@@ -5,7 +5,7 @@ import inspect
 import numpy as np
 from nessai.reparameterisations import Reparameterisation
 from scipy.interpolate import PchipInterpolator
-from scipy.special import ndtr, ndtri
+from scipy.special import log_ndtr, ndtr, ndtri
 
 from .. import nessai_logger
 
@@ -350,6 +350,18 @@ class EffectiveSpinReparameterisation(Reparameterisation):
 #: (both are zero only on sets of zero prior measure).
 _TINY = 1e-300
 
+#: The charts of :class:`PrecessingSpinReparameterisation`.
+PRECESSING_SPIN_COORDINATES = ("cogwheel", "cartesian")
+#: Prime names of the ``cogwheel`` chart's two azimuths, angles in
+#: ``[-pi, pi)`` (periodic dimensions of the flow).
+PRECESSING_SPIN_ANGLES = ("phi_jl_angle", "phi_12_angle")
+_PRIME_PARAMETERS = {
+    "cogwheel": ("chi_eff_prime", "chi_diff_prime", "r1_prime", "r2_prime",
+                 *PRECESSING_SPIN_ANGLES),
+    "cartesian": ("chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x",
+                  "s2_y"),
+}
+
 
 def _in_plane_forward(a, tilt, a_max):
     r"""The in-plane radius ``rho`` of :class:`PrecessingSpinReparameterisation`
@@ -398,7 +410,9 @@ def _in_plane_inverse(chi_z, rho, a_max):
 
 class PrecessingSpinReparameterisation(Reparameterisation):
     r"""Precessing spins ``(a_1, tilt_1, a_2, tilt_2, phi_12, phi_jl) ->
-    (chi_eff_prime, chi_diff_prime, s1_x, s1_y, s2_x, s2_y)``.
+    (chi_eff_prime, chi_diff_prime, r1_prime, r2_prime, phi_jl_angle,
+    phi_12_angle)`` (``cogwheel``, the default) or ``(chi_eff_prime,
+    chi_diff_prime, s1_x, s1_y, s2_x, s2_y)`` (``cartesian``).
 
     For the usual prior on precessing spins, magnitudes uniform in
     ``[0, a_max]`` and isotropic directions (``tilt_i`` sine-distributed,
@@ -417,17 +431,33 @@ class PrecessingSpinReparameterisation(Reparameterisation):
       azimuth makes a 2D standard normal,
       ``(s_x, s_y) = rho (cos phi, sin phi)``. The azimuth is ``phi_jl`` for
       the first spin and ``phi_12`` for the second. ``rho`` is proportional to
-      the in-plane spin near zero, so the chart is smooth there and the
-      angles need no periodic boundaries.
+      the in-plane spin near zero, so the ``cartesian`` chart is smooth there
+      and the angles need no periodic boundaries.
+    * The ``cogwheel`` chart (Roulet et al. 2022, arXiv:2207.03508, whose
+      ``cums1r_s1z``, ``cums2r_s2z`` are the ``u_i``) keeps the polar
+      coordinates instead: ``r_i = Phi^{-1}(u_i)``, a standard normal, and
+      the azimuths as angles in ``[-pi, pi)``, ``phi_12_angle = phi_12`` and
+      ``phi_jl_angle = phi_jl + pi [theta_jn > pi / 2]``, uniform under the
+      prior.  The flow must treat the angles as periodic.  The shift of
+      ``phi_jl`` with the inclination is the paper's: the improper elements of
+      every nessai-gw group send ``theta_jn -> pi - theta_jn`` together with
+      ``phi_jl -> phi_jl + pi`` (see
+      :class:`~nessai_gw.group_mixture.TriangularDetectorGroupAction`), which
+      leaves ``phi_jl_angle`` unchanged, so the chart is invariant under every
+      group action.  It reads ``theta_jn`` (``inclination``) from x-space, on
+      the inverse too.  Measured on the PS noorb runs' live points, a fresh
+      flow fits it ~0.5 nats better (KL to the live points) than the
+      ``cartesian`` chart (xG_inference studies/noorb_runs/proposal_benchmark.py).
 
     The log-Jacobian is that of the effective spins plus
     :math:`\sum_i [\log \sin \mathrm{tilt}_i - \log \ln(a_{\mathrm{max}, i} /
-    a_i)]`.
+    a_i)]` (``cartesian``), and for ``cogwheel`` that of
+    ``(s_x, s_y) -> (r_i, phi)``,
+    :math:`\sum_i [-\rho_i^2 / 2 - \log \varphi(r_i)]`.
 
-    The coordinates are invariant under the sky rotations of the triangular
-    detector group. Under its plane reflection ``phi_jl -> phi_jl + pi``,
-    i.e. ``(s1_x, s1_y) -> -(s1_x, s1_y)`` (see
-    :class:`~nessai_gw.group_mixture.TriangularDetectorGroupAction`).
+    The ``cartesian`` coordinates are invariant under the sky rotations of the
+    triangular detector group; under its plane reflection ``phi_jl -> phi_jl +
+    pi``, i.e. ``(s1_x, s1_y) -> -(s1_x, s1_y)``.
 
     Parameters
     ----------
@@ -441,6 +471,11 @@ class PrecessingSpinReparameterisation(Reparameterisation):
         read from x-space on the inverse.
     min_mass_ratio : float, optional
         As for :class:`EffectiveSpinReparameterisation`.
+    coordinates : {"cogwheel", "cartesian"}, optional
+        The chart (above); default ``"cogwheel"``.
+    inclination : str, optional
+        Name of ``theta_jn``, read by the ``cogwheel`` chart (default
+        ``"theta_jn"``).
     """
 
     one_to_one = False
@@ -451,10 +486,18 @@ class PrecessingSpinReparameterisation(Reparameterisation):
         prior_bounds=None,
         mass_ratio="mass_ratio",
         min_mass_ratio=1e-6,
+        coordinates="cogwheel",
+        inclination="theta_jn",
         rng=None,
         **kwargs,
     ):
         from .._effective_spin_table import TabulatedEffectiveSpinTransform
+
+        if coordinates not in PRECESSING_SPIN_COORDINATES:
+            raise ValueError(
+                f"coordinates must be one of {PRECESSING_SPIN_COORDINATES}, "
+                f"not {coordinates!r}"
+            )
 
         parent_params = inspect.signature(
             Reparameterisation.__init__
@@ -499,27 +542,45 @@ class PrecessingSpinReparameterisation(Reparameterisation):
         self._transform = TabulatedEffectiveSpinTransform(*self.a_max)
         self._mass_ratio = mass_ratio
         self.min_mass_ratio = float(min_mass_ratio)
-        self.requires = [mass_ratio]
+        self.coordinates = coordinates
+        self._inclination = inclination
+        reads = [mass_ratio]
+        if coordinates == "cogwheel":
+            reads.append(inclination)
+        self.requires = list(reads)
 
-        self.prime_parameters = [
-            "chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x", "s2_y",
-        ]
+        self.prime_parameters = list(_PRIME_PARAMETERS[coordinates])
         if hasattr(self, "output_parameters"):
             self.output_parameters = list(self.prime_parameters)
         if hasattr(self, "inverse_input_parameters"):
             self.inverse_input_parameters = list(
-                dict.fromkeys(
-                    list(self.inverse_input_parameters or []) + [mass_ratio]
-                )
+                dict.fromkeys(list(self.inverse_input_parameters or []) + reads)
             )
 
+    def __setstate__(self, state):
+        # pickled before the cogwheel chart: the Cartesian one
+        state.setdefault("coordinates", "cartesian")
+        state.setdefault("_inclination", "theta_jn")
+        self.__dict__.update(state)
+
     def _spins(self):
-        """``(magnitude, tilt, azimuth, (x, y) prime names, a_max)`` per spin."""
+        """``(magnitude, tilt, azimuth, (x, y) prime names, a_max)`` per spin:
+        for ``cogwheel`` the names are ``(r_i, azimuth angle)``."""
         a_1, tilt_1, a_2, tilt_2, phi_12, phi_jl = self.parameters
+        if self.coordinates == "cogwheel":
+            names = (("r1_prime", "phi_jl_angle"), ("r2_prime", "phi_12_angle"))
+        else:
+            names = (("s1_x", "s1_y"), ("s2_x", "s2_y"))
         return (
-            (a_1, tilt_1, phi_jl, ("s1_x", "s1_y"), self.a_max[0]),
-            (a_2, tilt_2, phi_12, ("s2_x", "s2_y"), self.a_max[1]),
+            (a_1, tilt_1, phi_jl, names[0], self.a_max[0]),
+            (a_2, tilt_2, phi_12, names[1], self.a_max[1]),
         )
+
+    def _azimuth_shifts(self, x):
+        """What the ``cogwheel`` chart adds to ``(phi_jl, phi_12)``."""
+        if self.coordinates != "cogwheel":
+            return 0.0, 0.0
+        return np.pi * (x[self._inclination] > 0.5 * np.pi), 0.0
 
     def reparameterise(self, x, x_prime, log_j, **kwargs):
         (a_1, tilt_1, *_), (a_2, tilt_2, *_) = self._spins()
@@ -528,12 +589,38 @@ class PrecessingSpinReparameterisation(Reparameterisation):
         u, w, lj = self._transform.forward(chi_1z, chi_2z, x[self._mass_ratio])
         x_prime["chi_eff_prime"] = u
         x_prime["chi_diff_prime"] = w
-        for a, tilt, phi, (sx, sy), a_max in self._spins():
+        for (a, tilt, phi, (sx, sy), a_max), shift in zip(
+            self._spins(), self._azimuth_shifts(x)
+        ):
             rho, lj_i = _in_plane_forward(x[a], x[tilt], a_max)
-            x_prime[sx] = rho * np.cos(x[phi])
-            x_prime[sy] = rho * np.sin(x[phi])
+            if self.coordinates == "cogwheel":
+                # u_i = 1 - exp(-rho^2 / 2); (s_x, s_y) -> (rho, phi) ->
+                # (Phi^-1(u_i), phi): -log rho + log(rho e^{-rho^2/2}) - log N
+                half_rho2 = 0.5 * rho**2
+                with np.errstate(divide="ignore"):
+                    r = np.where(
+                        half_rho2 < np.log(2.0),
+                        ndtri(-np.expm1(-half_rho2)),
+                        -ndtri(np.exp(-half_rho2)),
+                    )
+                x_prime[sx] = r
+                x_prime[sy] = (
+                    np.remainder(x[phi] + shift + np.pi, 2 * np.pi) - np.pi
+                )
+                lj_i = lj_i - half_rho2 + 0.5 * r**2 + 0.5 * _LOG_2PI
+            else:
+                x_prime[sx] = rho * np.cos(x[phi])
+                x_prime[sy] = rho * np.sin(x[phi])
             lj = lj + lj_i
         return x, x_prime, log_j + lj
+
+    def _radius_azimuth(self, x_prime, names):
+        """``(rho, azimuth before the shift)`` of one spin from x'."""
+        sx, sy = x_prime[names[0]], x_prime[names[1]]
+        if self.coordinates == "cogwheel":
+            # 1 - u_i = Phi(-r_i) = exp(-rho^2 / 2)
+            return np.sqrt(np.maximum(-2.0 * log_ndtr(-sx), 0.0)), sy
+        return np.hypot(sx, sy), np.arctan2(sy, sx)
 
     def inverse_reparameterise(self, x, x_prime, log_j, **kwargs):
         u = x_prime["chi_eff_prime"]
@@ -556,18 +643,20 @@ class PrecessingSpinReparameterisation(Reparameterisation):
                 chi_1z, chi_2z, lj_v = self._transform.inverse(
                     u[valid], w[valid], q[valid]
                 )
-                for (a, tilt, phi, _, a_max), z, (sx, sy) in zip(
-                    self._spins(), (chi_1z, chi_2z), in_plane
+                shifts = self._azimuth_shifts(x)
+                for (a, tilt, phi, names, a_max), z, shift in zip(
+                    self._spins(), (chi_1z, chi_2z), shifts
                 ):
-                    sx, sy = sx[valid], sy[valid]
-                    a_v, tilt_v, lj_i = _in_plane_inverse(
-                        z, np.hypot(sx, sy), a_max
-                    )
+                    rho, azimuth = self._radius_azimuth(x_prime[valid], names)
+                    a_v, tilt_v, lj_i = _in_plane_inverse(z, rho, a_max)
                     out[a][valid] = a_v
                     out[tilt][valid] = tilt_v
-                    out[phi][valid] = np.remainder(
-                        np.arctan2(sy, sx), 2 * np.pi
-                    )
+                    shift = shift[valid] if np.ndim(shift) else shift
+                    out[phi][valid] = np.remainder(azimuth - shift, 2 * np.pi)
+                    if self.coordinates == "cogwheel":
+                        r = x_prime[names[0]][valid]
+                        lj_i = (lj_i - 0.5 * rho**2 + 0.5 * r**2
+                                + 0.5 * _LOG_2PI)
                     lj_v = lj_v + lj_i
             lj[valid] = lj_v
             # as EffectiveSpinReparameterisation: a non-finite log-Jacobian

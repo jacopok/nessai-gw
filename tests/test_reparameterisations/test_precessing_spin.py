@@ -1,5 +1,6 @@
 """Tests for the precessing-spin reparameterisation: an exact bijection
-whose prior is approximately N(0, I_6)."""
+whose prior is approximately N(0, I_6) (``cartesian``), or N(0, I_4) times
+uniform angles (``cogwheel``)."""
 
 import numpy as np
 import pytest
@@ -13,22 +14,31 @@ from nessai_gw.reparameterisations.spin import (
 
 A1, A2 = 0.05, 0.04
 NAMES = ["a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"]
-PRIMES = ["chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x", "s2_y"]
+X_NAMES = NAMES + ["mass_ratio", "theta_jn"]
+PRIMES = {
+    "cartesian": ["chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x",
+                  "s2_y"],
+    "cogwheel": ["chi_eff_prime", "chi_diff_prime", "r1_prime", "r2_prime",
+                 "phi_jl_angle", "phi_12_angle"],
+}
+ANGLES = ("phi_jl_angle", "phi_12_angle")
+BOUNDS = {
+    "a_1": [0, A1], "a_2": [0, A2], "tilt_1": [0, np.pi],
+    "tilt_2": [0, np.pi], "phi_12": [0, 2 * np.pi],
+    "phi_jl": [0, 2 * np.pi],
+}
 
 
-@pytest.fixture(scope="module")
-def reparam():
-    bounds = {
-        "a_1": [0, A1], "a_2": [0, A2], "tilt_1": [0, np.pi],
-        "tilt_2": [0, np.pi], "phi_12": [0, 2 * np.pi],
-        "phi_jl": [0, 2 * np.pi],
-    }
-    return PrecessingSpinReparameterisation(parameters=NAMES, prior_bounds=bounds)
+@pytest.fixture(scope="module", params=["cogwheel", "cartesian"])
+def reparam(request):
+    return PrecessingSpinReparameterisation(
+        parameters=NAMES, prior_bounds=BOUNDS, coordinates=request.param
+    )
 
 
 def _prior(n, seed=0, q_min=0.3):
     rng = np.random.default_rng(seed)
-    x = np.zeros(n, dtype=[(k, "f8") for k in NAMES + ["mass_ratio"]])
+    x = np.zeros(n, dtype=[(k, "f8") for k in X_NAMES])
     x["a_1"] = rng.uniform(0, A1, n)
     x["a_2"] = rng.uniform(0, A2, n)
     x["tilt_1"] = np.arccos(rng.uniform(-1, 1, n))
@@ -36,18 +46,23 @@ def _prior(n, seed=0, q_min=0.3):
     x["phi_12"] = rng.uniform(0, 2 * np.pi, n)
     x["phi_jl"] = rng.uniform(0, 2 * np.pi, n)
     x["mass_ratio"] = rng.uniform(q_min, 1.0, n)
+    x["theta_jn"] = np.arccos(rng.uniform(-1, 1, n))
     return x
 
 
 def _forward(reparam, x):
-    x_prime = np.zeros(len(x), dtype=[(k, "f8") for k in PRIMES])
+    x_prime = np.zeros(
+        len(x), dtype=[(k, "f8") for k in reparam.prime_parameters]
+    )
     x, x_prime, log_j = reparam.reparameterise(x, x_prime, np.zeros(len(x)))
     return x_prime, log_j
 
 
-def _inverse(reparam, x_prime, mass_ratio):
-    x = np.zeros(len(x_prime), dtype=[(k, "f8") for k in NAMES + ["mass_ratio"]])
+def _inverse(reparam, x_prime, mass_ratio, theta_jn=None):
+    x = np.zeros(len(x_prime), dtype=[(k, "f8") for k in X_NAMES])
     x["mass_ratio"] = mass_ratio
+    if theta_jn is not None:
+        x["theta_jn"] = theta_jn
     x, _, log_j = reparam.inverse_reparameterise(
         x, x_prime, np.zeros(len(x_prime))
     )
@@ -57,7 +72,7 @@ def _inverse(reparam, x_prime, mass_ratio):
 def test_round_trip(reparam):
     x = _prior(5000, seed=1, q_min=0.05)
     x_prime, log_j = _forward(reparam, x)
-    back, log_j_back = _inverse(reparam, x_prime, x["mass_ratio"])
+    back, log_j_back = _inverse(reparam, x_prime, x["mass_ratio"], x["theta_jn"])
     for name in NAMES:
         np.testing.assert_allclose(back[name], x[name], rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(log_j_back, -log_j, atol=1e-7)
@@ -102,14 +117,22 @@ def test_jacobian_is_that_of_the_map(reparam):
 def test_prior_is_approximately_standard_normal(reparam):
     x = _prior(20000, seed=4)
     x_prime, _ = _forward(reparam, x)
-    for name in PRIMES:
+    assert list(reparam.prime_parameters) == PRIMES[reparam.coordinates]
+    for name in reparam.prime_parameters:
         y = x_prime[name]
+        if name in ANGLES:
+            assert np.all((y >= -np.pi) & (y < np.pi)), name
+            assert stats.kstest(
+                y, "uniform", args=(-np.pi, 2 * np.pi)
+            ).statistic < 0.02, name
+            continue
         assert abs(y.mean()) < 0.05 and abs(y.std() - 1) < 0.05, name
         assert stats.kstest(y, "norm").statistic < 0.02, name
-    # the in-plane radii are chi(2)
-    for sx, sy in (("s1_x", "s1_y"), ("s2_x", "s2_y")):
-        r2 = x_prime[sx] ** 2 + x_prime[sy] ** 2
-        assert stats.kstest(r2, "chi2", args=(2,)).statistic < 0.02
+    if reparam.coordinates == "cartesian":
+        # the in-plane radii are chi(2)
+        for sx, sy in (("s1_x", "s1_y"), ("s2_x", "s2_y")):
+            r2 = x_prime[sx] ** 2 + x_prime[sy] ** 2
+            assert stats.kstest(r2, "chi2", args=(2,)).statistic < 0.02
 
 
 def test_log_jacobian_is_the_density_ratio(reparam):
@@ -124,7 +147,12 @@ def test_log_jacobian_is_the_density_ratio(reparam):
         - 2 * np.log(2 * np.pi)
     )
     log_normal = np.sum(
-        [stats.norm.logpdf(x_prime[name]) for name in PRIMES], axis=0
+        [
+            np.full(len(x), -np.log(2 * np.pi)) if name in ANGLES
+            else stats.norm.logpdf(x_prime[name])
+            for name in reparam.prime_parameters
+        ],
+        axis=0,
     )
     residual = log_prior - log_j - log_normal
 
@@ -141,8 +169,79 @@ def test_log_jacobian_is_the_density_ratio(reparam):
     np.testing.assert_allclose(residual, aligned_residual, atol=1e-8)
 
 
-def test_reflection_is_a_sign_flip_of_the_first_spin(reparam):
-    """phi_jl -> phi_jl + pi is (s1_x, s1_y) -> -(s1_x, s1_y), the rest fixed."""
+def test_jacobian_of_the_whole_map(reparam):
+    """Finite differences of the whole map, at fixed mass ratio and
+    inclination."""
+    x = _prior(300, seed=8)
+    x["a_1"] = np.clip(x["a_1"], 0.002, 0.98 * A1)
+    x["a_2"] = np.clip(x["a_2"], 0.002, 0.98 * A2)
+    x["tilt_1"] = np.clip(x["tilt_1"], 0.2, np.pi - 0.2)
+    x["tilt_2"] = np.clip(x["tilt_2"], 0.2, np.pi - 0.2)
+    _, log_j = _forward(reparam, x)
+    h = 1e-7
+    jac = np.empty((len(x), 6, 6))
+    for j, name in enumerate(NAMES):
+        up, down = x.copy(), x.copy()
+        up[name] += h
+        down[name] -= h
+        d = np.stack(
+            [_forward(reparam, up)[0][k] - _forward(reparam, down)[0][k]
+             for k in reparam.prime_parameters], -1
+        )
+        jac[:, :, j] = np.angle(np.exp(1j * d)) / (2 * h)
+    np.testing.assert_allclose(
+        np.linalg.slogdet(jac)[1], log_j, atol=1e-4
+    )
+
+
+def test_cogwheel_is_invariant_under_the_improper_elements():
+    """theta_jn -> pi - theta_jn with phi_jl -> phi_jl + pi (the improper
+    elements of every nessai-gw group) leaves the cogwheel coordinates
+    unchanged; the inclination alone moves phi_jl_angle by pi."""
+    reparam = PrecessingSpinReparameterisation(
+        parameters=NAMES, prior_bounds=BOUNDS, coordinates="cogwheel"
+    )
+    x = _prior(1000, seed=9)
+    x_prime, log_j = _forward(reparam, x)
+    image = x.copy()
+    image["theta_jn"] = np.pi - x["theta_jn"]
+    image["phi_jl"] = np.remainder(x["phi_jl"] + np.pi, 2 * np.pi)
+    i_prime, i_log_j = _forward(reparam, image)
+    for name in reparam.prime_parameters:
+        d = i_prime[name] - x_prime[name]
+        np.testing.assert_allclose(np.angle(np.exp(1j * d)), 0, atol=1e-12)
+    np.testing.assert_array_equal(i_log_j, log_j)
+    tilted = x.copy()
+    tilted["theta_jn"] = np.pi - x["theta_jn"]
+    t_prime, _ = _forward(reparam, tilted)
+    d = t_prime["phi_jl_angle"] - x_prime["phi_jl_angle"]
+    np.testing.assert_allclose(np.abs(np.angle(np.exp(1j * d))), np.pi,
+                               atol=1e-12)
+
+
+def test_unpickled_chart_without_coordinates_is_cartesian():
+    import pickle
+
+    reparam = PrecessingSpinReparameterisation(
+        parameters=NAMES, prior_bounds=BOUNDS, coordinates="cartesian"
+    )
+    state = dict(reparam.__dict__)
+    del state["coordinates"], state["_inclination"]
+    old = PrecessingSpinReparameterisation.__new__(
+        PrecessingSpinReparameterisation
+    )
+    old.__setstate__(state)
+    old = pickle.loads(pickle.dumps(old))
+    x = _prior(50, seed=10)
+    np.testing.assert_array_equal(_forward(old, x)[0], _forward(reparam, x)[0])
+
+
+def test_reflection_is_a_sign_flip_of_the_first_spin():
+    """Cartesian: phi_jl -> phi_jl + pi is (s1_x, s1_y) -> -(s1_x, s1_y), the
+    rest fixed."""
+    reparam = PrecessingSpinReparameterisation(
+        parameters=NAMES, prior_bounds=BOUNDS, coordinates="cartesian"
+    )
     x = _prior(100, seed=6)
     x_prime, log_j = _forward(reparam, x)
     flipped = x.copy()
@@ -158,14 +257,15 @@ def test_reflection_is_a_sign_flip_of_the_first_spin(reparam):
 def test_inverse_drops_invalid_points(reparam):
     rng = np.random.default_rng(7)
     n = 1000
-    x_prime = np.zeros(n, dtype=[(k, "f8") for k in PRIMES])
-    for name in PRIMES:
+    primes = reparam.prime_parameters
+    x_prime = np.zeros(n, dtype=[(k, "f8") for k in primes])
+    for name in primes:
         x_prime[name] = 3 * rng.standard_normal(n)
-    x_prime["s2_x"][0] = np.nan
+    x_prime[primes[3]][0] = np.nan
     q = rng.uniform(0.3, 1.0, n)
     q[1] = 0.0
     with np.errstate(all="raise"):
-        x, log_j = _inverse(reparam, x_prime, q)
+        x, log_j = _inverse(reparam, x_prime, q, rng.uniform(0, np.pi, n))
     assert np.all(np.isnan(x["a_2"][:2])) and np.all(np.isnan(log_j[:2]))
     kept = np.isfinite(log_j)
     assert kept[2:].mean() > 0.99
@@ -181,3 +281,10 @@ def test_bounds_must_start_at_zero():
     }
     with pytest.raises(RuntimeError):
         PrecessingSpinReparameterisation(parameters=NAMES, prior_bounds=bounds)
+
+
+def test_unknown_coordinates():
+    with pytest.raises(ValueError):
+        PrecessingSpinReparameterisation(
+            parameters=NAMES, prior_bounds=BOUNDS, coordinates="lvk"
+        )

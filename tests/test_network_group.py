@@ -792,6 +792,28 @@ def test_network_proposal_initialise_train_and_draw(
 
 
 @requires_group_mixture
+@pytest.mark.parametrize("circular_psi_phase", [True, False])
+def test_network_proposal_cogwheel_spin_angles(geometry, circular_psi_phase):
+    names = [n for n in PARAMETERS if n not in ("chi_1", "chi_2")] + [
+        "a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl",
+    ]
+    fm = make_network_group_flow_proposal(
+        names, geometry, circular_psi_phase=circular_psi_phase,
+        precessing_spin=True,
+    )._FlowModelClass
+    assert fm.circular_parameters == (
+        ["psi_prime", "delta_phase"] if circular_psi_phase else []
+    ) + ["phi_jl_angle", "phi_12_angle"]
+    fm = make_network_group_flow_proposal(
+        names, geometry, circular_psi_phase=circular_psi_phase,
+        precessing_spin="cartesian",
+    )._FlowModelClass
+    assert (fm.circular_parameters or []) == (
+        ["psi_prime", "delta_phase"] if circular_psi_phase else []
+    )
+
+
+@requires_group_mixture
 def test_network_proposal_circular_options(geometry):
     from nessai_gw.group_mixture import CircularCanonicalTransform
 

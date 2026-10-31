@@ -319,13 +319,13 @@ BOUNDS = {
 }
 
 
-def _stub_model():
+def _stub_model(names=BNS_PARAMETERS, bounds=BOUNDS):
     from nessai.model import Model
 
     class _StubModel(Model):
         def __init__(self):
-            self.names = list(BNS_PARAMETERS)
-            self.bounds = {k: np.asarray(v) for k, v in BOUNDS.items()}
+            self.names = list(names)
+            self.bounds = {k: np.asarray(bounds[k]) for k in names}
 
         def log_prior(self, x):
             return np.log(self.in_bounds(x), dtype=float)
@@ -341,19 +341,20 @@ def _stub_model():
 def _prior_live_points(model, n, seed=7):
     from nessai.livepoint import numpy_array_to_live_points
 
+    names = list(model.names)
     rng = np.random.default_rng(seed)
-    theta = np.column_stack([rng.uniform(*BOUNDS[p], n) for p in BNS_PARAMETERS])
-    theta[:, BNS_PARAMETERS.index("dec")] = np.arcsin(rng.uniform(-1, 1, n))
-    theta[:, BNS_PARAMETERS.index("theta_jn")] = np.arccos(
-        rng.uniform(-1, 1, n)
-    )
-    live = numpy_array_to_live_points(theta, BNS_PARAMETERS)
+    theta = np.column_stack([rng.uniform(*model.bounds[p], n) for p in names])
+    for name in ("theta_jn", "tilt_1", "tilt_2"):
+        if name in names:
+            theta[:, names.index(name)] = np.arccos(rng.uniform(-1, 1, n))
+    theta[:, names.index("dec")] = np.arcsin(rng.uniform(-1, 1, n))
+    live = numpy_array_to_live_points(theta, names)
     live["logL"] = 0.0
     live["logP"] = model.log_prior(live)
     return live
 
 
-def _check_trained_proposal(proposal, model, live):
+def _check_trained_proposal(proposal, model, live, whole_domain=True):
     from nessai.flows.circular import CircularNeuralSplineFlow
 
     flow = proposal.flow.model
@@ -374,7 +375,8 @@ def _check_trained_proposal(proposal, model, live):
         np.testing.assert_allclose(
             log_q, flow.log_prob(x), rtol=1e-5, atol=1e-5
         )
-    assert float(flow._log_domain_mass) == pytest.approx(0.0, abs=1e-12)
+    if whole_domain:  # the base frame is the fundamental domain
+        assert float(flow._log_domain_mass) == pytest.approx(0.0, abs=1e-12)
     worst = live[:1].copy()
     worst["logL"] = -np.inf
     proposal.populate(worst, n_samples=200)
@@ -393,9 +395,11 @@ def _check_trained_proposal(proposal, model, live):
     rflow.eval()
     with torch.no_grad():
         x, _ = flow.sample_and_log_prob(300)
-        np.testing.assert_allclose(
-            rflow.log_prob(x), flow.log_prob(x), rtol=1e-5, atol=1e-5
-        )
+        d = (rflow.log_prob(x) - flow.log_prob(x)).numpy()
+    if not whole_domain:
+        # the domain's mass is estimated afresh by the resumed flow
+        d = d - d.mean()
+    np.testing.assert_allclose(d, 0.0, atol=1e-5)
     return circ
 
 
@@ -441,6 +445,80 @@ def test_et_proposal_circular_end_to_end(
     )
     assert set(circ) == {"psi_prime", "delta_phase"}
     assert proposal.flow.model.circular_standardisation == standardise
+
+
+PS_PARAMETERS = [n for n in BNS_PARAMETERS if n not in ("chi_1", "chi_2")] + [
+    "a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl",
+]
+PS_BOUNDS = BOUNDS | {
+    "a_1": [0.0, 0.05], "a_2": [0.0, 0.05], "tilt_1": [0.0, np.pi],
+    "tilt_2": [0.0, np.pi], "phi_12": [0.0, 2 * np.pi],
+    "phi_jl": [0.0, 2 * np.pi],
+}
+COGWHEEL_ANGLES = ["phi_jl_angle", "phi_12_angle"]
+
+
+@requires_circular
+@pytest.mark.parametrize("circular_psi_phase", [True, False])
+def test_et_proposal_cogwheel_spins_end_to_end(tmp_path, circular_psi_phase):
+    """The cogwheel spin angles are circular dimensions of the flow, with or
+    without the circular psi / delta_phase; it trains, samples within the
+    prior and resumes."""
+    cls = make_et_group_flow_proposal(
+        PS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
+        polarisation_quarter=True, psi_single=True,
+        circular_psi_phase=circular_psi_phase, log_mass_ratio=False,
+        precessing_spin=True,
+    )
+    fm = cls._FlowModelClass
+    expected = (["psi_prime", "delta_phase"] if circular_psi_phase
+                else []) + COGWHEEL_ANGLES
+    assert fm.circular_parameters == expected
+    assert isinstance(fm.canonical_transform, CircularCanonicalTransform)
+    model = _stub_model(PS_PARAMETERS, PS_BOUNDS)
+    proposal = cls(
+        model,
+        output=str(tmp_path),
+        poolsize=200,
+        reparameterisations=triangular_group_reparameterisations(
+            PS_PARAMETERS, REFERENCE_TIME, log_mass_ratio=False,
+            precessing_spin=True,
+        ),
+        flow_config={
+            "ftype": "circular", "n_blocks": 2, "n_neurons": 8,
+            "n_layers": 1, "real_transform": "affine",
+        },
+        training_config={"max_epochs": 3, "patience": 3},
+        latent_temperature=1.4,
+    )
+    proposal.initialise()
+    assert set(COGWHEEL_ANGLES) <= set(proposal.prime_parameters)
+    circ = _check_trained_proposal(
+        proposal, model, _prior_live_points(model, 1000),
+        whole_domain=circular_psi_phase,
+    )
+    assert set(circ) == set(expected)
+
+
+@requires_circular
+def test_cogwheel_spins_need_a_circular_flow(tmp_path):
+    cls = make_et_group_flow_proposal(
+        PS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
+        polarisation_quarter=True, psi_single=True, log_mass_ratio=False,
+        precessing_spin=True,
+    )
+    proposal = cls(
+        _stub_model(PS_PARAMETERS, PS_BOUNDS),
+        output=str(tmp_path),
+        poolsize=200,
+        reparameterisations=triangular_group_reparameterisations(
+            PS_PARAMETERS, REFERENCE_TIME, log_mass_ratio=False,
+            precessing_spin=True,
+        ),
+        flow_config={"n_blocks": 2, "n_neurons": 8, "n_layers": 1},
+    )
+    with pytest.raises(ValueError, match="circular base flow"):
+        proposal.initialise()
 
 
 @requires_circular

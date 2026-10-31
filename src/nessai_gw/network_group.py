@@ -85,6 +85,7 @@ from .group_mixture import (
     _wrap_angle,
     curvature_shear_kwargs,
     detector_tensors,
+    spin_angle_circles,
     triangular_group_reparameterisations,
 )
 
@@ -425,7 +426,10 @@ class PrimeSpacePolarisationPhaseAction:
     times are kept), as is the chirp distance.  ``h`` is measure preserving
     (equal-area sky, ``sin theta_jn`` prior); the per-element weights absorb
     how far the data break it and importance sampling corrects the rest.
-    The domain gains ``(sky_u - sky_u_offset) mod 1 < 1/2``.
+    The domain gains ``(sky_u - sky_u_offset) mod 1 < 1/2``.  Precessing
+    spins are left alone: in the ``cogwheel`` chart that is ``phi_jl ->
+    phi_jl + pi`` with the inclination flip, as the improper elements of the
+    triangle's group act; in the ``cartesian`` chart ``phi_jl`` is kept.
     """
 
     def __init__(self, prime_names, psi_offset=0.0, delta_offset=0.0,
@@ -848,10 +852,13 @@ def network_group_reparameterisations(
     log_mass_ratio : bool, optional
         Sample ``mass_ratio`` as ``ln q`` (``log-mass-ratio``).  Must match
         :func:`make_network_group_flow_proposal`.  Default ``True``.
-    precessing_spin : bool, optional
+    precessing_spin : bool or str, optional
         Carry the six precessing spin parameters as the ``precessing-spin``
-        coordinates (needs ``mass_ratio``).  Must match
-        :func:`make_network_group_flow_proposal`.  Default ``False``.
+        coordinates (needs ``mass_ratio``), in the ``cogwheel`` chart
+        (``True``, also needs ``theta_jn``) or the ``cartesian`` one; see
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Must match :func:`make_network_group_flow_proposal`.  Default
+        ``False``.
     effective_tidal_deformability : bool, optional
         Carry ``lambda_1``, ``lambda_2`` as ``(lambda_tilde_prime,
         lambda_diff_prime)`` (needs ``mass_ratio``).  Must match
@@ -1021,10 +1028,12 @@ def make_network_group_flow_proposal(
     log_mass_ratio : bool, optional
         Whether ``mass_ratio`` is sampled as ``ln q``; must match
         :func:`network_group_reparameterisations`.  Default ``True``.
-    precessing_spin : bool, optional
+    precessing_spin : bool or str, optional
         Whether precessing spins are carried as the ``precessing-spin``
         coordinates; must match :func:`network_group_reparameterisations`.
-        Default ``False``.
+        The ``cogwheel`` chart's two angles are periodic dimensions of the
+        flow, which then needs a circular base flow
+        (``flow_config['ftype'] = 'circular'``).  Default ``False``.
     effective_tidal_deformability, doppler_vector : optional
         Must match :func:`network_group_reparameterisations`.
     baseline_flip : bool, optional
@@ -1189,11 +1198,13 @@ def make_network_group_flow_proposal(
         # the whole circle, starting at the fundamental domain's seam
         start = float(sky_u_offset) if baseline_flip else 0.0
         circles["sky_u"] = (start, 1.0, (0.0, 1.0))
+    circles |= spin_angle_circles(prime_names)
     if circles:
         if "circular_parameters" not in gm_params:
             raise RuntimeError(
-                "circular_psi_phase requires a version of nessai whose "
-                "make_group_mixture_flow accepts `circular_parameters`."
+                f"the circular coordinates {list(circles)} require a version "
+                "of nessai whose make_group_mixture_flow accepts "
+                "`circular_parameters`."
             )
         canonical = CircularCanonicalTransform(
             circles, prime_names, inner=canonical
@@ -1316,6 +1327,7 @@ def _make_network_amplitude_flow_proposal(
         )
     circles = {name: AMPLITUDE_ARGUMENT_CIRCLE
                for name in NETWORK_AMPLITUDE_ANGLES}
+    circles |= spin_angle_circles(prime_names)
     if circular_sky_u:
         if "sky_u" not in prime_names:
             raise RuntimeError(

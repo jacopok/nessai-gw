@@ -164,6 +164,11 @@ from . import nessai_logger
 from ._geometry import SPEED_OF_LIGHT as _SPEED_OF_LIGHT
 from ._geometry import greenwich_mean_sidereal_time as _greenwich_mean_sidereal_time
 from ._geometry import gmst_hours_before
+from .reparameterisations.spin import (
+    PRECESSING_SPIN_ANGLES,
+    PRECESSING_SPIN_COORDINATES,
+    PrecessingSpinReparameterisation,
+)
 from .reparameterisations.time import TIME_PARAMETERS
 
 logger = nessai_logger.getChild(__name__)
@@ -1555,6 +1560,9 @@ POLARISATION_PHASE_CIRCLE = (-1.0, 1.0, (-1.0, 1.0))
 #: their whole range.
 AMPLITUDE_ARGUMENT_CIRCLE = (-np.pi, _TWO_PI, (-np.pi, np.pi))
 
+#: ``circles`` entry of the cogwheel precessing-spin angles: their whole range.
+PRECESSING_SPIN_ANGLE_CIRCLE = AMPLITUDE_ARGUMENT_CIRCLE
+
 
 class PhaseQuarterRecanonicaliser(torch.nn.Module):
     """Per-expert choice of fundamental domain for the polarisation/phase
@@ -2201,6 +2209,29 @@ CHIRP_DISTANCE_REQUIRES = ("chirp_mass", "theta_jn", "ra", "dec", "psi")
 PRECESSING_SPIN_PARAMETERS = ("a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl")
 
 
+def precessing_spin_coordinates(precessing_spin):
+    """The ``precessing-spin`` chart a ``precessing_spin`` option asks for:
+    ``None`` (off), ``"cogwheel"`` (``True``) or ``"cartesian"``."""
+    if precessing_spin is None or precessing_spin is False:
+        return None
+    if precessing_spin is True:
+        return "cogwheel"
+    if precessing_spin not in PRECESSING_SPIN_COORDINATES:
+        raise ValueError(
+            f"precessing_spin must be a bool or one of "
+            f"{PRECESSING_SPIN_COORDINATES}, not {precessing_spin!r}"
+        )
+    return precessing_spin
+
+
+def spin_angle_circles(prime_names):
+    """``circles`` (:class:`CircularCanonicalTransform`) of the cogwheel
+    precessing-spin angles among ``prime_names``: their whole range, the
+    group actions leave them alone."""
+    return {name: PRECESSING_SPIN_ANGLE_CIRCLE
+            for name in PRECESSING_SPIN_ANGLES if name in prime_names}
+
+
 def _time_parameter(sampling_parameters):
     """The coalescence-time parameter sampled: ``geocent_time_offset`` if
     present, else ``geocent_time`` (see :data:`TIME_PARAMETERS`)."""
@@ -2310,12 +2341,19 @@ def triangular_group_reparameterisations(
       ``mass_ratio`` is a prerequisite, so this is ranked ahead as well.
     * ``a_1``, ``tilt_1``, ``a_2``, ``tilt_2``, ``phi_12``, ``phi_jl`` ->
       ``precessing-spin`` (only if ``precessing_spin`` is set and all six are
-      sampled): the effective spins of the components along ``L`` and a 2D
-      standard normal per in-plane spin, ``(s1_x, s1_y)`` about ``phi_jl``
-      and ``(s2_x, s2_y)`` about ``phi_12``; see
+      sampled): the effective spins of the components along ``L`` and, in
+      the ``cogwheel`` chart (the default), a standard normal per in-plane
+      spin magnitude and the two azimuths as angles, ``phi_jl_angle``
+      (``phi_jl`` shifted by ``pi`` where ``theta_jn > pi / 2``) and
+      ``phi_12_angle``, which the proposals make periodic dimensions of the
+      flow; see
       :class:`~nessai_gw.reparameterisations.PrecessingSpinReparameterisation`.
-      ``mass_ratio`` is a prerequisite.  The plane reflection of the group
-      sends ``phi_jl -> phi_jl + pi``, i.e. ``(s1_x, s1_y) -> -(s1_x,
+      ``mass_ratio`` and ``theta_jn`` are prerequisites.  The plane
+      reflection of the group sends ``theta_jn -> pi - theta_jn`` and
+      ``phi_jl -> phi_jl + pi``, which leaves ``phi_jl_angle`` unchanged.  In
+      the ``cartesian`` chart the in-plane spins are a 2D standard normal
+      each, ``(s1_x, s1_y)`` about ``phi_jl`` and ``(s2_x, s2_y)`` about
+      ``phi_12``, and the reflection sends ``(s1_x, s1_y) -> -(s1_x,
       s1_y)``, which :class:`PrimeSpaceTriangularGroupAction` applies.
     * ``mass_ratio`` -> ``log-mass-ratio`` (unless ``log_mass_ratio`` is
       unset): ``ln q`` rescaled to its bounds, as Roulet et al. sample it, with
@@ -2399,10 +2437,12 @@ def triangular_group_reparameterisations(
         Sample ``mass_ratio`` as ``ln q`` (``log-mass-ratio``) rather than
         ``q`` (``mass_ratio``).  The prime name stays ``mass_ratio_prime``.
         Default ``True``.
-    precessing_spin : bool, optional
+    precessing_spin : bool or str, optional
         Reparameterise the six precessing spin parameters jointly
-        (``precessing-spin``, above).  Needs ``mass_ratio`` to be sampled;
-        does nothing unless all six are.  Default ``False``.
+        (``precessing-spin``, above): ``True`` or ``"cogwheel"`` for the
+        cogwheel chart, ``"cartesian"`` for the Cartesian in-plane spins
+        (runs made before the cogwheel chart).  Needs ``mass_ratio`` to be
+        sampled; does nothing unless all six are.  Default ``False``.
     effective_tidal_deformability : bool, optional
         Reparameterise ``lambda_1``, ``lambda_2`` jointly as
         ``(lambda_tilde_prime, lambda_diff_prime)`` (``effective-tidal-deformability``)
@@ -2511,13 +2551,20 @@ def triangular_group_reparameterisations(
             "(chi_eff = (chi_1 + q chi_2) / (1 + q)); pass "
             "effective_spin=False."
         )
-    precessing_spin = bool(precessing_spin) and set(
+    spin_coordinates = precessing_spin_coordinates(precessing_spin)
+    precessing_spin = spin_coordinates is not None and set(
         PRECESSING_SPIN_PARAMETERS
     ) <= set(sampling_parameters)
     if precessing_spin and "mass_ratio" not in sampling_parameters:
         raise ValueError(
             "precessing_spin needs 'mass_ratio' in the sampling parameters; "
             "pass precessing_spin=False."
+        )
+    if (precessing_spin and spin_coordinates == "cogwheel"
+            and "theta_jn" not in sampling_parameters):
+        raise ValueError(
+            "the cogwheel precessing-spin chart needs 'theta_jn' in the "
+            "sampling parameters; pass precessing_spin='cartesian'."
         )
     effective_tidal_deformability = bool(effective_tidal_deformability) and {
         "lambda_1", "lambda_2"
@@ -2580,7 +2627,7 @@ def triangular_group_reparameterisations(
         # on its inverse.
         _rank["chi_1"] = -1
     if precessing_spin:
-        # likewise
+        # likewise; the cogwheel chart also reads theta_jn (rank >= 1)
         _rank["a_1"] = -1
     if effective_tidal_deformability:
         # Reads mass_ratio on its inverse, as the effective spin.
@@ -2646,6 +2693,7 @@ def triangular_group_reparameterisations(
             reps[name] = {
                 "reparameterisation": "precessing-spin",
                 "parameters": list(PRECESSING_SPIN_PARAMETERS),
+                "coordinates": spin_coordinates,
             }
         elif name in PRECESSING_SPIN_PARAMETERS and precessing_spin:
             continue  # covered by the joint ``precessing-spin`` entry
@@ -2984,11 +3032,16 @@ def _prime_parameter_names(
         )
 
     out = []
-    precessing = precessing_spin and set(PRECESSING_SPIN_PARAMETERS) | {
-        "mass_ratio"
-    } <= set(names)
+    spin_coordinates = precessing_spin_coordinates(precessing_spin)
+    precessing = spin_coordinates is not None and set(
+        PRECESSING_SPIN_PARAMETERS
+    ) | {"mass_ratio"} <= set(names)
     if precessing:
-        out += ["chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x", "s2_y"]
+        out += list(PrecessingSpinReparameterisation(
+            prior_bounds={k: _DUMMY_PRIOR_BOUNDS[k]
+                          for k in PRECESSING_SPIN_PARAMETERS},
+            coordinates=spin_coordinates,
+        ).prime_parameters)
     if "ra" in names and "dec" in names:
         out += ["sky_u", "sky_v"]
     for name in names:
@@ -3644,12 +3697,15 @@ def make_triangular_group_flow_proposal(
     log_mass_ratio : bool, optional
         Must match :func:`triangular_group_reparameterisations` (only the
         probe's prime order depends on it).  Default ``True``.
-    precessing_spin : bool, optional
+    precessing_spin : bool or str, optional
         Must match :func:`triangular_group_reparameterisations`: the flow sees
-        the ``precessing-spin`` coordinates, of which the plane reflection
-        negates ``(s1_x, s1_y)``.  Without it a sampled ``phi_jl`` is still
-        shifted by ``pi`` under the reflection (``phi_jl_x``/``_y``).
-        Default ``False``.
+        the ``precessing-spin`` coordinates.  In the ``cogwheel`` chart
+        (``True``) the reflection leaves them alone and their two angles are
+        periodic dimensions of the flow, which then needs a circular base
+        flow (``flow_config['ftype'] = 'circular'``); in the ``cartesian``
+        one the plane reflection negates ``(s1_x, s1_y)``.  Without it a
+        sampled ``phi_jl`` is still shifted by ``pi`` under the reflection
+        (``phi_jl_x``/``_y``).  Default ``False``.
     effective_tidal_deformability, doppler_vector : optional
         Must match :func:`triangular_group_reparameterisations`: the flow sees
         ``lambda_tilde_prime`` / ``lambda_diff_prime`` in place of
@@ -3842,6 +3898,7 @@ def make_triangular_group_flow_proposal(
             gm_kwargs["base_reparam_factory"] = _functools.partial(
                 PhaseQuarterRecanonicaliser, list(prime_names)
             )
+    circles = {}
     if circular_psi_phase:
         bad = []
         if not psi_single:
@@ -3872,11 +3929,6 @@ def make_triangular_group_flow_proposal(
                 "psi_prime": POLARISATION_PHASE_CIRCLE,
                 action._delta_phase: POLARISATION_PHASE_CIRCLE,
             }
-        gm_kwargs["canonical_transform"] = CircularCanonicalTransform(
-            circles, prime_names,
-            inner=gm_kwargs.get("canonical_transform"),
-        )
-        gm_kwargs["circular_parameters"] = list(circles)
         if circular_standardisation:
             if "circular_standardisation" not in _gm_params:
                 raise RuntimeError(
@@ -3888,6 +3940,19 @@ def make_triangular_group_flow_proposal(
         raise RuntimeError(
             "circular_standardisation needs circular_psi_phase."
         )
+    circles |= spin_angle_circles(prime_names)
+    if circles:
+        if "circular_parameters" not in _gm_params:
+            raise RuntimeError(
+                f"the circular coordinates {list(circles)} require a version "
+                "of nessai whose make_group_mixture_flow accepts "
+                "`circular_parameters`."
+            )
+        gm_kwargs["canonical_transform"] = CircularCanonicalTransform(
+            circles, prime_names,
+            inner=gm_kwargs.get("canonical_transform"),
+        )
+        gm_kwargs["circular_parameters"] = list(circles)
     gm_kwargs.update(
         curvature_shear_kwargs(mass_ratio_shear, prime_names, _gm_params)
     )
@@ -3961,6 +4026,7 @@ def _make_triangle_amplitude_flow_proposal(
     action = PrimeSpaceSkyGroupAction(base_action, prime_names)
     circles = {name: AMPLITUDE_ARGUMENT_CIRCLE
                for name in NETWORK_AMPLITUDE_ANGLES}
+    circles |= spin_angle_circles(prime_names)
     gm_kwargs = {
         "mode_factor_sizes": action.mode_factor_sizes,
         "circular_parameters": list(circles),

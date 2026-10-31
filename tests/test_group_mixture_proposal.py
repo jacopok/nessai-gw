@@ -1419,13 +1419,18 @@ PRECESSING_PARAMETERS = [
 ] + ["a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"]
 
 
-def test_triangular_group_reparameterisations_precessing_spin():
+@pytest.mark.parametrize(
+    "option, coordinates",
+    [(True, "cogwheel"), ("cogwheel", "cogwheel"), ("cartesian", "cartesian")],
+)
+def test_triangular_group_reparameterisations_precessing_spin(option, coordinates):
     reps = triangular_group_reparameterisations(
-        PRECESSING_PARAMETERS, REFERENCE_TIME, precessing_spin=True
+        PRECESSING_PARAMETERS, REFERENCE_TIME, precessing_spin=option
     )
     assert reps["a_1"] == {
         "reparameterisation": "precessing-spin",
         "parameters": ["a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"],
+        "coordinates": coordinates,
     }
     for name in ("tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"):
         assert name not in reps
@@ -1442,17 +1447,111 @@ def test_triangular_group_reparameterisations_precessing_spin():
     with pytest.raises(ValueError, match="mass_ratio"):
         triangular_group_reparameterisations(
             [n for n in PRECESSING_PARAMETERS if n != "mass_ratio"],
-            REFERENCE_TIME, precessing_spin=True,
+            REFERENCE_TIME, precessing_spin=option,
         )
 
 
-def test_prime_parameter_names_precessing_spin():
-    prime = _prime_parameter_names(
-        PRECESSING_PARAMETERS, REFERENCE_TIME, precessing_spin=True
+def test_cogwheel_spins_need_theta_jn():
+    without = [n for n in PRECESSING_PARAMETERS if n != "theta_jn"]
+    with pytest.raises(ValueError, match="theta_jn"):
+        triangular_group_reparameterisations(
+            without, REFERENCE_TIME, precessing_spin=True
+        )
+    triangular_group_reparameterisations(
+        without, REFERENCE_TIME, precessing_spin="cartesian"
     )
-    assert {"chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y", "s2_x",
-            "s2_y"} <= set(prime)
-    assert not any(n.startswith(("a_1", "tilt", "phi_jl", "phi_12")) for n in prime)
+    with pytest.raises(ValueError, match="precessing_spin"):
+        triangular_group_reparameterisations(
+            PRECESSING_PARAMETERS, REFERENCE_TIME, precessing_spin="lvk"
+        )
+
+
+@pytest.mark.parametrize(
+    "option, spins",
+    [(True, {"chi_eff_prime", "chi_diff_prime", "r1_prime", "r2_prime",
+             "phi_jl_angle", "phi_12_angle"}),
+     ("cartesian", {"chi_eff_prime", "chi_diff_prime", "s1_x", "s1_y",
+                    "s2_x", "s2_y"})],
+)
+def test_prime_parameter_names_precessing_spin(option, spins):
+    prime = _prime_parameter_names(
+        PRECESSING_PARAMETERS, REFERENCE_TIME, precessing_spin=option
+    )
+    assert spins <= set(prime)
+    assert not any(n.startswith(("a_1", "tilt", "phi_jl_x", "phi_jl_y",
+                                 "phi_jl_prime", "phi_12_x", "phi_12_prime"))
+                   for n in prime)
+
+
+def test_prime_space_action_leaves_cogwheel_spins_alone(prime_points):
+    """In the cogwheel chart every element, the reflection included, leaves
+    the spin coordinates unchanged, as the physical action (theta_jn -> pi -
+    theta_jn with phi_jl -> phi_jl + pi) leaves the chart's points."""
+    base = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
+    spins = ["r1_prime", "phi_jl_angle", "phi_12_angle"]
+    action = PrimeSpaceTriangularGroupAction(base, PRIME_NAMES + spins)
+    rng = np.random.default_rng(6)
+    n = len(prime_points["t_det"])
+    points = dict(prime_points)
+    for name in spins:
+        points[name] = torch.as_tensor(rng.uniform(-np.pi, np.pi, n))
+    for g in range(base.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        mapped = action(points, modes)
+        for name in spins:
+            assert torch.equal(mapped[name], points[name]), (g, name)
+
+
+def test_physical_reflection_fixes_the_cogwheel_chart():
+    """The physical group action on (theta_jn, phi_jl) maps a point to one
+    with the same cogwheel coordinates."""
+    from nessai_gw.reparameterisations import PrecessingSpinReparameterisation
+
+    spin_names = ["a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl"]
+    bounds = {"a_1": [0, 0.05], "a_2": [0, 0.05], "tilt_1": [0, np.pi],
+              "tilt_2": [0, np.pi], "phi_12": [0, 2 * np.pi],
+              "phi_jl": [0, 2 * np.pi]}
+    chart = PrecessingSpinReparameterisation(
+        parameters=spin_names, prior_bounds=bounds
+    )
+    base = ETTriangleGroupAction(reference_time=REFERENCE_TIME)
+    rng = np.random.default_rng(7)
+    n = 400
+    cos_theta = rng.uniform(-1, 1, n)
+    points = {
+        "ra": torch.as_tensor(rng.uniform(0, 2 * np.pi, n)),
+        "sin_dec": torch.as_tensor(rng.uniform(-1, 1, n)),
+        "cos_theta_jn": torch.as_tensor(cos_theta),
+        "psi": torch.as_tensor(rng.uniform(0, np.pi, n)),
+        "phase": torch.as_tensor(rng.uniform(0, 2 * np.pi, n)),
+        "geocent_time": torch.as_tensor(
+            REFERENCE_TIME + rng.uniform(-0.1, 0.1, n)
+        ),
+        "phi_jl": torch.as_tensor(rng.uniform(0, 2 * np.pi, n)),
+    }
+    x = np.zeros(n, dtype=[(k, "f8") for k in spin_names
+                           + ["mass_ratio", "theta_jn"]])
+    x["a_1"] = rng.uniform(0, 0.05, n)
+    x["a_2"] = rng.uniform(0, 0.05, n)
+    x["tilt_1"] = np.arccos(rng.uniform(-1, 1, n))
+    x["tilt_2"] = np.arccos(rng.uniform(-1, 1, n))
+    x["phi_12"] = rng.uniform(0, 2 * np.pi, n)
+    x["mass_ratio"] = rng.uniform(0.5, 1, n)
+
+    def chart_of(d):
+        y = x.copy()
+        y["theta_jn"] = np.arccos(d["cos_theta_jn"].numpy())
+        y["phi_jl"] = d["phi_jl"].numpy()
+        x_prime = np.zeros(n, dtype=[(k, "f8") for k in chart.prime_parameters])
+        return chart.reparameterise(y, x_prime, np.zeros(n))[1]
+
+    before = chart_of(points)
+    for g in range(base.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        after = chart_of(base(points, modes))
+        for name in chart.prime_parameters:
+            d = np.angle(np.exp(1j * (after[name] - before[name])))
+            np.testing.assert_allclose(d, 0, atol=1e-9, err_msg=f"{g} {name}")
 
 
 @pytest.mark.parametrize(
