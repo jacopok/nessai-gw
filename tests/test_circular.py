@@ -447,7 +447,45 @@ def test_et_proposal_circular_end_to_end(
     assert proposal.flow.model.circular_standardisation == standardise
 
 
-PS_PARAMETERS = [n for n in BNS_PARAMETERS if n not in ("chi_1", "chi_2")] + [
+@requires_circular
+def test_et_proposal_mode_shift_end_to_end(tmp_path):
+    """The per-mode shifts: fitted at training, zero in the coordinates not
+    shifted, and the trained proposal's density exact and resumable."""
+    cls = make_et_group_flow_proposal(
+        BNS_PARAMETERS, REFERENCE_TIME, phase_reflection=True,
+        polarisation_quarter=True, psi_single=True, adaptive_domain=True,
+        circular_psi_phase=True, log_mass_ratio=False,
+        circular_standardisation=True, mode_shift=True,
+    )
+    fm = cls._FlowModelClass
+    assert "psi_prime" in fm.mode_shift and "delta_phase" in fm.mode_shift
+    assert "chirp_mass_prime" in fm.mode_shift
+    model = _stub_model()
+    proposal = cls(
+        model,
+        output=str(tmp_path),
+        poolsize=200,
+        reparameterisations=triangular_group_reparameterisations(
+            BNS_PARAMETERS, REFERENCE_TIME, log_mass_ratio=False
+        ),
+        flow_config={
+            "ftype": "circular", "n_blocks": 2, "n_neurons": 8,
+            "n_layers": 1, "real_transform": "affine",
+        },
+        training_config={"max_epochs": 3, "patience": 3},
+        latent_temperature=1.4,
+    )
+    proposal.initialise()
+    _check_trained_proposal(proposal, model, _prior_live_points(model, 1000))
+    flow = proposal.flow.model
+    names = list(flow.param_names)
+    shifted = [names.index(n) for n in fm.mode_shift]
+    others = [i for i in range(len(names)) if i not in shifted]
+    assert torch.all(flow._mode_shift[:, others] == 0)
+    assert torch.any(flow._mode_shift[:, shifted] != 0)
+
+
+PS_PARAMETERS =[n for n in BNS_PARAMETERS if n not in ("chi_1", "chi_2")] + [
     "a_1", "tilt_1", "a_2", "tilt_2", "phi_12", "phi_jl",
 ]
 PS_BOUNDS = BOUNDS | {

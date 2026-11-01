@@ -726,3 +726,32 @@ def test_curvature_shear_kwargs():
         curvature_shear_kwargs(True, ["chirp_mass_prime"], params)
     with pytest.raises(RuntimeError, match="curvature_shear"):
         curvature_shear_kwargs(True, names, {})
+
+
+def test_mode_shift_kwargs():
+    import inspect
+
+    from nessai.flowmodel.group_mixture import make_group_mixture_flow
+
+    from nessai_gw.group_mixture import mode_shift_kwargs
+
+    params = inspect.signature(make_group_mixture_flow).parameters
+    # the prime coordinates of the pop250 ET-Delta runs
+    names = [
+        "chirp_distance", "psi_res", "delta_phase_res", "t_det",
+        "chi_eff_prime", "chi_diff_prime", "lambda_tilde_prime",
+        "lambda_diff_prime", "mass_ratio_prime", "theta_jn_prime", "sky_u",
+        "sky_v", "chirp_mass_prime",
+    ]
+    assert mode_shift_kwargs(False, names, params, {}) == {}
+    assert mode_shift_kwargs(True, names, params, {}) == {"mode_shift": names}
+    # not the reflected ones, nor the curvature shear's
+    fixed = {"reflect_parameters": ["theta_jn_prime"],
+             "curvature_shear": "mass_ratio_prime"}
+    assert mode_shift_kwargs(True, names, params, fixed)["mode_shift"] == [
+        n for n in names if n not in ("theta_jn_prime", "mass_ratio_prime")]
+    with pytest.raises(ValueError, match="no coordinates"):
+        mode_shift_kwargs(True, ["mass_ratio_prime"], params,
+                          {"curvature_shear": "mass_ratio_prime"})
+    with pytest.raises(RuntimeError, match="mode_shift"):
+        mode_shift_kwargs(True, names, {}, {})

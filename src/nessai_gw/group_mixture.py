@@ -3482,6 +3482,39 @@ def curvature_shear_kwargs(mass_ratio_shear, prime_names, gm_params):
     return {"curvature_shear": "mass_ratio_prime"}
 
 
+def mode_shift_kwargs(mode_shift, prime_names, gm_params, gm_kwargs):
+    """``make_group_mixture_flow`` keywords of ``mode_shift``.
+
+    The sky group of a detector is a symmetry of the likelihood only at one
+    instant: over a long signal the Earth turns the detector about its own
+    axis, not the detector's normal, so the images of a mode are not exact
+    copies and fold onto slightly different places (Earth-rotation
+    timescales; the arrival time and sky by up to ~2 sigma at SNR ~ 500).
+    nessai's ``mode_shift`` standardises each group element's points about
+    its own centre, fitted to the live points, which stacks them again. The
+    rotation acts on the response, but the arrival time drags the chirp
+    mass, effective spin and tides along the inspiral's degeneracy (~1 sigma
+    at SNR ~ 400), so every coordinate is shifted but the reflected ones and
+    the curvature shear's (both folded about a fixed boundary).
+    """
+    if not mode_shift:
+        return {}
+    if "mode_shift" not in gm_params:
+        raise RuntimeError(
+            "mode_shift requires a version of nessai whose "
+            "make_group_mixture_flow accepts `mode_shift`."
+        )
+    fixed = set(gm_kwargs.get("reflect_parameters") or ()) | {
+        gm_kwargs.get("curvature_shear")}
+    names = [n for n in prime_names if n not in fixed]
+    if not names:
+        raise ValueError(
+            f"mode_shift: no coordinates to shift in {list(prime_names)}."
+        )
+    logger.info(f"Per-mode shifts of {names}")
+    return {"mode_shift": names}
+
+
 def make_triangular_group_flow_proposal(
     sampling_parameters,
     reference_time,
@@ -3513,6 +3546,7 @@ def make_triangular_group_flow_proposal(
     circular_psi_phase=False,
     circular_standardisation=False,
     mass_ratio_shear=False,
+    mode_shift=False,
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
@@ -3676,6 +3710,13 @@ def make_triangular_group_flow_proposal(
         polynomial in ``mass_ratio_prime`` about the ``q = 1`` edge, fitted
         to the live points (nessai's ``curvature_shear``, see
         :func:`curvature_shear_kwargs`).  Default ``False``.
+    mode_shift : bool, optional
+        Standardise each group element's points about its own centre (in
+        every coordinate but the reflected ones and the curvature shear's),
+        fitted to the live points (nessai's
+        ``mode_shift``, see :func:`mode_shift_kwargs`): stacks the images of
+        a mode that the Earth's rotation displaces.  Not with
+        ``amplitudes``.  Default ``False``.
     adaptive_domain : bool, optional
         Give every group-mixture expert an :class:`AdaptiveFundamentalDomain`
         ``base_reparam``: each expert moves the sky, ``psi`` and
@@ -3741,6 +3782,7 @@ def make_triangular_group_flow_proposal(
             ("reference_epoch", reference_epoch is not None),
             ("base_action", base_action is not None),
             ("polarisation_offset", polarisation_offset),
+            ("mode_shift", mode_shift),
         ) if on)
         if bad:
             raise ValueError(f"amplitudes excludes {bad}.")
@@ -3955,6 +3997,9 @@ def make_triangular_group_flow_proposal(
         gm_kwargs["circular_parameters"] = list(circles)
     gm_kwargs.update(
         curvature_shear_kwargs(mass_ratio_shear, prime_names, _gm_params)
+    )
+    gm_kwargs.update(
+        mode_shift_kwargs(mode_shift, prime_names, _gm_params, gm_kwargs)
     )
     flow_model_cls = _make_flow_model(
         group_action_fn=action,  # ignored on the prime-space path
@@ -4175,6 +4220,7 @@ def make_et_group_flow_proposal(
     circular_psi_phase=False,
     circular_standardisation=False,
     mass_ratio_shear=False,
+    mode_shift=False,
     time_reference_frequency=None,
     time_to_merger=None,
     chirp_distance_inversion=False,
@@ -4217,6 +4263,7 @@ def make_et_group_flow_proposal(
         circular_psi_phase=circular_psi_phase,
         circular_standardisation=circular_standardisation,
         mass_ratio_shear=mass_ratio_shear,
+        mode_shift=mode_shift,
         time_reference_frequency=time_reference_frequency,
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,
