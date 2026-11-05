@@ -474,6 +474,9 @@ class MixtureProposalMixin:
         self.x = x[:n_samples]
         self.population_clipped_share = n_clipped / max(n_accepted, 1)
         self.samples = self.convert_to_samples(self.x, plot=False)
+        # no pre-cap acceptance recorded for the mixture's draws: nessai's
+        # clip-compression terms are zero for this pool (not a stale pool's)
+        self.pool_log_excess = None
         self.population_time += datetime.datetime.now() - st
         self.samples["logL"] = self.model.batch_evaluate_log_likelihood(self.samples)
         if self.check_acceptance:
@@ -595,6 +598,7 @@ class MixtureProposalMixin:
         sec.populate(worst_point, n_samples=n_samples, plot=False, r=r, max_samples=max_samples)
         self.x = sec.x
         self.samples = sec.samples
+        self.pool_log_excess = getattr(sec, "pool_log_excess", None)
         self.indices = self.rng.permutation(self.samples.size).tolist()
         sec.indices, sec.populated = [], False
         self.population_acceptance = sec.population_acceptance
