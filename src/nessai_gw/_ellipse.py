@@ -766,34 +766,65 @@ class ResponseFit:
         trace = torch.diagonal(gram, dim1=-2, dim2=-1).sum(-1).real
         gram = gram + _GRAM_FLOOR * trace[:, None, None] * torch.eye(2, dtype=gram.dtype)
         rhs = torch.einsum("nki,k->ni", torch.conj(a), data)
-        v = torch.linalg.solve(gram, rhs[..., None])[..., 0]
-        return v[:, 0].to(dtype), v[:, 1].to(dtype)
+        # the 2 x 2 systems in closed form (batched LAPACK solves of 2 x 2
+        # systems cost many times more)
+        g00, g01 = gram[:, 0, 0], gram[:, 0, 1]
+        g10, g11 = gram[:, 1, 0], gram[:, 1, 1]
+        det = g00 * g11 - g01 * g10
+        v0 = (g11 * rhs[:, 0] - g01 * rhs[:, 1]) / det
+        v1 = (g00 * rhs[:, 1] - g10 * rhs[:, 0]) / det
+        return v0.to(dtype), v1.to(dtype)
+
+    def _psi_star_from(self, ar, al):
+        import torch
+
+        z = ar * torch.conj(al) * np.exp(-1j * self.branch_psi)
+        return 0.25 * torch.angle(z) + 0.25 * self.branch_psi
 
     def _psi_star_torch(self, w):
         import torch
 
         if self.psi_mode == "none" or self.data is None:
             return torch.zeros(w.shape[0], dtype=w.real.dtype)
-        ar, al = self._helicities_torch(w)
-        z = ar * torch.conj(al) * np.exp(-1j * self.branch_psi)
-        return 0.25 * torch.angle(z) + 0.25 * self.branch_psi
+        return self._psi_star_from(*self._helicities_torch(w))
 
-    def predict_torch(self, ra, sin_dec):
-        """:meth:`predict` for torch tensors."""
-        psi = self._psi_star_torch(self._torch_parts(ra, sin_dec)) + self.offset_psi
-        return psi, self.offset_sum - psi
-
-    def phase_torch(self, ra, sin_dec, cos_theta_jn, psi):
-        """:meth:`phase` for torch tensors, from ``ra`` and ``sin(dec)``."""
+    def sky_state_torch(self, ra, sin_dec):
+        """What :meth:`predict_torch` and :meth:`phase_torch` share at a
+        sky, computed once: the responses, the helicity fit (if used) and
+        ``psi*`` (pass it to both as ``state``)."""
         import torch
 
         w = self._torch_parts(ra, sin_dec)
+        hel = None
+        if self.data is not None and (self.phase_mode == "sky" or self.psi_mode != "none"):
+            hel = self._helicities_torch(w)
+        if self.psi_mode == "none" or self.data is None:
+            psi_star = torch.zeros(w.shape[0], dtype=w.real.dtype)
+        else:
+            psi_star = self._psi_star_from(*hel)
+        return w, hel, psi_star
+
+    def predict_torch(self, ra, sin_dec, state=None):
+        """:meth:`predict` for torch tensors (``state``: see :meth:`phase_torch`)."""
+        if state is None:
+            psi = self._psi_star_torch(self._torch_parts(ra, sin_dec))
+        else:
+            psi = state[2]
+        psi = psi + self.offset_psi
+        return psi, self.offset_sum - psi
+
+    def phase_torch(self, ra, sin_dec, cos_theta_jn, psi, state=None):
+        """:meth:`phase` for torch tensors, from ``ra`` and ``sin(dec)``
+        (``state``: :meth:`sky_state_torch` at that sky; else computed)."""
+        import torch
+
+        w, hel, psi_star = state if state is not None else self.sky_state_torch(ra, sin_dec)
         s = torch.where(cos_theta_jn >= 0, torch.ones_like(psi), -torch.ones_like(psi))
         if self.data is None:
             m = torch.zeros_like(psi)
         else:
             if self.phase_mode == "sky":
-                ar, al = self._helicities_torch(w)
+                ar, al = hel
                 z = torch.where(s > 0, ar, al)
             else:
                 c = cos_theta_jn[..., None]
@@ -803,7 +834,7 @@ class ResponseFit:
                 g = torch.sum(torch.conj(zk) * data, dim=-1)
                 z = g * torch.exp(2j * (s * psi).to(g.dtype))
             m = 0.5 * torch.angle(z * np.exp(-1j * self.branch)) + 0.5 * self.branch
-        return ((1 - s) * psi - self._psi_star_torch(w) + m
+        return ((1 - s) * psi - psi_star + m
                 + self.offset_sum - self.offset_psi)
 
     # -- refit ------------------------------------------------------------

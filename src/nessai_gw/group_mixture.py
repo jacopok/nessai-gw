@@ -923,11 +923,27 @@ class PrimeSpaceTriangularGroupAction:
 
     # -- decode / encode -------------------------------------------------
 
-    def _decode(self, point_dict):
+    def _sheet_predict(self, ra, sin_dec):
+        """``(psi*, phase*, state)`` of the sheet at the sky; ``state`` (a
+        sheet with ``sky_state_torch``: its helicity fit, computed once) for
+        :meth:`_sheet_phase` at the same sky."""
+        if hasattr(self._sheet, "sky_state_torch"):
+            state = self._sheet.sky_state_torch(ra, sin_dec)
+            return (*self._sheet.predict_torch(ra, sin_dec, state=state), state)
+        return (*self._sheet.predict_torch(ra, sin_dec), None)
+
+    def _sheet_phase(self, ra, sin_dec, cos_ct, psi, state):
+        if state is None:
+            return self._sheet.phase_torch(ra, sin_dec, cos_ct, psi)
+        return self._sheet.phase_torch(ra, sin_dec, cos_ct, psi, state=state)
+
+    def _decode(self, point_dict, sheet=True):
         """nessai-gw prime dict -> ``TriangularDetectorGroupAction`` coordinate dict.
 
         Returns ``(acted, aux)`` where ``aux`` carries the radii needed to
-        re-encode.
+        re-encode. ``sheet=False``: on the sheet-residual path, ``psi`` and
+        ``phase`` are left zero (the sheet's prediction not computed), for
+        :meth:`in_fundamental_domain`, which tests the residuals.
         """
         # EqualAreaSky: (sky_u, sky_v) -> detector-frame unit vector.
         u = point_dict[self._sky2d[0]]
@@ -967,8 +983,11 @@ class PrimeSpaceTriangularGroupAction:
                 e1 > e0, torch.remainder(ph0 + np.pi, _TWO_PI), ph0
             )
             r_psi = torch.ones_like(ra)
+        elif self._sheet_res is not None and not sheet:
+            psi, phase = torch.zeros_like(ra), torch.zeros_like(ra)
+            r_psi = torch.ones_like(ra)
         elif self._sheet_res is not None:
-            psi_s, phase_s = self._sheet.predict_torch(ra, sin_dec)
+            psi_s, phase_s, state = self._sheet_predict(ra, sin_dec)
             r_psi = (point_dict[self._sheet_res[0]] + 1.0) * (0.5 * np.pi)
             r_sum = (point_dict[self._sheet_res[1]] + 1.0) * np.pi
             psi = torch.remainder(r_psi + psi_s, np.pi)
@@ -979,7 +998,7 @@ class PrimeSpaceTriangularGroupAction:
                     raise RuntimeError("an orientation-dependent sheet needs "
                                        "the plain theta_jn coordinate")
                 cos_ct = -torch.sin(point_dict[self._theta_jn] * (0.5 * np.pi))
-                phase_s = self._sheet.phase_torch(ra, sin_dec, cos_ct, psi)
+                phase_s = self._sheet_phase(ra, sin_dec, cos_ct, psi, state)
             phase = torch.remainder(r_sum - r_psi + phase_s, _TWO_PI)
             r_psi = torch.ones_like(ra)
         elif self._psi_single:
@@ -1111,12 +1130,12 @@ class PrimeSpaceTriangularGroupAction:
             return {n: out[n] for n in self._prime_names}
         if self._sheet_res is not None:
             # relative to the prediction at the mapped sky
-            psi_s, phase_s = self._sheet.predict_torch(ra_t, sin_dec_t)
+            psi_s, phase_s, state = self._sheet_predict(ra_t, sin_dec_t)
             if getattr(self._sheet, "orientation_dependent", False):
                 # the reflection sends cos theta_jn -> -cos theta_jn
                 u = point_dict[self._theta_jn]
                 cos_ct = -torch.sin(torch.where(aux["reflected"], -u, u) * (0.5 * np.pi))
-                phase_s = self._sheet.phase_torch(ra_t, sin_dec_t, cos_ct, mapped["psi"])
+                phase_s = self._sheet_phase(ra_t, sin_dec_t, cos_ct, mapped["psi"], state)
             r_psi = torch.remainder(mapped["psi"] - psi_s, np.pi)
             out[self._sheet_res[0]] = r_psi * (2.0 / np.pi) - 1.0
             out[self._sheet_res[1]] = (
@@ -1171,8 +1190,33 @@ class PrimeSpaceTriangularGroupAction:
         )
         return self._encode(point_dict, mapped, aux)
 
-    def in_fundamental_domain(self, point_dict):
+    def preimages(self, point_dict, k):
+        """``self`` on the ``B`` points of ``point_dict`` tiled ``k`` times,
+        row ``j * B + i`` the point ``i`` under the inverse of element ``j``
+        (the group mixture's pre-images, ``k`` its group size), with each
+        point decoded once rather than ``k`` times: the decoding does not
+        depend on the element."""
         acted, aux = self._decode(point_dict)
+        b = next(iter(point_dict.values())).shape[0]
+
+        def tile(t):
+            if not torch.is_tensor(t) or t.dim() == 0 or t.shape[0] != b:
+                return t
+            return t.repeat(k, *([1] * (t.dim() - 1)))
+
+        acted = {n: tile(t) for n, t in acted.items()}
+        aux = {n: tile(t) for n, t in aux.items()}
+        tiled = {n: tile(t) for n, t in point_dict.items()}
+        device = next(iter(point_dict.values())).device
+        modes = torch.arange(k, device=device).repeat_interleave(b)
+        mapped = self._action(acted, modes, inverse=True)
+        aux["reflected"], aux["phase_step"] = self._mode_masks(modes, True)
+        return self._encode(tiled, mapped, aux)
+
+    def in_fundamental_domain(self, point_dict):
+        # on the sheet-residual path the predicate tests the residuals, not
+        # psi and phase: the sheet's prediction is not needed
+        acted, aux = self._decode(point_dict, sheet=self._sheet_res is None)
         # _decode carries a dummy cos(theta_jn) (the action only flips it);
         # a predicate on it (the inclination reflection's cos >= 0) needs
         # its sign
