@@ -72,6 +72,68 @@ def random_points(n, seed=0):
     )
 
 
+@pytest.fixture
+def network(tensors, gmst):
+    return ChirpDistanceReparameterisation(
+        parameters="luminosity_distance",
+        tensors=tensors,
+        gmst=gmst,
+        fiducial=FIDUCIAL,
+        response="network",
+    )
+
+
+def test_network_response(network, tensors, gmst):
+    d_l, mchirp, theta_jn, ra, dec, psi = random_points(200)
+    x = structured(d_l, mchirp, theta_jn, ra, dec, psi)
+    x_prime = np.zeros(len(x), dtype=[("chirp_distance", "f8")])
+    _, x_prime, log_j = network.reparameterise(x, x_prime, np.zeros(len(x)))
+    r = response_R(tensors, ra, dec, psi, theta_jn, gmst)
+    amp = np.sqrt(np.mean(np.abs(r) ** 2, axis=-1))
+    np.testing.assert_allclose(
+        x_prime["chirp_distance"], d_l / (mchirp ** (5 / 6) * amp)
+    )
+    np.testing.assert_allclose(log_j, -np.log(mchirp ** (5 / 6) * amp))
+
+
+def test_network_round_trip(network):
+    x = structured(*random_points(200, seed=3))
+    x_prime = np.zeros(len(x), dtype=[("chirp_distance", "f8")])
+    _, x_prime, log_j = network.reparameterise(x, x_prime, np.zeros(len(x)))
+    back = x.copy()
+    back["luminosity_distance"] = 0.0
+    back, _, log_j_inv = network.inverse_reparameterise(
+        back, x_prime, np.zeros(len(x))
+    )
+    np.testing.assert_allclose(
+        back["luminosity_distance"], x["luminosity_distance"]
+    )
+    np.testing.assert_allclose(log_j_inv, -log_j)
+
+
+def test_unknown_response(tensors, gmst):
+    with pytest.raises(ValueError, match="response must be one of"):
+        ChirpDistanceReparameterisation(
+            parameters="luminosity_distance", tensors=tensors, gmst=gmst,
+            k0=0, response="mean",
+        )
+
+
+def test_pickle_before_the_response_is_loudest(reparam):
+    import pickle
+
+    state = dict(reparam.__dict__)
+    del state["response"]
+    old = ChirpDistanceReparameterisation.__new__(
+        ChirpDistanceReparameterisation
+    )
+    old.__setstate__(state)
+    assert old.response == "loudest"
+    x = structured(*random_points(50, seed=4))
+    np.testing.assert_array_equal(old._abs_r(x), reparam._abs_r(x))
+    assert pickle.loads(pickle.dumps(reparam)).response == "loudest"
+
+
 def test_registered():
     assert "chirp-distance" in known_reparameterisations
 

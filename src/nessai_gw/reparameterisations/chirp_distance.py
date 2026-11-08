@@ -21,6 +21,15 @@ the idealised triangle), why ``k0 = argmax_k |R_k(fiducial)|`` is the right way
 to pick the reference detector for the co-located ET-EMR sub-interferometers,
 and why the coordinate is invariant under the group actions.
 
+With ``response="network"`` the amplitude is the network's,
+``sqrt(mean_k |R_k|**2)``, rather than the reference detector's ``|R_k0|``
+(equal weights: for detectors sharing a PSD it is the network SNR's antenna
+factor).  ``|R_k0|`` has zeros, and live points that come near them (along
+the sky ring of two separated detectors) give the chirp distance a long tail
+(skew ~6, kurtosis ~70 on 2L live points); the network's vanishes only
+where every detector's does.  Each ``|R_k|`` is group-invariant, so the
+network's is too.
+
 With ``boundary_inversion`` the prior edge of ``luminosity_distance`` the
 live points pile up against (typically the upper one: a source-frame-uniform
 prior grows towards ``d_max``) is reflected in the *physical* distance,
@@ -89,9 +98,15 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         (default ``("upper",)``: the lower one sits near zero distance).
     detect_edges_kwargs : dict, optional
         Extra keyword arguments for :func:`nessai.utils.detect_edge`.
+    response : {"loudest", "network"}, optional
+        The amplitude the distance is divided by: the reference detector's
+        ``|R_k0|`` (``"loudest"``, the default) or the network's
+        ``sqrt(mean_k |R_k|**2)`` (``"network"``).
     """
 
     one_to_one = False
+    #: The amplitudes of ``response``.
+    RESPONSES = ("loudest", "network")
 
     def __init__(
         self,
@@ -112,6 +127,7 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         boundary_inversion=False,
         inversion_bounds=("upper",),
         detect_edges_kwargs=None,
+        response="loudest",
         **kwargs,
     ):
         parent_params = inspect.signature(
@@ -178,9 +194,15 @@ class ChirpDistanceReparameterisation(Reparameterisation):
                 f"k0={self.k0} is out of range for {len(self.tensors)} "
                 "detector tensors."
             )
+        if response not in self.RESPONSES:
+            raise ValueError(
+                f"response must be one of {self.RESPONSES}; got {response!r}"
+            )
+        self.response = response
         logger.info(
-            "ChirpDistanceReparameterisation: reference detector k0=%d",
-            self.k0,
+            "ChirpDistanceReparameterisation: %s",
+            f"reference detector k0={self.k0}" if response == "loudest"
+            else f"network response of {len(self.tensors)} detectors",
         )
 
         self._chirp_mass = chirp_mass
@@ -234,8 +256,10 @@ class ChirpDistanceReparameterisation(Reparameterisation):
             x[self._psi],
             x[self._theta_jn],
             self.gmst if gmst is None else gmst,
-        )[..., self.k0]
-        return np.abs(r)
+        )
+        if self.response == "network":
+            return np.sqrt(np.mean(np.abs(r) ** 2, axis=-1))
+        return np.abs(r[..., self.k0])
 
     def log_spread(self, x, gmsts):
         """Standard deviation over ``x`` of the log chirp distance with the
@@ -321,4 +345,6 @@ class ChirpDistanceReparameterisation(Reparameterisation):
         state.setdefault("inversion_bounds", ("upper",))
         state.setdefault("detect_edges_kwargs", {})
         state.setdefault("_edge", None)
+        # and before the network response
+        state.setdefault("response", "loudest")
         self.__dict__.update(state)
