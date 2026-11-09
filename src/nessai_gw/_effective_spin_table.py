@@ -285,3 +285,113 @@ class TabulatedEffectiveSpinTransform:
         return chi1, chi2, self._log_jacobian(
             q, s_max, log_g, log_f, width, u, w
         )
+
+
+def spin_orbit_coefficients(q):
+    r"""``(a_1, r, kappa)`` at mass ratio ``q = m_2 / m_1``: the spin-orbit
+    combination is :math:`\beta = a_1 (\chi_1 + r \chi_2)`, with
+    :math:`a_i = (113 m_i^2 / M^2 + 75 \eta) / 12` and ``r = a_2 / a_1``, and
+    :math:`\kappa = (4 \eta)^{-3/5}` is the mass-ratio dependence of the
+    1.5PN phase coefficient at fixed chirp mass, 1 at ``q = 1``."""
+    eta = q / (1.0 + q) ** 2
+    m1, m2 = 1.0 / (1.0 + q), q / (1.0 + q)
+    a1 = (113.0 * m1**2 + 75.0 * eta) / 12.0
+    a2 = (113.0 * m2**2 + 75.0 * eta) / 12.0
+    return a1, a2 / a1, (4.0 * eta) ** -0.6
+
+
+class SpinOrbitChart:
+    r"""The aligned spins as ``(y, w)``: ``y`` an affine function of the
+    1.5PN coefficient of the inspiral phase, ``w`` the prior's Rosenblatt
+    coordinate along the line of constant ``y``.
+
+    The phase is linear in its PN coefficients; the 1.5PN one (of
+    :math:`f^{-2/3}`) is
+
+    .. math::
+        C_3 = \frac{3}{128} (\pi \mathcal{M})^{-2/3} 4^{-3/5}
+              \kappa(q) (4\beta - 16\pi),
+        \qquad \beta = a_1 \chi_1 + a_2 \chi_2,
+
+    (:func:`spin_orbit_coefficients`; :math:`\kappa = (4\eta)^{-3/5}`).
+    Dropping the chirp-mass factor (constant to ~1e-5 over a posterior),
+
+    .. math::
+        y = \frac{\kappa(q) (4\beta - 16\pi) + 16\pi}{4 a_{\max, 1}},
+
+    i.e. ``a_1 (chi_1 + chi_2) / a_max_1`` at ``q = 1``.  Where the data
+    measure the phase, the live points of the mass ratio, chirp mass and
+    spins lie along a straight, constant-width tube in the PN coefficients;
+    in ``(ln q, chi_eff_prime)`` the same tube is curved, and of varying width
+    (beta is not a function of chi_eff).
+
+    ``w`` comes from the tables of ``inner`` (a
+    :class:`TabulatedEffectiveSpinTransform`) evaluated at ``r = a_2 / a_1``
+    in place of the mass ratio: their ``chi_1 + r chi_2`` is
+    :math:`\beta / a_1`, so their Rosenblatt transform is the prior's in the
+    order (beta, position along the line of constant beta), and their ``u``
+    is a strictly increasing function of ``y`` at fixed ``q``.  The map is
+    exactly invertible with the exact Jacobian
+    :math:`|\partial y / \partial u| \, |\partial(u, w) / \partial(\chi_1,
+    \chi_2)|`; ``y`` is not normal under the prior (at fixed ``q`` it is a
+    rescaled spin-orbit combination, and it shifts with ``q`` by the
+    :math:`-16\pi` term).  Same interface as the tables: ``forward(chi1,
+    chi2, q) -> (y, w, log_j)`` and ``inverse(y, w, q) -> (chi1, chi2,
+    log_j)``, ``log_j`` the forward log-Jacobian; outside the prior the
+    inverse gives NaN.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    @property
+    def a1(self):
+        return self.inner.a1
+
+    @property
+    def a2(self):
+        return self.inner.a2
+
+    def _y_of_s(self, s, a1, kappa):
+        return (kappa * (4.0 * a1 * s - 16.0 * np.pi) + 16.0 * np.pi) / (
+            4.0 * self.inner.a1)
+
+    def _s_of_y(self, y, a1, kappa):
+        return ((4.0 * self.inner.a1 * y - 16.0 * np.pi) / kappa
+                + 16.0 * np.pi) / (4.0 * a1)
+
+    def _log_dy_du(self, u, t, r, a1, kappa):
+        """``log |dy/du|``: ``dy/dS = kappa a_1 / a_max_1`` and the tables'
+        ``du/dS = G'(t) / (s_max phi(u))``."""
+        s_max = self.inner.a1 + r * self.inner.a2
+        _, log_g = self.inner._u_and_slope(t, r)
+        return (np.log(kappa * a1 / self.inner.a1) + np.log(s_max)
+                + _log_std_normal(u) - log_g)
+
+    def forward(self, chi1, chi2, q):
+        """``(y, w, log|d(y, w)/d(chi_1, chi_2)|)``."""
+        chi1, chi2, q = np.broadcast_arrays(
+            *(np.atleast_1d(np.asarray(a, dtype=float)) for a in (chi1, chi2, q))
+        )
+        a1, r, kappa = spin_orbit_coefficients(q)
+        u, w, lj = self.inner.forward(chi1, chi2, r)
+        s = chi1 + r * chi2
+        t = s / (self.inner.a1 + r * self.inner.a2)
+        return (self._y_of_s(s, a1, kappa), w,
+                lj + self._log_dy_du(u, t, r, a1, kappa))
+
+    def inverse(self, y, w, q):
+        """``(chi_1, chi_2, log|d(y, w)/d(chi_1, chi_2)|)``; NaN where ``y``
+        is outside the prior at ``q``."""
+        y, w, q = np.broadcast_arrays(
+            *(np.atleast_1d(np.asarray(a, dtype=float)) for a in (y, w, q))
+        )
+        a1, r, kappa = spin_orbit_coefficients(q)
+        t = self._s_of_y(y, a1, kappa) / (self.inner.a1 + r * self.inner.a2)
+        ok = np.isfinite(t) & (np.abs(t) < 1) & np.isfinite(w)
+        t = np.where(ok, t, 0.0)
+        u, _ = self.inner._u_and_slope(t, r)
+        chi1, chi2, lj = self.inner.inverse(u, np.where(ok, w, 0.0), r)
+        lj = lj + self._log_dy_du(u, t, r, a1, kappa)
+        return (np.where(ok, chi1, np.nan), np.where(ok, chi2, np.nan),
+                np.where(ok, lj, np.nan))

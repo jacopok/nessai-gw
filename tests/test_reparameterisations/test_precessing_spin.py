@@ -288,3 +288,37 @@ def test_unknown_coordinates():
         PrecessingSpinReparameterisation(
             parameters=NAMES, prior_bounds=BOUNDS, coordinates="lvk"
         )
+
+
+@pytest.mark.parametrize("coordinates", ["cogwheel", "cartesian"])
+def test_spin_orbit_chart(coordinates):
+    """The aligned components in the spin-orbit chart (as the aligned-spin
+    reparameterisation's), the in-plane coordinates unchanged; an exact round
+    trip."""
+    from nessai_gw._effective_spin_table import SpinOrbitChart
+    from nessai_gw.reparameterisations import EffectiveSpinReparameterisation
+
+    r = PrecessingSpinReparameterisation(
+        parameters=NAMES, prior_bounds=BOUNDS, coordinates=coordinates,
+        spin_chart="spin-orbit",
+    )
+    assert r.spin_chart == "spin-orbit" and isinstance(r._transform, SpinOrbitChart)
+    plain = PrecessingSpinReparameterisation(
+        parameters=NAMES, prior_bounds=BOUNDS, coordinates=coordinates)
+    x = _prior(3000, seed=11, q_min=0.1)
+    x_prime, log_j = _forward(r, x.copy())
+    x_plain, log_j_plain = _forward(plain, x.copy())
+    for name in r.prime_parameters[2:]:
+        np.testing.assert_array_equal(x_prime[name], x_plain[name])
+    aligned = EffectiveSpinReparameterisation(
+        prior_bounds={"chi_1": [-A1, A1], "chi_2": [-A2, A2]}, spin_chart="spin-orbit")
+    y, _, lj_y = aligned._transform.forward(
+        x["a_1"] * np.cos(x["tilt_1"]), x["a_2"] * np.cos(x["tilt_2"]), x["mass_ratio"])
+    _, _, lj_u = plain._transform.forward(
+        x["a_1"] * np.cos(x["tilt_1"]), x["a_2"] * np.cos(x["tilt_2"]), x["mass_ratio"])
+    np.testing.assert_array_equal(x_prime["chi_eff_prime"], y)
+    np.testing.assert_allclose(log_j - log_j_plain, lj_y - lj_u, atol=1e-10)
+    back, log_j_back = _inverse(r, x_prime, x["mass_ratio"], x["theta_jn"])
+    for name in NAMES:
+        np.testing.assert_allclose(back[name], x[name], rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(log_j_back, -log_j, atol=1e-7)

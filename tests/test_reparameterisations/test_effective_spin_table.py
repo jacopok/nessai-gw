@@ -8,7 +8,11 @@ import pytest
 from scipy import stats
 
 from nessai_gw._effective_spin import EffectiveSpinTransform
-from nessai_gw._effective_spin_table import TabulatedEffectiveSpinTransform
+from nessai_gw._effective_spin_table import (
+    SpinOrbitChart,
+    TabulatedEffectiveSpinTransform,
+    spin_orbit_coefficients,
+)
 from nessai_gw.reparameterisations import EffectiveSpinReparameterisation
 
 A1, A2 = 0.05, 0.04
@@ -118,3 +122,128 @@ def test_reparameterisation_drops_unresolved_tails():
     assert not kept.all()
     assert np.all(np.isfinite(log_j[kept]))
     assert np.all(np.isnan(x["chi_2"][~np.isfinite(log_j)]))
+
+
+# -- the spin-orbit chart ------------------------------------------------------
+
+MSUN_S = 4.925490947641267e-06
+
+
+@pytest.fixture(scope="module")
+def chart(transform):
+    return SpinOrbitChart(transform)
+
+
+def test_spin_orbit_y_is_the_phase_coefficient(chart):
+    """``4 a_max_1 y - 16 pi`` is the 1.5PN coefficient of the phase in units
+    of its chirp-mass factor, at every mass ratio."""
+    c1, c2, q = _points(2000, seed=6, q_min=0.1)
+    y, _, _ = chart.forward(c1, c2, q)
+    eta = q / (1 + q) ** 2
+    m1, m2 = 1 / (1 + q), q / (1 + q)
+    beta = (c1 * (113 * m1**2 + 75 * eta) + c2 * (113 * m2**2 + 75 * eta)) / 12
+    total = 1.4 * eta**-0.6 * MSUN_S  # any chirp mass: it factors out
+    c3 = 3 / (128 * eta) * (np.pi * total) ** (-2 / 3) * (4 * beta - 16 * np.pi)
+    ratio = (4 * A1 * y - 16 * np.pi) / c3
+    np.testing.assert_allclose(ratio, ratio[0], rtol=1e-12)
+    a1, r, kappa = spin_orbit_coefficients(np.array([1.0]))
+    assert kappa[0] == 1 and r[0] == 1 and np.isclose(a1[0], 47 / 12)
+
+
+def test_spin_orbit_round_trip_is_exact(chart):
+    c1, c2, q = _points(5000, seed=7, q_min=0.1)
+    y, w, lj = chart.forward(c1, c2, q)
+    b1, b2, lj_back = chart.inverse(y, w, q)
+    np.testing.assert_allclose(b1, c1, rtol=0, atol=1e-14)
+    np.testing.assert_allclose(b2, c2, rtol=0, atol=1e-14)
+    np.testing.assert_allclose(lj_back, lj, atol=1e-8)
+
+
+def test_spin_orbit_jacobian_is_that_of_the_map(chart):
+    c1, c2, q = _points(300, seed=8)
+    h = 1e-8
+
+    def yw(a, b):
+        y, w, _ = chart.forward(a, b, q)
+        return np.stack([y, w], axis=-1)
+
+    jac = np.stack(
+        [(yw(c1 + h, c2) - yw(c1 - h, c2)) / (2 * h),
+         (yw(c1, c2 + h) - yw(c1, c2 - h)) / (2 * h)],
+        axis=-1,
+    )
+    _, _, lj = chart.forward(c1, c2, q)
+    err = np.abs(np.log(np.abs(np.linalg.det(jac))) - lj)
+    assert np.median(err) < 1e-5
+    assert np.mean(err > 1e-3) < 0.02
+
+
+def test_spin_orbit_w_is_along_constant_beta(chart):
+    """At fixed ``q`` and ``y``, moving along ``w`` keeps beta fixed."""
+    q = np.full(50, 0.6)
+    y = np.full(50, chart.forward(0.01, -0.02, 0.6)[0][0])
+    w = np.linspace(-3, 3, 50)
+    c1, c2, _ = chart.inverse(y, w, q)
+    assert np.all(np.isfinite(c1))
+    eta = 0.6 / 1.6**2
+    beta = c1 * (113 / 1.6**2 + 75 * eta) + c2 * (113 * 0.36 / 1.6**2 + 75 * eta)
+    np.testing.assert_allclose(beta, beta[0], rtol=1e-12)
+    assert np.all(np.diff(c1) > 0)
+
+
+def test_spin_orbit_inverse_outside_the_prior_is_nan(chart):
+    q = np.array([0.5, 0.5, 1.0])
+    y, w, lj = chart.forward(np.zeros(3), np.zeros(3), q)
+    y = y + np.array([0.0, 1e3, -1e3])
+    c1, c2, lj = chart.inverse(y, w, q)
+    assert np.isfinite(c1[0]) and np.isfinite(lj[0])
+    assert np.all(np.isnan(c1[1:])) and np.all(np.isnan(c2[1:]))
+    assert np.all(np.isnan(lj[1:]))
+
+
+def _spin_x(n, seed):
+    c1, c2, q = _points(n, seed=seed)
+    x = np.zeros(n, dtype=[(k, "f8") for k in ("chi_1", "chi_2", "mass_ratio")])
+    x["chi_1"], x["chi_2"], x["mass_ratio"] = c1, c2, q
+    x_prime = np.zeros(n, dtype=[("chi_eff_prime", "f8"), ("chi_diff_prime", "f8")])
+    return x, x_prime
+
+
+def test_reparameterisation_spin_chart():
+    bounds = {"chi_1": [-A1, A1], "chi_2": [-A2, A2]}
+    r = EffectiveSpinReparameterisation(prior_bounds=bounds, spin_chart="spin-orbit")
+    assert r.spin_chart == "spin-orbit"
+    assert isinstance(r._transform, SpinOrbitChart)
+    x, x_prime = _spin_x(1000, seed=9)
+    _, x_prime, lj = r.reparameterise(x.copy(), x_prime, np.zeros(len(x)))
+    y, w, lj_chart = r._transform.forward(x["chi_1"], x["chi_2"], x["mass_ratio"])
+    np.testing.assert_array_equal(x_prime["chi_eff_prime"], y)
+    np.testing.assert_array_equal(lj, lj_chart)
+    back = x.copy()
+    back["chi_1"] = back["chi_2"] = np.nan
+    back, _, lj_back = r.inverse_reparameterise(back, x_prime, np.zeros(len(x)))
+    np.testing.assert_allclose(back["chi_1"], x["chi_1"], atol=1e-14)
+    np.testing.assert_allclose(back["chi_2"], x["chi_2"], atol=1e-14)
+    np.testing.assert_allclose(lj_back, -lj, atol=1e-8)
+    # pickled and back, still the chart; switched on an existing instance
+    r2 = pickle.loads(pickle.dumps(r))
+    assert r2.spin_chart == "spin-orbit"
+    r2.spin_chart = "effective"
+    assert type(r2._transform) is TabulatedEffectiveSpinTransform
+    _, xp_eff, _ = r2.reparameterise(x.copy(), x_prime.copy(), np.zeros(len(x)))
+    u, _, _ = TabulatedEffectiveSpinTransform(A1, A2).forward(
+        x["chi_1"], x["chi_2"], x["mass_ratio"])
+    np.testing.assert_array_equal(xp_eff["chi_eff_prime"], u)
+    r2.spin_chart = "spin-orbit"
+    r2.spin_chart = "spin-orbit"  # not wrapped twice
+    assert type(r2._transform.inner) is TabulatedEffectiveSpinTransform
+
+
+def test_reparameterisation_spin_chart_errors():
+    bounds = {"chi_1": [-A1, A1], "chi_2": [-A2, A2]}
+    assert EffectiveSpinReparameterisation(prior_bounds=bounds).spin_chart == "effective"
+    with pytest.raises(ValueError, match="tabulated"):
+        EffectiveSpinReparameterisation(prior_bounds=bounds, tabulated=False,
+                                        spin_chart="spin-orbit")
+    with pytest.raises(ValueError, match="spin_chart"):
+        EffectiveSpinReparameterisation(prior_bounds=bounds, spin_chart="beta")
