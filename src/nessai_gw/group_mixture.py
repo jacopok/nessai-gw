@@ -2330,6 +2330,8 @@ def triangular_group_reparameterisations(
     amplitudes=False,
     amplitude_tensors=None,
     sheet_phase=None,
+    chirp_distance_response="loudest",
+    spin_chart="effective",
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2516,6 +2518,18 @@ def triangular_group_reparameterisations(
         (see
         :class:`~nessai_gw.reparameterisations.ChirpDistanceReparameterisation`).
         Default ``False``.
+    chirp_distance_response : {"loudest", "network"}, optional
+        With ``chirp_distance``: divide by the reference detector's ``|R_k0|``
+        (``"loudest"``, the default) or by the network's
+        ``sqrt(mean_k |R_k|^2)`` over ``chirp_distance_tensors``
+        (``"network"``; see
+        :class:`~nessai_gw.reparameterisations.ChirpDistanceReparameterisation`).
+    spin_chart : {"effective", "spin-orbit"}, optional
+        The aligned-spin pair of ``effective-spin`` and ``precessing-spin``:
+        ``chi_eff``'s probit (``"effective"``, the default) or the 1.5PN
+        spin-orbit phase coefficient's (``"spin-orbit"``; tabulated spins
+        only, see
+        :class:`~nessai_gw.reparameterisations.EffectiveSpinReparameterisation`).
     time_to_merger : str, optional
         ``"module:function"`` giving the waveform's time from each frequency to
         the merger (see
@@ -2552,8 +2566,17 @@ def triangular_group_reparameterisations(
     dict
         A ``reparameterisations`` mapping for ``bilby.run_sampler`` / nessai.
     """
+    if chirp_distance_response not in ("loudest", "network"):
+        raise ValueError(
+            "chirp_distance_response must be 'loudest' or 'network', not "
+            f"{chirp_distance_response!r}"
+        )
+    if spin_chart not in ("effective", "spin-orbit"):
+        raise ValueError(
+            f"spin_chart must be 'effective' or 'spin-orbit', not {spin_chart!r}"
+        )
     if amplitudes:
-        return _amplitude_reparameterisations(
+        return _with_spin_chart(_amplitude_reparameterisations(
             sampling_parameters, reference_time,
             ET_EMR_DETECTOR_TENSORS if amplitude_tensors is None
             else amplitude_tensors,
@@ -2566,7 +2589,7 @@ def triangular_group_reparameterisations(
             time_reference_frequency=time_reference_frequency,
             time_frequency_range=time_frequency_range,
             time_to_merger=time_to_merger, waveform_phase=waveform_phase,
-        )
+        ), spin_chart)
     if vertex is None:
         vertex = ET_EMR_VERTEX
     chirp_distance = bool(chirp_distance) and (
@@ -2724,6 +2747,8 @@ def triangular_group_reparameterisations(
             }
             if chirp_distance_inversion:
                 reps[name]["boundary_inversion"] = True
+            if chirp_distance_response != "loudest":
+                reps[name]["response"] = chirp_distance_response
         elif name == "chi_1" and effective_spin:
             reps[name] = {
                 "reparameterisation": "effective-spin",
@@ -2872,6 +2897,17 @@ def triangular_group_reparameterisations(
                 if v.get("reparameterisation") == "chirp-distance"}
         reps = {**head, "sheet-residual": entry,
                 **{k: v for k, v in reps.items() if k not in head}}
+    return _with_spin_chart(reps, spin_chart)
+
+
+def _with_spin_chart(reps, spin_chart):
+    """``reps`` with ``spin_chart`` on its ``effective-spin`` and
+    ``precessing-spin`` entries (left out for the default, ``"effective"``,
+    so the specs stay those of a nessai-gw from before it)."""
+    if spin_chart != "effective":
+        for spec in reps.values():
+            if spec.get("reparameterisation") in ("effective-spin", "precessing-spin"):
+                spec["spin_chart"] = spin_chart
     return reps
 
 

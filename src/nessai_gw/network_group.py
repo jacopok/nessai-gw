@@ -817,6 +817,8 @@ def network_group_reparameterisations(
     waveform_phase=None,
     network_amplitudes=False,
     observed_phase=None,
+    chirp_distance_response="loudest",
+    spin_chart="effective",
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -900,6 +902,14 @@ def network_group_reparameterisations(
         the sky's ``psi*(n)`` out of ``psi``.  Both predictions are unchanged
         by the quarter turn, so the group action is the same.  Not with
         ``network_amplitudes``.  Default None.
+    chirp_distance_response : {"loudest", "network"}, optional
+        The chirp distance's response, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`
+        (``"network"``: over the sites' tensors).  Default ``"loudest"``.
+    spin_chart : {"effective", "spin-orbit"}, optional
+        The aligned-spin chart, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
+        Default ``"effective"``.
     """
     if network_amplitudes and observed_phase is not None:
         raise ValueError("observed_phase is not for network_amplitudes")
@@ -912,6 +922,7 @@ def network_group_reparameterisations(
             doppler_vector=doppler_vector,
             time_reference_frequency=time_reference_frequency,
             time_to_merger=time_to_merger, waveform_phase=waveform_phase,
+            spin_chart=spin_chart,
         )
     reps = triangular_group_reparameterisations(
         sampling_parameters,
@@ -927,6 +938,8 @@ def network_group_reparameterisations(
         time_to_merger=time_to_merger,
         chirp_distance_inversion=chirp_distance_inversion,
         waveform_phase=waveform_phase,
+        chirp_distance_response=chirp_distance_response,
+        spin_chart=spin_chart,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,

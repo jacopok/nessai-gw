@@ -1451,6 +1451,96 @@ def test_triangular_group_reparameterisations_precessing_spin(option, coordinate
         )
 
 
+def test_chirp_distance_response_and_spin_chart_specs():
+    """The specs carry ``response`` / ``spin_chart`` only when asked for."""
+    kwargs = dict(chirp_distance=True, chirp_distance_k0=0, precessing_spin=True)
+    default = triangular_group_reparameterisations(
+        PRECESSING_PARAMETERS, REFERENCE_TIME, **kwargs)
+    assert "response" not in default["luminosity_distance"]
+    assert "spin_chart" not in default["a_1"]
+    reps = triangular_group_reparameterisations(
+        PRECESSING_PARAMETERS, REFERENCE_TIME, chirp_distance_response="network",
+        spin_chart="spin-orbit", **kwargs)
+    assert reps["luminosity_distance"]["response"] == "network"
+    assert reps["a_1"]["spin_chart"] == "spin-orbit"
+    # nothing else changes
+    for spec in (reps["luminosity_distance"], reps["a_1"]):
+        spec.pop("response", None), spec.pop("spin_chart", None)
+    assert reps.keys() == default.keys()
+    assert all(
+        np.array_equal(v, default[name][k]) if isinstance(v, np.ndarray)
+        else v == default[name][k]
+        for name, spec in reps.items() for k, v in spec.items()
+    )
+    aligned = triangular_group_reparameterisations(
+        BNS_PARAMETERS, REFERENCE_TIME, effective_spin="tabulated",
+        spin_chart="spin-orbit")
+    assert aligned["chi_1"]["spin_chart"] == "spin-orbit"
+    with pytest.raises(ValueError, match="chirp_distance_response"):
+        triangular_group_reparameterisations(
+            PRECESSING_PARAMETERS, REFERENCE_TIME, chirp_distance_response="nearest",
+            **kwargs)
+    with pytest.raises(ValueError, match="spin_chart"):
+        triangular_group_reparameterisations(
+            PRECESSING_PARAMETERS, REFERENCE_TIME, spin_chart="chi_eff", **kwargs)
+
+
+def test_proposal_with_network_response_and_spin_orbit_chart(tmp_path):
+    """A proposal built from the specs has the network response and the
+    spin-orbit chart, and maps the prior's points there and back."""
+    from nessai.model import Model
+
+    from nessai_gw.reparameterisations.chirp_distance import (
+        ChirpDistanceReparameterisation)
+    from nessai_gw.reparameterisations.spin import PrecessingSpinReparameterisation
+
+    bounds = {
+        "chirp_mass": (1.19, 1.21), "mass_ratio": (0.5, 1.0),
+        "luminosity_distance": (1.0, 1000.0), "theta_jn": (0.0, np.pi),
+        "psi": (0.0, np.pi), "phase": (0.0, 2 * np.pi), "ra": (0.0, 2 * np.pi),
+        "dec": (-np.pi / 2, np.pi / 2),
+        "geocent_time": (REFERENCE_TIME - 0.1, REFERENCE_TIME + 0.1),
+        "a_1": (0.0, 0.05), "tilt_1": (0.0, np.pi), "a_2": (0.0, 0.05),
+        "tilt_2": (0.0, np.pi), "phi_12": (0.0, 2 * np.pi), "phi_jl": (0.0, 2 * np.pi),
+    }
+    names = list(bounds)
+
+    class _StubModel(Model):
+        def __init__(self):
+            self.names = names
+            self.bounds = {k: np.asarray(v) for k, v in bounds.items()}
+            self.rng = np.random.default_rng(3)
+
+        def log_prior(self, x):
+            return np.log(self.in_bounds(x), dtype=float)
+
+        def log_likelihood(self, x):
+            return np.zeros(len(np.atleast_1d(x)))
+
+    kwargs = dict(chirp_distance=True, chirp_distance_k0=0, precessing_spin=True)
+    cls = make_et_group_flow_proposal(names, REFERENCE_TIME, n_clusters_max=1, **kwargs)
+    proposal = cls(
+        _StubModel(), output=str(tmp_path), poolsize=100,
+        reparameterisations=triangular_group_reparameterisations(
+            names, REFERENCE_TIME, chirp_distance_response="network",
+            spin_chart="spin-orbit", **kwargs),
+        # the cogwheel angles are circular dimensions of the flow
+        flow_config={"ftype": "circular", "real_transform": "affine", "n_blocks": 1,
+                     "n_neurons": 4, "n_layers": 1},
+    )
+    proposal.initialise()
+    reparams = list(proposal._reparameterisation.values())
+    (distance,) = [r for r in reparams if isinstance(r, ChirpDistanceReparameterisation)]
+    (spins,) = [r for r in reparams if isinstance(r, PrecessingSpinReparameterisation)]
+    assert distance.response == "network"
+    assert spins.spin_chart == "spin-orbit"
+    x = proposal.model.new_point(N=50)
+    x_prime, _ = proposal.rescale(x)
+    back, _ = proposal.inverse_rescale(x_prime)
+    for name in names:  # the points first, then any mirror copies
+        np.testing.assert_allclose(back[name][:len(x)], x[name], rtol=1e-8, atol=1e-10)
+
+
 def test_cogwheel_spins_need_theta_jn():
     without = [n for n in PRECESSING_PARAMETERS if n != "theta_jn"]
     with pytest.raises(ValueError, match="theta_jn"):

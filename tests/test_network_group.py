@@ -609,6 +609,19 @@ def test_reparameterisations_default_to_effective_spin(geometry):
     assert off["chi_1"] == off["chi_2"] == {"reparameterisation": "aligned-spin"}
 
 
+def test_reparameterisations_network_response_and_spin_chart(geometry):
+    """Passed through to the chirp-distance and effective-spin specs."""
+    reps = network_group_reparameterisations(
+        PARAMETERS, geometry, effective_spin="tabulated",
+        chirp_distance_response="network", spin_chart="spin-orbit")
+    assert reps["luminosity_distance"]["response"] == "network"
+    np.testing.assert_array_equal(reps["luminosity_distance"]["tensors"], TENSORS)
+    assert reps["chi_1"]["spin_chart"] == "spin-orbit"
+    default = network_group_reparameterisations(PARAMETERS, geometry)
+    assert "response" not in default["luminosity_distance"]
+    assert "spin_chart" not in default["chi_1"]
+
+
 def test_chirp_distance_needs_tensors():
     geo = DetectorNetworkGeometry([IT, DE], [30.0, 40.0], REFERENCE_TIME)
     with pytest.raises(ValueError, match="detector tensors"):
