@@ -276,6 +276,10 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     rank_gaussian_params = ("chirp_distance",)
     #: A new line replaces the active one only if it beats it by this much.
     refit_margin = 0.05
+    #: A side whose share of the points fell below this fraction of its share
+    #: when the line was last fitted is shrinking: a new line may not raise
+    #: its share (:meth:`_refit_allowed`).  ``None`` disables the check.
+    refit_shrinking_ratio = 0.75
     #: Minimum fraction of points on each side to activate.
     activate_fraction = MIN_BRANCH_FRACTION
     #: Once active, the split collapses when either side falls below this.
@@ -342,8 +346,8 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     #: version did).
     #:
     #: Checked every clustering round, per active expert, against a
-    #: running high-water mark of that expert's own population size since
-    #: its last reset (:meth:`_maybe_reset_shrunk_experts`); tripping the
+    #: running high-water mark of that expert's own share of the training
+    #: rows since its last reset (:meth:`_maybe_reset_shrunk_experts`); tripping the
     #: factor reinitialises that expert's flow weights (and its canonical
     #: standardisation) so its next few training rounds rebuild density
     #: from only the live points it actually owns now, instead of carrying
@@ -352,16 +356,50 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
     #: over, not stale unmatched density.
     reset_shrink_factor = 2.0
 
+    #: Set by the sampler before a training (or by hand) to keep the split
+    #: line and the experts' weights as they are for one clustering round:
+    #: no refit of the line, no shrink reset.  Used to retry a training whose
+    #: result was discarded (nessai's training guard) without repeating the
+    #: change that made it worse.  Cleared by :meth:`_cluster`.
+    hold_structure = False
+    #: Whether the last clustering round reset an expert, moved the line or
+    #: changed the number of experts (read by the sampler's guard).
+    structure_changed = False
+
     def _cluster(self, x):
-        labels = super()._cluster(x)
-        self._maybe_reset_shrunk_experts(labels)
+        k_before = int(self._n_active.item())
+        line_before = (
+            self._split_normal.clone(),
+            self._split_offset.clone(),
+        )
+        self._expert_was_reset = False
+        try:
+            labels = super()._cluster(x)
+            self._maybe_reset_shrunk_experts(labels)
+        finally:
+            self.hold_structure = False
+        k = int(self._n_active.item())
+        moved = k >= 2 and not (
+            torch.equal(line_before[0], self._split_normal)
+            and torch.equal(line_before[1], self._split_offset)
+        )
+        self.structure_changed = bool(
+            self._expert_was_reset or k != k_before or moved
+        )
         return labels
 
     def _maybe_reset_shrunk_experts(self, labels):
-        """Reset any active expert whose live population has shrunk more
-        than :attr:`reset_shrink_factor` since its own high-water mark (see
-        that attribute's docstring for why). ``labels`` is this round's
-        per-row expert assignment, as returned by :meth:`_cluster`.
+        """Reset any active expert whose share of the training rows has
+        shrunk more than :attr:`reset_shrink_factor` since its own high-water
+        mark (see that attribute's docstring for why). ``labels`` is this
+        round's per-row expert assignment, as returned by :meth:`_cluster`.
+
+        Shares, not counts: the rows sometimes carry mirror copies of the
+        live points (boundary inversion with duplication) and sometimes not,
+        which halves every count at once.  The marks restart when the number
+        of active experts changes, so switching the split on (the single
+        expert going from all the rows to its side of the line) is not a
+        shrink.
         """
         if self.reset_shrink_factor is None:
             return
@@ -369,17 +407,23 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         if k < 1:
             return
         ref = getattr(self, "_expert_ref_size", None)
-        if ref is None or len(ref) != self.n_experts:
+        if (
+            ref is None
+            or len(ref) != self.n_experts
+            or getattr(self, "_expert_ref_k", None) != k
+        ):
             # Not a buffer: a resume restarts high-water tracking, which
             # only delays detecting a shrink that happened within the gap.
             ref = np.zeros(self.n_experts)
             self._expert_ref_size = ref
+            self._expert_ref_k = k
 
         counts = np.bincount(
             labels.detach().cpu().numpy(), minlength=self.n_experts
         )
+        total = max(float(counts.sum()), 1.0)
         for j in range(k):
-            n_j = float(counts[j])
+            n_j = float(counts[j]) / total
             keeps_warm = getattr(self, "keeps_warm", None)
             if (
                 n_j <= 0
@@ -393,6 +437,8 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
                 ref[j] = n_j
                 continue
             ref[j] = max(ref[j], n_j)
+            if self.hold_structure:
+                continue
             if n_j * self.reset_shrink_factor < ref[j]:
                 expert = self.experts[j]
                 expert.apply(reset_weights)
@@ -403,12 +449,13 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
                 if trained is not None:
                     # a fresh flow: it must train before it may freeze
                     trained[j] = False
+                self._expert_was_reset = True
                 logger.info(
-                    "DiagonalSplitClusterWrapper: expert %d population "
-                    "shrank %.0f -> %.0f (>%gx since its last reset) -- "
-                    "resetting its flow weights so it rebuilds density "
-                    "from its current live points instead of carrying "
-                    "forward a wider ancestor",
+                    "DiagonalSplitClusterWrapper: expert %d share of the "
+                    "training rows shrank %.3f -> %.3f (>%gx since its last "
+                    "reset) -- resetting its flow weights so it rebuilds "
+                    "density from its current live points instead of "
+                    "carrying forward a wider ancestor",
                     j,
                     ref[j],
                     n_j,
@@ -462,6 +509,47 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
             self._split_offset.fill_(fit["offset"])
             self._split_fitted.fill_(True)
 
+    def _refit_allowed(self, frac, fit):
+        """Whether ``fit`` may replace the active line, ``frac`` being the
+        clump side's current share under the active line.
+
+        Not while :attr:`hold_structure` is set, and not if it hands points
+        back to a shrinking side: one whose share fell below
+        :attr:`refit_shrinking_ratio` times its share when the line was last
+        fitted.  That side is leaving the likelihood contour, and a line
+        moved to refill it gives its expert, fitted to a narrow mode, a
+        slice of the other side to cover.  Moving the line further into a
+        shrinking side stays allowed.
+        """
+        if self.hold_structure:
+            return False
+        ratio = self.refit_shrinking_ratio
+        frac0 = getattr(self, "_split_fit_fraction", None)
+        if frac0 is None:
+            # not a buffer: after a resume the reference is the first share
+            # seen, which only delays noticing a side that is shrinking
+            self._split_fit_fraction = frac
+            return True
+        if ratio is None:
+            return True
+        new = fit["fraction"]
+        for now, then, after in (
+            (frac, frac0, new),
+            (1.0 - frac, 1.0 - frac0, 1.0 - new),
+        ):
+            if now < ratio * then and after > now:
+                logger.info(
+                    "Diagonal split: keeping the line -- a side's share "
+                    "fell %.3f -> %.3f since the line was fitted and the "
+                    "new fit (gain %.2f) would raise it to %.3f",
+                    then,
+                    now,
+                    fit["gain"],
+                    after,
+                )
+                return False
+        return True
+
     def _k_want(self, t, ts, mu, sd):
         """2 while a two-expert split pays for itself, else 1 (see the class
         docstring)."""
@@ -474,6 +562,9 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         active = (
             bool(self._clustering_seen) and int(self._n_active.item()) >= 2
         )
+
+        if self.hold_structure and bool(self._split_fitted):
+            return 2 if active else 1
 
         c, v = self._split_coords(t)
         t_gauss = self._gaussian_frame(t)
@@ -501,8 +592,14 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
         if fit is not None and not dying and (
             not active or fit["gain"] > cur_gain + self.refit_margin
         ):
-            self._store_split(fit)
-            cur_gain = fit["gain"]
+            if (
+                not active
+                or not bool(self._split_fitted)
+                or self._refit_allowed(float(cur_lab.mean()), fit)
+            ):
+                self._store_split(fit)
+                self._split_fit_fraction = fit["fraction"]
+                cur_gain = fit["gain"]
         if not bool(self._split_fitted):
             return 1
 

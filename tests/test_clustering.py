@@ -337,21 +337,84 @@ class _ResettableStub(torch.nn.Module):
         pass
 
 
-def test_shrink_reset_skips_frozen_experts():
+def _shrink_wrapper(k=2, ref=(1.0, 1.0)):
     cls = type("W", (DiagonalSplitClusterWrapper,), {})
     w = cls([_ResettableStub(), _ResettableStub()], 4, freeze_min_size=50)
-    w._n_active.fill_(2)
-    w._expert_ref_size = np.array([400.0, 400.0])
-    w._frozen[0] = True
+    w._n_active.fill_(k)
+    if ref is not None:
+        w._expert_ref_size = np.array(ref, dtype=float)
+        w._expert_ref_k = k
     if hasattr(w, "_trained"):
         w._trained.fill_(True)
-    labels = torch.as_tensor(np.r_[np.zeros(20), np.ones(100)].astype(int))
-    w._maybe_reset_shrunk_experts(labels)
+    return w
+
+
+def _labels(n0, n1):
+    return torch.as_tensor(np.r_[np.zeros(n0), np.ones(n1)].astype(int))
+
+
+def test_shrink_reset_skips_frozen_experts():
+    w = _shrink_wrapper(ref=(0.9, 0.9))
+    w._frozen[0] = True
+    w._maybe_reset_shrunk_experts(_labels(80, 20))
     assert bool(w.experts[0]._canon_seen.all())       # frozen: untouched
-    assert not bool(w.experts[1]._canon_seen.any())   # 400 -> 100: reset
+    assert not bool(w.experts[1]._canon_seen.any())   # 0.9 -> 0.2: reset
     if hasattr(w, "_trained"):
         # a reset expert must train again before it may be frozen
         assert bool(w._trained[0]) and not bool(w._trained[1])
+
+
+def test_shrink_reset_ignores_mirror_copies():
+    """The reference is a share of the rows: dropping the mirror copies
+    (every count halved) is not a shrink."""
+    w = _shrink_wrapper(ref=None)
+    w._maybe_reset_shrunk_experts(_labels(6000, 9000))
+    w._maybe_reset_shrunk_experts(_labels(3000, 4500))
+    assert all(bool(e._canon_seen.all()) for e in w.experts)
+    np.testing.assert_allclose(w._expert_ref_size, [0.4, 0.6])
+
+
+def test_shrink_reset_restarts_when_the_split_switches_on():
+    w = _shrink_wrapper(k=1, ref=None)
+    w._maybe_reset_shrunk_experts(_labels(15000, 0))
+    w._n_active.fill_(2)
+    w._maybe_reset_shrunk_experts(_labels(4000, 11000))
+    assert all(bool(e._canon_seen.all()) for e in w.experts)
+    np.testing.assert_allclose(w._expert_ref_size, [4 / 15, 11 / 15])
+    # a real shrink of expert 0 since then still resets it
+    w._maybe_reset_shrunk_experts(_labels(1500, 13500))
+    assert not bool(w.experts[0]._canon_seen.any())
+    assert bool(w.experts[1]._canon_seen.all())
+    assert w._expert_was_reset
+
+
+def test_shrink_reset_held():
+    w = _shrink_wrapper(ref=(0.9, 0.9))
+    w.hold_structure = True
+    w._maybe_reset_shrunk_experts(_labels(80, 20))
+    assert all(bool(e._canon_seen.all()) for e in w.experts)
+
+
+def test_refit_not_into_a_shrinking_side():
+    w = _shrink_wrapper()
+    w._split_fit_fraction = 0.47
+    fit = dict(fraction=0.26, gain=1.0)
+    # clump side fell 0.47 -> 0.15: a line raising it to 0.26 is refused,
+    assert not w._refit_allowed(0.15, fit)
+    # one moving further into it is not,
+    assert w._refit_allowed(0.15, dict(fraction=0.10, gain=1.0))
+    # nor is any line while the side holds its share
+    assert w._refit_allowed(0.40, fit)
+    # the other side shrinking: same rule, mirrored
+    w._split_fit_fraction = 0.5
+    assert not w._refit_allowed(0.8, dict(fraction=0.7, gain=1.0))
+    assert w._refit_allowed(0.8, dict(fraction=0.9, gain=1.0))
+    w.hold_structure = True
+    assert not w._refit_allowed(0.5, dict(fraction=0.5, gain=1.0))
+    w.hold_structure = False
+    w.refit_shrinking_ratio = None
+    w._split_fit_fraction = 0.47
+    assert w._refit_allowed(0.15, fit)
 
 
 def test_make_diagonal_split_cluster_flow_forwards_freeze_options():

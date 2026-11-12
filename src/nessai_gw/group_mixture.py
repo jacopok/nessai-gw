@@ -3413,6 +3413,19 @@ def _make_group_proposal_class(
                 )
             super().add_default_reparameterisations()
 
+        def _shared_training_state(self):
+            """The fits held by shared objects (sheet, ellipse), which a copy
+            of the reparameterisations does not keep."""
+            from ._ellipse import shared_state
+
+            reps = getattr(self, "_reparameterisation", None) or {}
+            return shared_state(reps.values())
+
+        def _restore_shared_training_state(self, state):
+            from ._ellipse import restore_shared_state
+
+            restore_shared_state(state)
+
         def _realign_prime_space_action(self):
             """Realign the prime-space action and model to nessai's actual
             prime parameter order (do not assume the reparameterisation-dict

@@ -53,6 +53,8 @@ the samples is indistinguishable.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import numpy as np
 
 from ._geometry import greenwich_mean_sidereal_time
@@ -872,3 +874,27 @@ class ResponseFit:
         r_sum = r_psi + x["phase"] - self.phase(x["ra"], x["dec"], c, x["psi"])
         self.offset_psi = float((np.angle(np.mean(np.exp(4j * r_psi))) - np.pi) / 4.0)
         self.offset_sum = float((np.angle(np.mean(np.exp(2j * r_sum))) - np.pi) / 2.0)
+
+
+#: The classes whose instances are shared (a deep copy is the instance).
+SHARED = (PolarisationEllipse, SheetPhase, ObservedPhase, ResponseFit)
+
+
+def shared_state(holders):
+    """The shared instances among the attributes of ``holders`` (and of those
+    instances), each with a copy of its attributes: a deep copy of a holder
+    does not keep what a later fit changes in them."""
+    found, stack = {}, list(holders)
+    while stack:
+        for v in vars(stack.pop()).values():
+            if isinstance(v, SHARED) and id(v) not in found:
+                found[id(v)] = (v, {k: deepcopy(a) for k, a in vars(v).items()})
+                stack.append(v)
+    return list(found.values())
+
+
+def restore_shared_state(state):
+    """Put back the attributes kept by :func:`shared_state`."""
+    for obj, attrs in state:
+        obj.__dict__.clear()
+        obj.__dict__.update(attrs)

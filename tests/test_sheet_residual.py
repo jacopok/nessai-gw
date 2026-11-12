@@ -869,3 +869,26 @@ def test_response_fit_finite_on_the_detector_plane():
         psi, _ = rf.predict_torch(torch.as_tensor(ra, dtype=dtype),
                                   torch.as_tensor(np.sin(dec), dtype=dtype))
         assert torch.all(torch.isfinite(psi))
+
+
+def test_shared_state_restores_a_refitted_sheet():
+    """A deep copy of the holder shares the sheet: its fit is kept apart."""
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from nessai_gw._ellipse import restore_shared_state, shared_state
+
+    ellipse = PolarisationEllipse(
+        ET_EMR_PLANE_NORMAL, 1e9,
+        dict(ra=1.0, dec=0.3, theta_jn=0.5, psi=0.4),
+    )
+    holder = SimpleNamespace(sheet=SheetPhase(ellipse), other=3)
+    assert deepcopy(holder).sheet is holder.sheet
+    state = shared_state([holder])
+    assert {id(o) for o, _ in state} == {id(holder.sheet), id(ellipse)}
+    holder.sheet.offset_psi = 0.2
+    ellipse.width_knots_s = np.array([2.0, 2.0])
+    restore_shared_state(state)
+    assert holder.sheet.offset_psi == 0.0
+    assert holder.sheet.ellipse is ellipse
+    assert not np.array_equal(ellipse.width_knots_s, [2.0, 2.0])
