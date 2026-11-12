@@ -956,12 +956,20 @@ def test_amplitude_proposal_initialise_train_and_draw(geometry, tmp_path):
     x_prime, log_j = proposal.rescale(live)
     back, log_j_inv = proposal.inverse_rescale(x_prime)
     n = len(live)
-    # within ~0.01 of face-on/off the amplitudes depend on theta_jn only at
-    # fourth order and the inverse loses its digits
-    ok = np.abs(np.sin(live["theta_jn"])) > 0.01
-    for name in ("luminosity_distance", "theta_jn", "ra", "dec"):
+    # near face-on/off the amplitudes depend on theta_jn only at fourth
+    # order: the inverse loses its digits as sin(theta_jn)^-4 (measured: up to
+    # 1e-12 of them, relative; the amplitudes themselves round-trip to 1e-13,
+    # so the waveform at the point returned is the right one), and the
+    # Jacobian, evaluated there, follows
+    sin = np.abs(np.sin(live["theta_jn"]))
+    ok = sin > 0.01
+    lost = 1e-11 / sin[ok] ** 4
+    for name in ("luminosity_distance", "ra", "dec"):
         np.testing.assert_allclose(back[name][:n][ok], live[name][ok], rtol=1e-7)
-    np.testing.assert_allclose(log_j[:n][ok], -log_j_inv[:n][ok], atol=1e-6)
+    error = np.abs(back["theta_jn"][:n][ok] / live["theta_jn"][ok] - 1)
+    assert np.all(error < np.maximum(1e-7, lost))
+    error = np.abs(log_j[:n][ok] + log_j_inv[:n][ok])
+    assert np.all(error < np.maximum(1e-6, 10 * lost))
     proposal.train(live)
     worst = live[:1].copy()
     worst["logL"] = -np.inf
