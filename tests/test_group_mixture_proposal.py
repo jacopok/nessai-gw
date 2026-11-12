@@ -1105,13 +1105,9 @@ def test_et_proposal_with_chirp_distance_and_effective_spin(tmp_path):
 
 
 @requires_group_mixture
-def test_reference_epoch_moves_every_frame(tmp_path):
-    """With ``reference_epoch``, the epoch moves to where the training
-    points' amplitude is sharpest; the sky frame, the group's frame, the
-    chirp distance and the detector-centre time all follow it, the rescaling
-    still round-trips, and the group's images keep the luminosity distance
-    and the detector-centre time (the coordinates stay invariant) in the new
-    frame."""
+def _reference_epoch_proposal(tmp_path):
+    """A proposal with ``reference_epoch`` at the merger, and live points
+    whose amplitude is sharpest 5 h before it."""
     from nessai.livepoint import numpy_array_to_live_points
     from nessai.model import Model
 
@@ -1181,6 +1177,26 @@ def test_reference_epoch_moves_every_frame(tmp_path):
         50.0 * live["chirp_mass"] ** (5 / 6) * r
         * np.exp(0.05 * rng.standard_normal(n))
     )
+    return proposal, live, bounds, names, _StubModel
+
+
+def test_reference_epoch_moves_every_frame(tmp_path):
+    """With ``reference_epoch``, the epoch moves to where the training
+    points' amplitude is sharpest; the sky frame, the group's frame, the
+    chirp distance and the detector-centre time all follow it, the rescaling
+    still round-trips, and the group's images keep the luminosity distance
+    and the detector-centre time (the coordinates stay invariant) in the new
+    frame."""
+    from nessai_gw._geometry import geocenter_time_delay
+    from nessai_gw.group_mixture import ET_EMR_VERTEX
+
+    proposal, live, bounds, names, _StubModel = _reference_epoch_proposal(
+        tmp_path
+    )
+    epoch = proposal.reference_epoch
+    action = proposal.flow.model.prime_space_action
+    merger_gmst = action.sky_frame_merger_gmst
+    n = len(live)
     proposal.check_state(live)
     assert abs(epoch.hours - 5.0) < 0.1
     reps = proposal._reparameterisation
@@ -1690,3 +1706,51 @@ def test_prime_space_action_shifts_phi_jl(prime_points, phi_jl_names):
         back = action(mapped, modes, inverse=True)
         for name in phi_jl_names:
             assert torch.allclose(back[name], points[name], atol=1e-12)
+
+
+def test_reference_epoch_discarded_move(tmp_path):
+    """A training discarded by nessai's guard takes the move of the epoch
+    with it (every frame is back), the guard is told of the move, and the
+    retry it asks for (``hold_structure``) keeps the epoch and raises the
+    bar for the next move."""
+    from nessai.samplers.nestedsampler import NestedSampler
+
+    proposal, live, *_ = _reference_epoch_proposal(tmp_path)
+    epoch = proposal.reference_epoch
+    action = proposal.flow.model.prime_space_action
+    merger_gmst = action.sky_frame_merger_gmst
+    x_prime, _ = proposal.rescale(live)
+    prime = list(proposal.prime_parameters)
+
+    ns = object.__new__(NestedSampler)
+    snapshot = ns._training_snapshot(proposal)
+    proposal.check_state(live)
+    assert abs(epoch.hours - 5.0) < 0.1
+    assert proposal.structure_changed
+    assert proposal in ns._structure_holders(proposal)
+    ns._restore_training_snapshot(snapshot)
+    assert epoch.hours == 0.0
+    # one action, in the restored flow too, back at the merger's frame
+    assert proposal.flow.model.prime_space_action is action
+    assert action._action.gmst == pytest.approx(merger_gmst)
+    reps = proposal._reparameterisation
+    cd = next(v for v in reps.values() if hasattr(v, "log_spread"))
+    sky = next(v for v in reps.values() if hasattr(v, "set_rotation"))
+    assert cd.gmst == pytest.approx(merger_gmst)
+    np.testing.assert_allclose(sky._R, action.sky_frame_rotation)
+    x_prime_2, _ = proposal.rescale(live)
+    for k in prime:
+        np.testing.assert_array_equal(x_prime_2[k], x_prime[k])
+
+    # the retry: the epoch stays, and stays for the same points afterwards
+    proposal.hold_structure = True
+    proposal.check_state(live)
+    assert epoch.hours == 0.0
+    assert not proposal.structure_changed and not proposal.hold_structure
+    assert epoch.declined > epoch.tolerance
+    proposal.check_state(live)
+    assert epoch.hours == 0.0 and not proposal.structure_changed
+    # until the gain has grown past the declined one
+    epoch.declined *= 0.5
+    proposal.check_state(live)
+    assert abs(epoch.hours - 5.0) < 0.1 and epoch.declined == 0.0

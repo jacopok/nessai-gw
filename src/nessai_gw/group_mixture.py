@@ -799,6 +799,12 @@ class PrimeSpaceTriangularGroupAction:
         )
         self.bind(prime_names)
 
+    def __deepcopy__(self, memo):
+        # One action per proposal: the flow model holds it and the proposal
+        # moves its frame (reference epoch) and rebinds it, so a copy of the
+        # model (kept to undo a training or a reset) must not get its own.
+        return self
+
     def set_gmst(self, gmst):
         """Move the group's detector frame (and the flow's sky frame it
         decodes) to the Earth's orientation ``gmst``."""
@@ -1298,6 +1304,12 @@ class PrimeSpaceSkyGroupAction:
         self.bind(prime_names)
 
     @property
+    def __deepcopy__(self, memo):
+        # One action per proposal: the flow model holds it and the proposal
+        # moves its frame (reference epoch) and rebinds it, so a copy of the
+        # model (kept to undo a training or a reset) must not get its own.
+        return self
+
     def sky_frame_rotation(self):
         return self._action.sky_frame_rotation
 
@@ -3264,7 +3276,9 @@ class ReferenceEpoch:
     ``max_hours`` before it and refined between the neighbours of the best.
     It moves only when that lowers the spread by more than ``tolerance``
     (relative): every move changes the flow's coordinates, so the flow is
-    trained afresh.
+    trained afresh.  A move that is held back (``hold``: the training that
+    came with it was discarded by nessai's training guard) raises the bar:
+    the next needs its gain to have grown by ``tolerance`` again.
 
     Parameters
     ----------
@@ -3289,6 +3303,9 @@ class ReferenceEpoch:
         #: the current epoch, hours before the merger
         self.hours = 0.0
 
+    #: relative gain of the last move that was held back
+    declined = 0.0
+
     @property
     def gmst(self):
         return gmst_hours_before(self.merger_gmst, self.hours)
@@ -3296,9 +3313,10 @@ class ReferenceEpoch:
     def _gmsts(self, hours):
         return [gmst_hours_before(self.merger_gmst, h) for h in hours]
 
-    def choose(self, spread):
+    def choose(self, spread, hold=False):
         """Move to the epoch of least ``spread(gmsts) -> spreads``; returns
-        whether the epoch moved."""
+        whether the epoch moved.  With ``hold`` it stays, and a move that
+        would have been made is recorded as declined."""
         hours = np.linspace(0.0, self.max_hours, self.n_grid)
         s = np.asarray(spread(self._gmsts(hours)), dtype=float)
         if not np.isfinite(s).any():
@@ -3310,8 +3328,21 @@ class ReferenceEpoch:
         j = int(np.nanargmin(np.where(np.isfinite(sf), sf, np.nan)))
         best_hours, best = float(fine[j]), float(sf[j])
         current = float(np.asarray(spread([self.gmst]), dtype=float)[0])
-        moved = not current <= (1.0 + self.tolerance) * best
+        moved = not current <= (
+            1.0 + self.tolerance + self.declined
+        ) * best
+        if moved and hold:
+            self.declined = current / best - 1.0
+            logger.info(
+                "Reference epoch held at %.2f h before merger: the training "
+                "that moved it to %.2f h was discarded; it moves once the "
+                "log chirp-distance spread falls by more than %.3f "
+                "(relative)", self.hours, best_hours,
+                self.tolerance + self.declined,
+            )
+            return False
         if moved:
+            self.declined = 0.0
             logger.info(
                 "Reference epoch %.2f h before merger (was %.2f h): log "
                 "chirp-distance spread %.3f (%.3f at the previous epoch, "
@@ -3414,17 +3445,29 @@ def _make_group_proposal_class(
             super().add_default_reparameterisations()
 
         def _shared_training_state(self):
-            """The fits held by shared objects (sheet, ellipse), which a copy
-            of the reparameterisations does not keep."""
+            """What a copy of the flow and of the reparameterisations does
+            not keep: the fits held by shared objects (sheet, ellipse) and
+            the reference epoch."""
             from ._ellipse import shared_state
 
             reps = getattr(self, "_reparameterisation", None) or {}
-            return shared_state(reps.values())
+            epoch = getattr(self, "reference_epoch", None)
+            return (
+                shared_state(reps.values()),
+                None if epoch is None else epoch.hours,
+            )
 
         def _restore_shared_training_state(self, state):
             from ._ellipse import restore_shared_state
 
-            restore_shared_state(state)
+            shared, hours = state
+            restore_shared_state(shared)
+            epoch = getattr(self, "reference_epoch", None)
+            if epoch is not None and hours is not None:
+                # the action is not copied with the flow: back to the frame
+                # of the flow and reparameterisations that are restored
+                epoch.hours = hours
+                self._apply_reference_epoch()
 
         def _realign_prime_space_action(self):
             """Realign the prime-space action and model to nessai's actual
@@ -3519,19 +3562,32 @@ def _make_group_proposal_class(
             logger.info("Reference epoch moved: every expert retrained "
                         "from scratch")
 
+        #: Set by the sampler before a training (or by hand) to keep the
+        #: reference epoch for it (:meth:`ReferenceEpoch.choose`).  Used to
+        #: retry a training whose result was discarded (nessai's training
+        #: guard) without the move of the epoch, which trains every expert
+        #: afresh.  Cleared by :meth:`check_state`.
+        hold_structure = False
+        #: Whether the last training moved the reference epoch (read by the
+        #: sampler's guard).
+        structure_changed = False
+
         def check_state(self, x):
             """Choose the reference epoch on the training points before the
             reparameterisations update on them."""
+            hold, self.hold_structure = self.hold_structure, False
+            self.structure_changed = False
             epoch = getattr(self, "reference_epoch", None)
             if epoch is not None and len(x) > 1:
                 cd = next(
                     (r for r in self._reparameterisation.values()
                      if hasattr(r, "log_spread")), None)
                 if cd is not None and epoch.choose(
-                    lambda gmsts: cd.log_spread(x, gmsts)
+                    lambda gmsts: cd.log_spread(x, gmsts), hold=hold
                 ):
                     self._apply_reference_epoch()
                     self._reset_for_reference_epoch()
+                    self.structure_changed = True
             super().check_state(x)
 
         def reset_model_weights(self, **kwargs):
