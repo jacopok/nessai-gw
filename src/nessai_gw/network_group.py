@@ -819,6 +819,7 @@ def network_group_reparameterisations(
     observed_phase=None,
     chirp_distance_response="loudest",
     spin_chart="effective",
+    fixed_sky=None,
 ):
     """``reparameterisations`` dict for :func:`make_network_group_flow_proposal`.
 
@@ -910,9 +911,15 @@ def network_group_reparameterisations(
         The aligned-spin chart, as in
         :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
         Default ``"effective"``.
+    fixed_sky : (float, float), optional
+        ``(ra, dec)`` of a sky that is not sampled, for the detector-centre
+        time's delay, as in
+        :func:`~nessai_gw.group_mixture.triangular_group_reparameterisations`.
     """
     if network_amplitudes and observed_phase is not None:
         raise ValueError("observed_phase is not for network_amplitudes")
+    if network_amplitudes and fixed_sky is not None:
+        raise ValueError("fixed_sky is not for network_amplitudes")
     if network_amplitudes:
         return _network_amplitude_reparameterisations(
             sampling_parameters, geometry,
@@ -940,6 +947,7 @@ def network_group_reparameterisations(
         waveform_phase=waveform_phase,
         chirp_distance_response=chirp_distance_response,
         spin_chart=spin_chart,
+        fixed_sky=fixed_sky,
         **_chirp_distance_kwargs(
             geometry,
             chirp_distance and "luminosity_distance" in sampling_parameters,
