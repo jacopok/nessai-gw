@@ -187,6 +187,10 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         read for ``time_to_merger`` (``None``: zero).
     correction_degree : int, optional
         Degree of the polynomial correction to 2PN (default 2).
+    fixed_sky : (float, float), optional
+        ``(ra, dec)`` of a sky that is not sampled (delta-function priors):
+        the delay (and the Doppler factor) at it, and ``ra``, ``dec`` not
+        required.  Default None: the point's own.
     prior : optional
         Accepted for registry compatibility and ignored.
     """
@@ -210,6 +214,7 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         time_to_merger=None,
         tides=("lambda_1", "lambda_2"),
         correction_degree=2,
+        fixed_sky=None,
         prior=None,
         rng=None,
         **kwargs,
@@ -253,7 +258,15 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         self.prime_parameters = ["t_det"]
         if hasattr(self, "output_parameters"):
             self.output_parameters = ["t_det"]
-        self.requires = ["ra", "dec"]
+        # a fixed sky (ra, dec): the delay and the Doppler factor at it,
+        # with ra and dec not sampled
+        self._fixed_sky = (
+            None if fixed_sky is None
+            else tuple(float(v) for v in fixed_sky)
+        )
+        if self._fixed_sky is not None and len(self._fixed_sky) != 2:
+            raise ValueError(f"`fixed_sky` must be (ra, dec); got {fixed_sky}")
+        self.requires = [] if self._fixed_sky is not None else ["ra", "dec"]
 
         self.adaptive = reference_frequency == "adaptive"
         self.frequency_range = tuple(float(f) for f in frequency_range)
@@ -324,10 +337,17 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         else:
             x[self._time] = t - self._origin_shift
 
+    def _sky(self, x):
+        """The point's (ra, dec), or the fixed sky's."""
+        if self._fixed_sky is not None:
+            return self._fixed_sky
+        return x["ra"], x["dec"]
+
     def _delay(self, x):
-        return geocenter_time_delay(
-            self._vertex, self._gmst, x["ra"], x["dec"]
-        )
+        delay = geocenter_time_delay(self._vertex, self._gmst, *self._sky(x))
+        if self._fixed_sky is not None:
+            delay = np.full(np.shape(x[self._time]), delay, dtype=float)
+        return delay
 
     def _params(self, x):
         """The intrinsic parameters ``tau`` depends on, as a dict of arrays
@@ -335,7 +355,7 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         chirp_mass = np.asarray(x[self._chirp_mass], dtype=float)
         if self.doppler_vector is not None:
             chirp_mass = chirp_mass * doppler_factor(
-                x["ra"], x["dec"], self.doppler_vector
+                *self._sky(x), self.doppler_vector
             )
         zeros = np.zeros_like(chirp_mass)
         params = dict(chirp_mass=chirp_mass,

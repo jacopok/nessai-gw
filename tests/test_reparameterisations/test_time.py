@@ -622,3 +622,58 @@ def test_triangular_wiring_time_to_merger():
     with pytest.raises(ValueError, match="time_to_merger needs"):
         triangular_group_reparameterisations(
             names, REFERENCE_TIME, time_to_merger="pkg.mod:fn")
+
+
+class TestFixedSky:
+    """A sky that is not sampled: the delay at ``fixed_sky``, as at a
+    sampled sky of the same (ra, dec)."""
+
+    prior_bounds = {"geocent_time": [REFERENCE_TIME - 0.1, REFERENCE_TIME + 0.1]}
+    sky = (3.44616, -0.408084)
+
+    def _reparam(self, fixed_sky=None):
+        return DetectorCenterTimeReparameterisation(
+            parameters="geocent_time", prior_bounds=self.prior_bounds,
+            vertex=ET_EMR_VERTEX, reference_time=REFERENCE_TIME, scale=SCALE,
+            fixed_sky=fixed_sky)
+
+    def test_requires_nothing(self):
+        assert self._reparam(self.sky).requires == []
+
+    def test_matches_sampled_sky(self):
+        rng = np.random.default_rng(2)
+        n = 20
+        gt = REFERENCE_TIME + rng.uniform(-0.05, 0.05, n)
+        ra, dec = np.full(n, self.sky[0]), np.full(n, self.sky[1])
+        out = {}
+        for fixed in (False, True):
+            reparam = self._reparam(self.sky if fixed else None)
+            names = ["geocent_time"] + ([] if fixed else ["ra", "dec"])
+            x = dict_to_live_points(
+                {"geocent_time": gt} | ({} if fixed else {"ra": ra, "dec": dec}))
+            x_prime = empty_structured_array(
+                n, names=["t_det"] + ([] if fixed else ["ra", "dec"]))
+            if not fixed:
+                x_prime["ra"], x_prime["dec"] = ra, dec
+            _, x_prime, log_j = reparam.reparameterise(x, x_prime, np.zeros(n))
+            back = empty_structured_array(n, names=names)
+            if not fixed:
+                back["ra"], back["dec"] = ra, dec
+            back, _, log_j_inv = reparam.inverse_reparameterise(
+                back, x_prime, np.zeros(n))
+            np.testing.assert_allclose(back["geocent_time"] - REFERENCE_TIME,
+                                       gt - REFERENCE_TIME, atol=1e-9)
+            out[fixed] = (x_prime["t_det"].copy(), log_j, log_j_inv)
+        for a, b in zip(out[False], out[True]):
+            np.testing.assert_allclose(a, b, atol=1e-12)
+
+    def test_network_profile_without_sky(self):
+        from nessai_gw.group_mixture import triangular_group_reparameterisations
+        names = ["chirp_mass", "mass_ratio", "geocent_time", "psi", "phase", "theta_jn"]
+        reps = triangular_group_reparameterisations(
+            names, REFERENCE_TIME, vertex=ET_EMR_VERTEX, fixed_sky=self.sky)
+        assert reps["geocent_time"]["fixed_sky"] == list(self.sky)
+        with pytest.raises(ValueError, match="fixed_sky with"):
+            triangular_group_reparameterisations(
+                names + ["ra", "dec"], REFERENCE_TIME, vertex=ET_EMR_VERTEX,
+                fixed_sky=self.sky)

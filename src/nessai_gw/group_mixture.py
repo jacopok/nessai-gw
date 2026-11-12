@@ -2344,6 +2344,7 @@ def triangular_group_reparameterisations(
     sheet_phase=None,
     chirp_distance_response="loudest",
     spin_chart="effective",
+    fixed_sky=None,
 ):
     """Reparameterisation overrides that keep the acted parameters isometric.
 
@@ -2572,6 +2573,10 @@ def triangular_group_reparameterisations(
         With ``amplitudes``: the ``(3, 3, 3)`` tensors of the triangle (its
         A and E channels are used) or ``(2, 3, 3)`` of two sites.  Defaults
         to :data:`ET_EMR_DETECTOR_TENSORS`.
+    fixed_sky : (float, float), optional
+        ``(ra, dec)`` of a sky that is not sampled (``ra`` and ``dec`` not in
+        ``sampling_parameters``): the detector-centre time's delay at it.
+        Needed for the time then; default None.
 
     Returns
     -------
@@ -2691,6 +2696,8 @@ def triangular_group_reparameterisations(
     # ``polarisation-phase`` needs, so it has to sit between the two.
     # the coalescence time: bilby's GPS time or its offset from an origin
     time_name = _time_parameter(sampling_parameters)
+    if fixed_sky is not None and {"ra", "dec"} & set(sampling_parameters):
+        raise ValueError("fixed_sky with 'ra' and 'dec' sampled")
     _rank = {"phase": 0, time_name: 0}
     if polarisation_ellipse is not None:
         _rank[time_name] = 1
@@ -2832,6 +2839,8 @@ def triangular_group_reparameterisations(
                 "reference_time": float(reference_time),
                 "scale": _GEOCENT_SCALE,
             }
+            if fixed_sky is not None:
+                reps[name]["fixed_sky"] = [float(v) for v in fixed_sky]
             if time_reference_frequency is not None:
                 reps[name]["reference_frequency"] = (
                     "adaptive" if time_reference_frequency == "adaptive"
@@ -3090,6 +3099,11 @@ def _prime_parameter_names(
                 chirp_distance_inversion=chirp_distance_inversion,
                 waveform_phase=waveform_phase,
                 sheet_phase=sheet_phase,
+                # a sky that is not sampled: only the names are read back,
+                # so any (ra, dec) will do
+                fixed_sky=(
+                    None if {"ra", "dec"} & set(names) else (0.0, 0.0)
+                ),
             ),
             fallback_reparameterisation="zscore",
         )
