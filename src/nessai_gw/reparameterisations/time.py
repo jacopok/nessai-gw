@@ -337,15 +337,21 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         else:
             x[self._time] = t - self._origin_shift
 
+    @property
+    def _fixed(self):
+        """The fixed sky, or None; None for a reparameterisation pickled
+        before ``fixed_sky`` existed (a resumed run's)."""
+        return getattr(self, "_fixed_sky", None)
+
     def _sky(self, x):
         """The point's (ra, dec), or the fixed sky's."""
-        if self._fixed_sky is not None:
-            return self._fixed_sky
+        if self._fixed is not None:
+            return self._fixed
         return x["ra"], x["dec"]
 
     def _delay(self, x):
         delay = geocenter_time_delay(self._vertex, self._gmst, *self._sky(x))
-        if self._fixed_sky is not None:
+        if self._fixed is not None:
             delay = np.full(np.shape(x[self._time]), delay, dtype=float)
         return delay
 
