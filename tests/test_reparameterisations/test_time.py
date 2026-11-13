@@ -677,3 +677,18 @@ class TestFixedSky:
             triangular_group_reparameterisations(
                 names + ["ra", "dec"], REFERENCE_TIME, vertex=ET_EMR_VERTEX,
                 fixed_sky=self.sky)
+
+
+def test_pickled_before_fixed_sky():
+    """A reparameterisation pickled before ``fixed_sky`` existed (no
+    ``_fixed_sky`` attribute) still evaluates: a resumed run's."""
+    reparam = DetectorCenterTimeReparameterisation(
+        parameters="geocent_time",
+        prior_bounds={"geocent_time": [REFERENCE_TIME - 0.1, REFERENCE_TIME + 0.1]},
+        vertex=ET_EMR_VERTEX, reference_time=REFERENCE_TIME, scale=SCALE)
+    del reparam.__dict__["_fixed_sky"]
+    x = dict_to_live_points({"geocent_time": np.array([REFERENCE_TIME + 0.01]),
+                             "ra": np.array([1.0]), "dec": np.array([0.2])})
+    want = geocenter_time_delay(ET_EMR_VERTEX, greenwich_mean_sidereal_time(REFERENCE_TIME),
+                                1.0, 0.2)
+    np.testing.assert_allclose(reparam._delay(x), want)
