@@ -481,7 +481,7 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
                 j = int(np.nanargmin(fine_spreads))
                 previous = self.reference_frequency
                 self.reference_frequency = float(fine[j])
-                logger.info(
+                logger.debug(
                     "Arrival time measured at %.1f Hz (was %.1f Hz): spread "
                     "over the training points %.3g ms, %.3g ms at merger",
                     self.reference_frequency, previous,
@@ -518,7 +518,7 @@ class DetectorCenterTimeReparameterisation(Reparameterisation):
         beta, *_ = np.linalg.lstsq(design, target[ok], rcond=None)
         self._correction["beta"] = beta
         residual = target[ok] - design @ beta
-        logger.info(
+        logger.debug(
             "Arrival-time correction to 2PN at %.1f Hz from the waveform: "
             "spread %.3g ms, fit residual %.3g ms (%d terms)", f,
             1e3 * np.std(target[ok]), 1e3 * np.std(residual), len(beta),

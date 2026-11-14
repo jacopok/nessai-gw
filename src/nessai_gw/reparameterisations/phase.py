@@ -167,6 +167,20 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
     spins, tides : tuple of str or None, optional
         Names of the aligned spins and tidal deformabilities of the heavier
         and lighter mass (``None``: zero).
+    phase_offset : callable or str, optional
+        ``g(x) -> offset`` of shape ``(N,)``: an exact phase offset (rad)
+        added to ``delta_phase`` at every point, unlike the fitted
+        ``waveform_phase`` one (a ``"module:function"`` string is imported
+        when first needed and is what is pickled).  For a waveform whose
+        phase moves with parameters the fit does not see, as
+        mlgw_bns_precessing's with the in-plane spin directions
+        (``xg_pe.waveform_time:mlgw_bns_precessing_twist``).  It must depend
+        only on parameters the group leaves unchanged (or moves the phase by
+        constants), and on none the inverse pass has yet to produce from
+        ``delta_phase``.
+    phase_offset_parameters : sequence of str, optional
+        The x-space parameters ``phase_offset`` reads (added to
+        ``requires``).
     prior : optional
         Accepted for registry compatibility and ignored (the flow models the
         prime coordinate directly).
@@ -218,6 +232,8 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         mass_ratio="mass_ratio",
         spins=("chi_1", "chi_2"),
         tides=("lambda_1", "lambda_2"),
+        phase_offset=None,
+        phase_offset_parameters=(),
         prior=None,
         rng=None,
         **kwargs,
@@ -290,6 +306,7 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             self.requires += list(self._spins or []) + list(self._tides or [])
             if self.doppler_vector is not None:
                 self.requires += ["ra", "dec"]
+        self.set_phase_offset(phase_offset, phase_offset_parameters)
         if hasattr(self, "inverse_input_parameters"):
             self.inverse_input_parameters = list(
                 dict.fromkeys(
@@ -297,6 +314,41 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
                 )
             )
         self._log_j = float(np.log(self.scale / np.pi))
+
+    def set_phase_offset(self, phase_offset, parameters=()):
+        """Set (or, with None, remove) the exact ``phase_offset`` and the
+        parameters it reads; also on a resumed proposal (then the flow's
+        coordinate changes: retrain it)."""
+        self._phase_offset = phase_offset
+        self._phase_offset_fn = None
+        self._phase_offset_parameters = tuple(parameters) if phase_offset else ()
+        self.requires = list(dict.fromkeys(
+            list(self.requires) + list(self._phase_offset_parameters)))
+        if hasattr(self, "inverse_input_parameters"):
+            self.inverse_input_parameters = list(dict.fromkeys(
+                list(self.inverse_input_parameters or []) + self.requires))
+
+    def _offset_fn(self):
+        """The ``phase_offset`` function, imported if given by name."""
+        spec = getattr(self, "_phase_offset", None)
+        if spec is None:
+            return None
+        if getattr(self, "_phase_offset_fn", None) is None:
+            if callable(spec):
+                self._phase_offset_fn = spec
+            else:
+                module, _, name = str(spec).partition(":")
+                # unlike waveform_phase, not optional: the coordinate is
+                # defined with it
+                self._phase_offset_fn = getattr(importlib.import_module(module), name)
+        return self._phase_offset_fn
+
+    def _exact_offset(self, x):
+        """``phase_offset(x)`` (0 without one)."""
+        fn = self._offset_fn()
+        if fn is None or not len(x):
+            return 0.0
+        return np.asarray(fn(x), dtype=float)
 
     @staticmethod
     def _psi_sign(x):
@@ -369,10 +421,11 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         return np.stack(columns, axis=1)
 
     def _shift(self, x):
-        """``a(theta) / 2``: what is added to the phase."""
+        """``a(theta) / 2 + phase_offset(x)``: what is added to the phase."""
+        exact = self._exact_offset(x)
         if getattr(self, "_offset", None) is None:
-            return 0.0
-        return 0.5 * (self._features(self._params(x)) @ self._offset["beta"])
+            return exact
+        return 0.5 * (self._features(self._params(x)) @ self._offset["beta"]) + exact
 
     def _concentration(self, angle):
         """Circular concentration of ``delta_phase`` at the first two
@@ -417,7 +470,7 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         if self._waveform() is None:
             return
         self.fit_offset(x, x["phase"] + self._psi_sign(x) * x["psi"]
-                        + self._observed_term(x))
+                        + self._observed_term(x) + self._exact_offset(x))
         if getattr(self, "_observed", None) is not None:
             self._refit_observed(x)
 
@@ -445,7 +498,7 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         n_terms = len(list(combinations_with_replacement(
             range(len(keys) + 1), self._correction_degree)))
         if len(x) < 2 * n_terms:
-            logger.info(
+            logger.debug(
                 "Phase measured at the merger (%d points for %d terms)",
                 len(x), n_terms,
             )
@@ -458,13 +511,13 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         design = self._features(params)
         beta, *_ = np.linalg.lstsq(design, target, rcond=None)
         self._offset["beta"] = beta
-        r_fit = float(self._concentration(base + self._shift(x)))
+        r_fit = float(self._concentration(base + self._shift(x) - self._exact_offset(x)))
         # compare circular variances 1 - R (~ sigma^2 / 2 when concentrated),
         # whose relative noise is ~ sqrt(2 / N) at any width: a difference of
         # R would call the two references equal once both are near 1
         gain = np.log(max(1.0 - r_merger, 1e-300) / max(1.0 - r_fit, 1e-300))
         if gain <= 4.0 * np.sqrt(2.0 / len(x)):
-            logger.info(
+            logger.debug(
                 "Phase measured at the merger (1 - concentration %.3g; %.3g "
                 "at %.1f Hz after the fit, log ratio %.3g <= %.3g)",
                 1.0 - r_merger, 1.0 - r_fit, freqs[i], gain,
@@ -474,7 +527,7 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             return
         self.reference_frequency = float(freqs[i])
         residual = target - design @ beta
-        logger.info(
+        logger.debug(
             "Phase measured at %.1f Hz: offset spread %.3g rad, fit residual "
             "%.3g rad (%d terms); 1 - concentration of delta_phase %.3g (%.3g "
             "at the merger)", self.reference_frequency, np.std(target),
@@ -507,6 +560,10 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
         if callable(state.get("_waveform_phase")):
             fn = state["_waveform_phase"]
             state["_waveform_phase"] = f"{fn.__module__}:{fn.__qualname__}"
+        state["_phase_offset_fn"] = None
+        if callable(state.get("_phase_offset")):
+            fn = state["_phase_offset"]
+            state["_phase_offset"] = f"{fn.__module__}:{fn.__qualname__}"
         return state
 
     def __setstate__(self, state):
@@ -518,6 +575,8 @@ class PolarisationPhaseReparameterisation(Reparameterisation):
             ("_mass_ratio", "mass_ratio"), ("_spins", ("chi_1", "chi_2")),
             ("_tides", ("lambda_1", "lambda_2")),
             ("reference_frequency", None), ("_offset", None), ("_observed", None),
+            ("_phase_offset", None), ("_phase_offset_fn", None),
+            ("_phase_offset_parameters", ()),
         ):
             state.setdefault(key, value)
         self.__dict__.update(state)
@@ -683,8 +742,10 @@ class SheetResidualReparameterisation(Reparameterisation):
     sheet : :class:`~nessai_gw._ellipse.SheetPhase`
         The prediction, shared with the group action.
     waveform_phase, frequency_range, correction_degree, doppler_vector, \
-    chirp_mass, mass_ratio, spins, tides : optional
-        As for :class:`PolarisationPhaseReparameterisation`.
+    chirp_mass, mass_ratio, spins, tides, phase_offset, \
+    phase_offset_parameters : optional
+        As for :class:`PolarisationPhaseReparameterisation` (``phase_offset``
+        stands with ``a(theta) / 2``).
     """
 
     one_to_one = False
@@ -702,6 +763,8 @@ class SheetResidualReparameterisation(Reparameterisation):
         mass_ratio="mass_ratio",
         spins=("chi_1", "chi_2"),
         tides=("lambda_1", "lambda_2"),
+        phase_offset=None,
+        phase_offset_parameters=(),
         prior=None,
         rng=None,
         **kwargs,
@@ -740,7 +803,7 @@ class SheetResidualReparameterisation(Reparameterisation):
             self.requires.append("theta_jn")
         #: the phase at a reference frequency: its offset model
         self._phase_ref = None
-        if waveform_phase is not None:
+        if waveform_phase is not None or phase_offset is not None:
             self._phase_ref = PolarisationPhaseReparameterisation(
                 parameters=["phase"],
                 prior_bounds={"phase": [0.0, _TWO_PI]},
@@ -750,11 +813,10 @@ class SheetResidualReparameterisation(Reparameterisation):
                 doppler_vector=doppler_vector,
                 chirp_mass=chirp_mass, mass_ratio=mass_ratio,
                 spins=spins, tides=tides,
+                phase_offset=phase_offset,
+                phase_offset_parameters=phase_offset_parameters,
             )
-            self.requires += [
-                n for n in self._phase_ref.requires
-                if n not in ("psi", "theta_jn", *self.requires)
-            ]
+            self._add_phase_ref_requires()
         if hasattr(self, "inverse_input_parameters"):
             self.inverse_input_parameters = list(
                 dict.fromkeys(
@@ -764,8 +826,29 @@ class SheetResidualReparameterisation(Reparameterisation):
         # (2 / pi) * (1 / pi)
         self._log_j = float(np.log(2.0) - 2.0 * np.log(np.pi))
 
+    def _add_phase_ref_requires(self):
+        self.requires += [
+            n for n in self._phase_ref.requires
+            if n not in ("psi", "theta_jn", *self.requires)
+        ]
+        if hasattr(self, "inverse_input_parameters"):
+            self.inverse_input_parameters = list(dict.fromkeys(
+                list(self.inverse_input_parameters or []) + self.requires))
+
+    def set_phase_offset(self, phase_offset, parameters=()):
+        """As :meth:`PolarisationPhaseReparameterisation.set_phase_offset`
+        (an existing waveform-phase model keeps its fitted offset)."""
+        if getattr(self, "_phase_ref", None) is None:
+            if phase_offset is None:
+                return
+            self._phase_ref = PolarisationPhaseReparameterisation(
+                parameters=["phase"], prior_bounds={"phase": [0.0, _TWO_PI]})
+        self._phase_ref.set_phase_offset(phase_offset, parameters)
+        self._add_phase_ref_requires()
+
     def _shift(self, x):
-        """``a(theta) / 2``, the phase's offset at the reference frequency."""
+        """``a(theta) / 2`` (the phase's offset at the reference frequency)
+        plus the exact ``phase_offset``."""
         if getattr(self, "_phase_ref", None) is None:
             return 0.0
         return self._phase_ref._shift(x)
@@ -808,7 +891,8 @@ class SheetResidualReparameterisation(Reparameterisation):
             psi_s, phase_s = self.sheet.predict(x["ra"], x["dec"])
             phase_s = self._phase_star(x, x["psi"], phase_s)
             self._phase_ref.fit_offset(
-                x, x["psi"] + x["phase"] - psi_s - phase_s)
+                x, x["psi"] + x["phase"] - psi_s - phase_s
+                + self._phase_ref._exact_offset(x))
             x = x.copy()
             x["phase"] = x["phase"] + self._shift(x)
         self.sheet.refit(x)

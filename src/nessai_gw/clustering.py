@@ -538,7 +538,7 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
             (1.0 - frac, 1.0 - frac0, 1.0 - new),
         ):
             if now < ratio * then and after > now:
-                logger.info(
+                logger.debug(
                     "Diagonal split: keeping the line -- a side's share "
                     "fell %.3f -> %.3f since the line was fitted and the "
                     "new fit (gain %.2f) would raise it to %.3f",
@@ -651,7 +651,7 @@ class DiagonalSplitClusterWrapper(ClusteredGroupMixtureFlowWrapper):
             n_min = self.activate_min_size_factor * self.freeze_min_size
             n_u = self._n_unique_small_side(c, v)
             if n_u < n_min:
-                logger.info(
+                logger.debug(
                     "Diagonal split: not activating -- smaller side has %d "
                     "unique live points (< %.0f = %g x freeze_min_size), its "
                     "expert would be frozen before it was trained",

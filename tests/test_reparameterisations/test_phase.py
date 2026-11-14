@@ -627,3 +627,117 @@ def test_waveform_phase_kept_when_the_merger_is_concentrated_too():
     reparam.update(x)
     assert reparam.reference_frequency == pytest.approx(_F_TRUE)
     assert 1 - reparam._concentration(base + reparam._shift(x)) < 1e-4
+
+
+# --- exact phase offset (phase_offset) ---------------------------------------
+
+
+def _fake_twist(x):
+    """A stand-in for mlgw_bns_precessing's alpha_ref - gamma_0: a phase
+    offset in a parameter the fitted offset does not see."""
+    return 1.5 * np.sin(x["phi_12"]) + 0.1 * x["mass_ratio"]
+
+
+def _twisted_points(n, seed):
+    """Helix points whose measured phase also carries ``_fake_twist``."""
+    rng = np.random.default_rng(seed)
+    x = _helix_points(n, seed)
+    x = dict_to_live_points({**{k: x[k] for k in x.dtype.names
+                                if k not in ("logP", "logL", "it")},
+                             "phi_12": rng.uniform(0, 2 * np.pi, n)})
+    x["phase"] = np.mod(x["phase"] - _fake_twist(x), 2 * np.pi)
+    return x
+
+
+def test_phase_offset_requires_and_unwinds_and_inverts():
+    reparam = _waveform_reparam(phase_offset=_fake_twist,
+                                phase_offset_parameters=("phi_12", "mass_ratio"))
+    assert {"phi_12", "mass_ratio"} <= set(reparam.requires)
+    without = _waveform_reparam()
+    x = _twisted_points(3000, 11)
+    without.update(x)
+    reparam.update(x)
+    _, a, log_j_a = _forward_phase(without, x)
+    _, b, log_j_b = _forward_phase(reparam, x)
+    # the fitted offset alone cannot follow phi_12; with the exact one the
+    # phase is as concentrated as the helix's noise allows
+    assert _concentration(a["delta_phase"]) < 0.9
+    assert _concentration(b["delta_phase"]) > 0.99
+    np.testing.assert_array_equal(log_j_a, log_j_b)
+    assert reparam.reference_frequency == pytest.approx(_F_TRUE)
+
+    x_in = x.copy()
+    x_in["phase"] = np.nan
+    x_out, _, log_j_back = reparam.inverse_reparameterise(x_in, b.copy(), log_j_b.copy())
+    d = np.angle(np.exp(1j * (x_out["phase"] - x["phase"])))
+    np.testing.assert_allclose(d, 0.0, atol=1e-10)
+    np.testing.assert_allclose(log_j_back, 0.0, atol=1e-12)
+
+
+def test_phase_offset_set_on_an_existing_reparameterisation_and_pickled():
+    import pickle
+
+    reparam = PolarisationPhaseReparameterisation(parameters="phase")
+    x = _twisted_points(200, 12)
+    _, plain, _ = _forward_phase(reparam, x)
+    reparam.set_phase_offset(_fake_twist, ("phi_12", "mass_ratio"))
+    _, shifted, _ = _forward_phase(reparam, x)
+    d = np.angle(np.exp(1j * np.pi * (shifted["delta_phase"] - plain["delta_phase"])))
+    np.testing.assert_allclose(d, np.angle(np.exp(1j * _fake_twist(x))), atol=1e-10)
+    state = reparam.__getstate__()
+    assert state["_phase_offset"].endswith(":_fake_twist")
+    assert state["_phase_offset_fn"] is None
+    restored = pickle.loads(pickle.dumps(reparam))
+    restored._phase_offset = _fake_twist          # the test module, by value
+    _, again, _ = _forward_phase(restored, x)
+    np.testing.assert_allclose(again["delta_phase"], shifted["delta_phase"])
+    reparam.set_phase_offset(None)
+    _, back, _ = _forward_phase(reparam, x)
+    np.testing.assert_allclose(back["delta_phase"], plain["delta_phase"])
+
+
+def test_phase_offset_old_pickles_load_without_it():
+    plain = PolarisationPhaseReparameterisation(parameters="phase")
+    state = dict(plain.__dict__)
+    for key in ("_phase_offset", "_phase_offset_fn", "_phase_offset_parameters"):
+        state.pop(key)
+    restored = PolarisationPhaseReparameterisation.__new__(
+        PolarisationPhaseReparameterisation)
+    restored.__setstate__(state)
+    x = _helix_points(50, 13)
+    _, a, _ = _forward_phase(restored, x)
+    _, b, _ = _forward_phase(plain, x)
+    np.testing.assert_array_equal(a["delta_phase"], b["delta_phase"])
+
+
+def test_sheet_residual_carries_the_phase_offset():
+    from nessai_gw.reparameterisations.phase import SheetResidualReparameterisation
+
+    class _Sheet:
+        orientation_dependent = False
+
+        def predict(self, ra, dec):
+            return 0.3 + 0.0 * ra, 1.1 + 0.0 * ra
+
+        def refit(self, x):
+            pass
+
+    x = _twisted_points(500, 14)
+    plain = SheetResidualReparameterisation(parameters=["psi", "phase"], sheet=_Sheet())
+    with_offset = SheetResidualReparameterisation(
+        parameters=["psi", "phase"], sheet=_Sheet(), phase_offset=_fake_twist,
+        phase_offset_parameters=("phi_12", "mass_ratio"))
+    assert {"phi_12", "mass_ratio"} <= set(with_offset.requires)
+    _, a, _ = _forward_phase(plain, x)
+    _, b, log_j = _forward_phase(with_offset, x)
+    d = np.angle(np.exp(1j * np.pi * (b["delta_phase_res"] - a["delta_phase_res"])))
+    np.testing.assert_allclose(d, np.angle(np.exp(1j * _fake_twist(x))), atol=1e-10)
+    x_in = x.copy()
+    x_in["phase"] = np.nan
+    x_out, _, _ = with_offset.inverse_reparameterise(x_in, b.copy(), log_j.copy())
+    np.testing.assert_allclose(np.angle(np.exp(1j * (x_out["phase"] - x["phase"]))), 0.0,
+                               atol=1e-10)
+    # set on an existing one (a migration)
+    plain.set_phase_offset(_fake_twist, ("phi_12", "mass_ratio"))
+    _, c, _ = _forward_phase(plain, x)
+    np.testing.assert_allclose(c["delta_phase_res"], b["delta_phase_res"])

@@ -3347,7 +3347,7 @@ class ReferenceEpoch:
         ) * best
         if moved and hold:
             self.declined = current / best - 1.0
-            logger.info(
+            logger.debug(
                 "Reference epoch held at %.2f h before merger: the training "
                 "that moved it to %.2f h was discarded; it moves once the "
                 "log chirp-distance spread falls by more than %.3f "
@@ -3357,14 +3357,14 @@ class ReferenceEpoch:
             return False
         if moved:
             self.declined = 0.0
-            logger.info(
+            logger.debug(
                 "Reference epoch %.2f h before merger (was %.2f h): log "
                 "chirp-distance spread %.3f (%.3f at the previous epoch, "
                 "%.3f at merger)", best_hours, self.hours, best, current,
                 float(s[0]),
             )
         else:
-            logger.info(
+            logger.debug(
                 "Reference epoch kept at %.2f h before merger: log "
                 "chirp-distance spread %.3f (best %.3f at %.2f h, %.3f at "
                 "merger)", self.hours, current, best, best_hours, float(s[0]),
