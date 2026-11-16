@@ -38,10 +38,14 @@ def lambda_tilde(lambda_1, lambda_2, q):
 def _probit(lower, upper):
     """``Phi^{-1}(p)`` from ``p = lower`` and ``1 - p = upper``, taking the
     smaller side so both tails keep full relative precision."""
+    # floored at the smallest normal float: a point exactly on an edge (an
+    # inverse whose ndtr underflowed, w < -38) maps to |Phi^-1| ~ 37.5, not
+    # inf, so it can still be scored and trained on
+    tiny = np.finfo(float).tiny
     return np.where(
         lower <= upper,
-        ndtri(np.clip(lower, 0.0, 0.5)),
-        -ndtri(np.clip(upper, 0.0, 0.5)),
+        ndtri(np.clip(lower, tiny, 0.5)),
+        -ndtri(np.clip(upper, tiny, 0.5)),
     )
 
 
@@ -221,8 +225,15 @@ class EffectiveTidalDeformabilityReparameterisation(Reparameterisation):
         s = l1 + r * l2
         u = _probit(*self._trapezoid_cdf(s - self.lo_1 - r * self.lo_2, a, b))
         lo, hi = self._segment(s, r)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            w = _probit((l1 - lo) / (hi - lo), (hi - l1) / (hi - lo))
+        # a zero-length segment (S at a corner of the box, u at its own
+        # edge) has lambda_1 fixed: its midpoint, w = 0, instead of 0/0
+        span = hi - lo
+        point = ~(span > 0)
+        span = np.where(point, 1.0, span)
+        w = _probit(
+            np.where(point, 0.5, (l1 - lo) / span),
+            np.where(point, 0.5, (hi - l1) / span),
+        )
         x_prime[self.prime_parameters[0]] = u
         x_prime[self.prime_parameters[1]] = w
         return x, x_prime, log_j + self._log_jacobian(u, w)

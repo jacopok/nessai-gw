@@ -290,3 +290,21 @@ def test_prime_names_from_nessai():
     assert {"lambda_tilde_prime", "lambda_diff_prime",
             "chirp_mass_prime"} <= set(prime)
     assert "lambda_1_prime" not in prime
+
+
+def test_tides_edge_points_map_to_finite_primes(tides):
+    """A draw deep enough in the tail (|w| > ~38) underflows ndtr and lands
+    exactly on an edge; mapped forward again it must stay finite (an inf
+    there broke an i-nessai level's training)."""
+    u = np.array([0.0, 0.0, -45.0, 45.0])
+    w = np.array([-45.0, 45.0, 0.0, 0.0])
+    x = _points(len(u), seed=5)
+    xp = _prime(tides, len(u))
+    xp["lambda_tilde_prime"], xp["lambda_diff_prime"] = u, w
+    x, _, _ = tides.inverse_reparameterise(x, xp, np.zeros(len(u)))
+    xp2 = _prime(tides, len(u))
+    _, xp2, lj = tides.reparameterise(x, xp2, np.zeros(len(u)))
+    for name in tides.prime_parameters:
+        assert np.isfinite(xp2[name]).all(), (name, xp2[name])
+    assert np.isfinite(lj).all()
+    assert (np.abs(xp2["lambda_diff_prime"][:2]) > 30).all()
