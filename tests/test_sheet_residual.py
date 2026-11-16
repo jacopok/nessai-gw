@@ -892,3 +892,127 @@ def test_shared_state_restores_a_refitted_sheet():
     assert holder.sheet.offset_psi == 0.0
     assert holder.sheet.ellipse is ellipse
     assert not np.array_equal(ellipse.width_knots_s, [2.0, 2.0])
+
+
+# -- the polarisation ellipse with the ResponseFit sheet ----------------------
+
+ELLIPSE_COORDINATES = ["angle", "cos"]
+
+
+def _ellipse_action(phase_mode, coordinate, moved, lock_slope=1.0):
+    base = ETTriangleGroupAction(
+        reference_time=REFERENCE_TIME, polarisation_quarter=True,
+        phase_reflection=True)
+    ellipse = PolarisationEllipse(ET_EMR_PLANE_NORMAL, REFERENCE_TIME, FIDUCIAL)
+    ellipse.set_lock_slope(lock_slope)
+    action = PrimeSpaceTriangularGroupAction(
+        base, PRIME_NAMES, sheet=_response("sky", phase_mode), ellipse=ellipse,
+        ellipse_coordinate=coordinate)
+    if moved:
+        # a reference epoch 20 min before the merger: the ellipse stays at
+        # the merger's Earth orientation
+        action.set_gmst(base.merger_gmst - 2 * np.pi * 1200 / 86164.1)
+    return action
+
+
+@pytest.mark.parametrize("lock_slope", [1.0, 0.4], ids=["lock", "partial-lock"])
+@pytest.mark.parametrize("moved", [False, True], ids=["merger", "moved"])
+@pytest.mark.parametrize("coordinate", ELLIPSE_COORDINATES)
+@pytest.mark.parametrize("phase_mode", ["sky", "conditional"])
+def test_ellipse_response_action_round_trip_and_domain(phase_mode, coordinate, moved,
+                                                       lock_slope, prime_points):
+    """With the ellipse's theta_jn residual (and the frame moved away from
+    the ellipse's): the prime action is a bijection and the fundamental
+    domain holds one image of every orbit."""
+    action = _ellipse_action(phase_mode, coordinate, moved, lock_slope)
+    n = len(prime_points["t_det"])
+    count = torch.zeros(n)
+    for g in range(action._action.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        fwd = action(prime_points, modes)
+        back = action(fwd, modes, inverse=True)
+        for name in ("psi_res", "delta_phase_res", "theta_jn_prime", "sky_u", "sky_v"):
+            period = 1.0 if name.startswith("sky") else 2.0
+            d = torch.remainder(back[name] - prime_points[name], period)
+            assert torch.minimum(d, period - d).max() < 1e-8, (g, name)
+        count += action.in_fundamental_domain(fwd).float()
+    assert torch.all(count == 1), count.unique(return_counts=True)
+
+
+@pytest.mark.parametrize("lock_slope", [1.0, 0.4], ids=["lock", "partial-lock"])
+@pytest.mark.parametrize("coordinate", ELLIPSE_COORDINATES)
+@pytest.mark.parametrize("phase_mode", ["sky", "conditional"])
+def test_ellipse_response_action_matches_physical(phase_mode, coordinate, lock_slope,
+                                                  prime_points):
+    """In the merger's frame the prime action equals the physical action
+    through the reparameterisations: the ellipse's residual and the
+    ResponseFit's (psi, phase) residuals, whose conditional phase reads
+    theta_jn."""
+    from nessai_gw.reparameterisations import PolarisationEllipseReparameterisation
+
+    action = _ellipse_action(phase_mode, coordinate, moved=False, lock_slope=lock_slope)
+    rep = _reparam(sheet=action._sheet)
+    inc = PolarisationEllipseReparameterisation(
+        parameters="theta_jn", ellipse=action._ellipse, coordinate=coordinate)
+    acted, _ = action._decode(prime_points)
+    cos0 = action._cos_theta_jn(prime_points["theta_jn_prime"], acted["ra"],
+                                acted["sin_dec"])
+    # the points whose residual decodes inside [0, pi]: the others are out of
+    # the prior and not bijective in theta_jn
+    if coordinate == "cos":
+        ok = torch.abs(cos0) <= 1
+    else:
+        star = torch.arccos(torch.clamp(action._ellipse.lock_centre(
+            action._ellipse.cos_iota_torch(acted["ra"], acted["sin_dec"])), -1, 1))
+        theta = prime_points["theta_jn_prime"] * 0.5 * np.pi + star
+        ok = (theta > 0) & (theta < np.pi)
+    pts = {k: v[ok] for k, v in prime_points.items()}
+    acted = {k: v[ok] for k, v in acted.items() if torch.is_tensor(v) and v.shape == ok.shape}
+    cos0 = cos0[ok]
+    n = len(pts["t_det"])
+    phys0 = {"ra": acted["ra"], "sin_dec": acted["sin_dec"], "cos_theta_jn": cos0,
+             "psi": acted["psi"], "phase": acted["phase"]}
+    base = action._action
+    for g in range(base.group_size):
+        modes = torch.full((n,), g, dtype=torch.long)
+        phys = base(phys0, modes)
+        x = np.zeros(n, dtype=[(k, "f8") for k in ("ra", "dec", "psi", "phase",
+                                                    "theta_jn")])
+        x["ra"] = phys["ra"].numpy()
+        x["dec"] = np.arcsin(phys["sin_dec"].numpy())
+        x["psi"] = phys["psi"].numpy()
+        x["phase"] = phys["phase"].numpy()
+        x["theta_jn"] = np.arccos(np.clip(phys["cos_theta_jn"].numpy(), -1, 1))
+        want, _ = _apply(rep, x)
+        xp = np.zeros(n, dtype=[("theta_jn_prime", "f8")])
+        _, xp, _ = inc.reparameterise(x.copy(), xp, np.zeros(n))
+        fwd = action(pts, modes)
+        for name in ("psi_res", "delta_phase_res"):
+            d = torch.remainder(fwd[name] - torch.as_tensor(want[name]), 2.0)
+            assert torch.minimum(d, 2.0 - d).max() < 1e-6, (g, name)
+        np.testing.assert_allclose(fwd["theta_jn_prime"].numpy(), xp["theta_jn_prime"],
+                                   atol=1e-6, err_msg=f"element {g}")
+
+
+def test_ellipse_fit_lock_slope():
+    """update() fits the lock slope: ~1 on points on the sheet, ~0 where
+    cos theta_jn is independent of cos iota*, and odd under the reflection."""
+    from nessai_gw.reparameterisations import PolarisationEllipseReparameterisation
+
+    rng = np.random.default_rng(3)
+    ellipse = PolarisationEllipse(ET_EMR_PLANE_NORMAL, REFERENCE_TIME, FIDUCIAL)
+    ellipse.fit_lock = True
+    inc = PolarisationEllipseReparameterisation(parameters="theta_jn", ellipse=ellipse)
+    n = 4000
+    x = np.zeros(n, dtype=[(k, "f8") for k in ("ra", "dec", "theta_jn")])
+    x["ra"] = rng.uniform(0, 2 * np.pi, n)
+    x["dec"] = np.arcsin(rng.uniform(-1, 1, n))
+    star = ellipse.cos_iota(x["ra"], x["dec"])
+    # both reflection images: the reflected sky carries -cos iota*
+    x["theta_jn"] = np.arccos(np.clip(star + rng.normal(0, 0.01, n), -1, 1))
+    inc.update(x)
+    on_sheet = ellipse.lock_slope
+    x["theta_jn"] = np.arccos(rng.uniform(-1, 1, n))
+    inc.update(x)
+    assert ellipse.lock_slope < 0.1
+    assert on_sheet > 0.9

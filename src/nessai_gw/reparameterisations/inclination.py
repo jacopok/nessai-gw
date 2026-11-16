@@ -199,7 +199,9 @@ class PolarisationEllipseReparameterisation(Reparameterisation):
         return self.ellipse.cos_iota(x["ra"], x["dec"])
 
     def _centre(self, cos_iota):
-        """``cos_iota`` -> the lock in the active coordinate."""
+        """``cos_iota`` -> the lock in the active coordinate (about ``b
+        cos iota*``, ``b`` the ellipse's lock slope, 1 unless fitted)."""
+        cos_iota = self.ellipse.lock_centre(cos_iota)
         if self.coordinate == "cos":
             return cos_iota
         return np.arccos(np.clip(cos_iota, -1.0, 1.0))
@@ -269,7 +271,8 @@ class PolarisationEllipseReparameterisation(Reparameterisation):
         a correlation of at least ``width_min_corr`` between ``|cos iota*|`` and
         ``|residual|``.  Below that the width is reset to the constant ``1``.
         """
-        if not self.adaptive_width:
+        fit_lock = bool(getattr(self.ellipse, "fit_lock", False))
+        if not (self.adaptive_width or fit_lock):
             return
         ra, dec, theta = x["ra"], x["dec"], x["theta_jn"]
         finite = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(theta)
@@ -277,10 +280,25 @@ class PolarisationEllipseReparameterisation(Reparameterisation):
             return
         cos_iota = self.ellipse.cos_iota(ra[finite], dec[finite])
         a = np.abs(np.clip(cos_iota, -1.0, 1.0))
+        if fit_lock:
+            # Lock strength: the within-image regression slope of |cos theta_jn|
+            # on the folded cos iota* (folding by sign(cos theta_jn) keeps it odd
+            # under the reflection), clipped to [0, 1].  A thin sheet gives ~1;
+            # no lock (near face-on, or Earth rotation breaking the frozen-sky
+            # degeneracy) gives ~0, i.e. back to plain cos theta_jn.
+            c = np.cos(theta[finite])
+            xs = np.clip(cos_iota, -1.0, 1.0) * np.sign(c)
+            var = np.var(xs)
+            b = np.cov(xs, np.abs(c))[0, 1] / var if var > 1e-12 else 0.0
+            self.ellipse.set_lock_slope(b)
+            logger.info(f"polarisation-ellipse lock slope {self.ellipse.lock_slope:.3f}")
+        centre = self.ellipse.lock_centre(cos_iota)
         if self.coordinate == "cos":
-            resid = np.cos(theta[finite]) - cos_iota
+            resid = np.cos(theta[finite]) - centre
         else:
-            resid = theta[finite] - np.arccos(np.clip(cos_iota, -1.0, 1.0))
+            resid = theta[finite] - np.arccos(np.clip(centre, -1.0, 1.0))
+        if not self.adaptive_width:
+            return
         if np.std(a) < 1e-6 or (
             np.corrcoef(a, np.abs(resid))[0, 1] < self.width_min_corr
         ):

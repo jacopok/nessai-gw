@@ -805,13 +805,43 @@ class PrimeSpaceTriangularGroupAction:
         # model (kept to undo a training or a reset) must not get its own.
         return self
 
+    def _cos_theta_jn(self, u, ra, sin_dec):
+        """``cos theta_jn`` from the theta_jn prime coordinate ``u`` at the
+        sky ``(ra, sin_dec)``: the angle-sine coordinate ``u = 2 theta_jn /
+        pi - 1``, or with the polarisation ellipse the residual about ``cos
+        iota*(n)`` (divided by the fitted width ``s(|cos iota*|)``, 1 unless
+        adaptive_width)."""
+        if self._ellipse is None:
+            return -torch.sin(u * (0.5 * np.pi))
+        cos_raw = self._ellipse.cos_iota_torch(ra, sin_dec)
+        width = self._ellipse.residual_width_torch(
+            torch.abs(torch.clamp(cos_raw, -1.0, 1.0))
+        )
+        cos_star = self._ellipse.lock_centre(cos_raw)
+        if self._ellipse_coordinate == "cos":
+            return self._ellipse_scale * width * u + cos_star
+        return torch.cos(
+            u * (0.5 * np.pi * self._ellipse_scale) * width
+            + torch.arccos(torch.clamp(cos_star, -1.0, 1.0))
+        )
+
     def set_gmst(self, gmst):
         """Move the group's detector frame (and the flow's sky frame it
         decodes) to the Earth's orientation ``gmst``."""
-        if self._ellipse is not None:
+        if self._ellipse is not None and self._sheet_res is None:
+            # polarisation-phase rebuilds delta_phase from the ellipse's
+            # sign(cos theta_jn), which needs the ellipse in the group's frame
             raise NotImplementedError(
-                "a movable frame is not supported with the polarisation "
-                "ellipse")
+                "a movable frame with the polarisation ellipse needs the "
+                "sheet-residual phase coordinates")
+        # On the sheet-residual path the action sends the theta_jn residual u
+        # to -u under a reflection, which is a group action in the prime space
+        # whatever frame the ellipse is in: the ellipse stays at the merger's
+        # Earth orientation, where the lock is tightest (on the ET-Delta
+        # stages_AS_HF_Delta_d1238 live points the residual is 0.003 wide at the
+        # merger, 0.006 at 6 min before it and 0.025 at 30 min), as the
+        # sheet's (psi, phase) prediction does; the residual is then exactly
+        # equivariant only at the merger's epoch.
         self._action.set_gmst(gmst)
         self._sky_R = torch.as_tensor(
             self._action.sky_frame_rotation, dtype=torch.float64
@@ -998,12 +1028,8 @@ class PrimeSpaceTriangularGroupAction:
             r_sum = (point_dict[self._sheet_res[1]] + 1.0) * np.pi
             psi = torch.remainder(r_psi + psi_s, np.pi)
             if getattr(self._sheet, "orientation_dependent", False):
-                # ObservedPhase: phase* depends on theta_jn and psi; the
-                # angle-sine coordinate u = 2 theta_jn / pi - 1
-                if self._ellipse is not None:
-                    raise RuntimeError("an orientation-dependent sheet needs "
-                                       "the plain theta_jn coordinate")
-                cos_ct = -torch.sin(point_dict[self._theta_jn] * (0.5 * np.pi))
+                # ObservedPhase / ResponseFit: phase* depends on theta_jn and psi
+                cos_ct = self._cos_theta_jn(point_dict[self._theta_jn], ra, sin_dec)
                 phase_s = self._sheet_phase(ra, sin_dec, cos_ct, psi, state)
             phase = torch.remainder(r_sum - r_psi + phase_s, _TWO_PI)
             r_psi = torch.ones_like(ra)
@@ -1028,22 +1054,7 @@ class PrimeSpaceTriangularGroupAction:
         if self._ellipse is None:
             sign_ct = -torch.sign(u_theta)
         else:
-            # residual coordinate: cos theta_jn = scale * u + cos iota*(n)
-            cos_star = self._ellipse.cos_iota_torch(ra, sin_dec)
-            # heteroskedastic residual: the reparameterisation divides by
-            # s(|cos iota*|); undo it here so cos theta_jn -- and its sign --
-            # come back exact.  s == 1 unless adaptive_width fitted a width.
-            width = self._ellipse.residual_width_torch(
-                torch.abs(torch.clamp(cos_star, -1.0, 1.0))
-            )
-            if self._ellipse_coordinate == "cos":
-                cos_ct = self._ellipse_scale * width * u_theta + cos_star
-            else:
-                cos_ct = torch.cos(
-                    u_theta * (0.5 * np.pi * self._ellipse_scale) * width
-                    + torch.arccos(torch.clamp(cos_star, -1.0, 1.0))
-                )
-            sign_ct = torch.sign(cos_ct)
+            sign_ct = torch.sign(self._cos_theta_jn(u_theta, ra, sin_dec))
             sign_ct = torch.where(
                 sign_ct == 0, torch.ones_like(sign_ct), sign_ct
             )
@@ -1138,9 +1149,11 @@ class PrimeSpaceTriangularGroupAction:
             # relative to the prediction at the mapped sky
             psi_s, phase_s, state = self._sheet_predict(ra_t, sin_dec_t)
             if getattr(self._sheet, "orientation_dependent", False):
-                # the reflection sends cos theta_jn -> -cos theta_jn
+                # the image's theta_jn coordinate (the reflection sends u to
+                # -u) decoded at the image's sky: what decoding the image gives
                 u = point_dict[self._theta_jn]
-                cos_ct = -torch.sin(torch.where(aux["reflected"], -u, u) * (0.5 * np.pi))
+                cos_ct = self._cos_theta_jn(torch.where(aux["reflected"], -u, u),
+                                            ra_t, sin_dec_t)
                 phase_s = self._sheet_phase(ra_t, sin_dec_t, cos_ct, mapped["psi"], state)
             r_psi = torch.remainder(mapped["psi"] - psi_s, np.pi)
             out[self._sheet_res[0]] = r_psi * (2.0 / np.pi) - 1.0

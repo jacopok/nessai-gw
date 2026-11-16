@@ -238,6 +238,20 @@ class PolarisationEllipse:
     width_knots_a = np.array([0.0, 1.0])
     width_knots_s = np.array([1.0, 1.0])
 
+    #: Lock slope ``b``: the residual is taken about ``b cos iota*(n)``, so
+    #: ``b = 1`` is the full lock and ``b = 0`` plain ``cos theta_jn``.  Fitted
+    #: from the live points when ``fit_lock`` (see
+    #: :meth:`PolarisationEllipseReparameterisation.update`), else 1.
+    lock_slope = 1.0
+    fit_lock = False
+
+    def set_lock_slope(self, b):
+        self.lock_slope = float(np.clip(b, 0.0, 1.0))
+
+    def lock_centre(self, cos_iota):
+        """``b cos iota*``: the centre the residual is taken about."""
+        return self.lock_slope * cos_iota
+
     def set_width(self, knots_a, knots_s):
         """Set the width knots (see the class notes).  ``knots_a`` must be
         sorted ascending; ``knots_s`` is floored at a small positive value."""
