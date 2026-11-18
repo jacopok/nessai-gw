@@ -1036,3 +1036,35 @@ def test_preimages_with_domain_matches_full_encoding(which, action, observed_act
     n = len(prime_points["t_det"])
     assert torch.all(mask.view(k, n).sum(dim=0) == 1)
 
+
+def test_independent_copy_of_shared_fits():
+    """A plain deep copy shares the ellipse, the sheet and the group action;
+    a deep copy asking for independent copies (an i-nessai level) gets its
+    own, still shared among the copied holders, and refitting them leaves
+    the original alone."""
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from nessai_gw._ellipse import INDEPENDENT_COPY
+
+    action = _ellipse_action("sky", "angle", moved=False)
+    ellipse, sheet = action._ellipse, action._sheet
+    reparam = SimpleNamespace(ellipse=ellipse, sheet=sheet)
+    holder = SimpleNamespace(action=action, reparam=reparam)
+    plain = deepcopy(holder)
+    assert plain.action is action and plain.reparam.ellipse is ellipse
+    assert plain.reparam.sheet is sheet
+
+    new = deepcopy(holder, {INDEPENDENT_COPY: True})
+    assert new.action is not action
+    assert new.reparam.ellipse is not ellipse
+    assert new.reparam.sheet is not sheet
+    # the copies keep the sharing: the action reads the reparameterisation's
+    # fits
+    assert new.action._ellipse is new.reparam.ellipse
+    assert new.action._sheet is new.reparam.sheet
+    slope = ellipse.lock_slope
+    new.reparam.ellipse.set_lock_slope(0.25 if slope != 0.25 else 0.5)
+    new.reparam.sheet.offset_psi = 0.3
+    assert ellipse.lock_slope == slope
+    assert sheet.offset_psi != 0.3

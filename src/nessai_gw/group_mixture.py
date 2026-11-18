@@ -164,6 +164,7 @@ from . import nessai_logger
 from ._geometry import SPEED_OF_LIGHT as _SPEED_OF_LIGHT
 from ._geometry import greenwich_mean_sidereal_time as _greenwich_mean_sidereal_time
 from ._geometry import gmst_hours_before
+from ._ellipse import shared_deepcopy
 from .reparameterisations.spin import (
     PRECESSING_SPIN_ANGLES,
     PRECESSING_SPIN_COORDINATES,
@@ -813,7 +814,9 @@ class PrimeSpaceTriangularGroupAction:
         # One action per proposal: the flow model holds it and the proposal
         # moves its frame (reference epoch) and rebinds it, so a copy of the
         # model (kept to undo a training or a reset) must not get its own.
-        return self
+        # A copy of the whole proposal (an i-nessai level) gets its own:
+        # see nessai_gw._ellipse.INDEPENDENT_COPY.
+        return shared_deepcopy(self, memo)
 
     def _cos_theta_jn(self, u, ra, sin_dec):
         """``cos theta_jn`` from the theta_jn prime coordinate ``u`` at the
@@ -1416,13 +1419,15 @@ class PrimeSpaceSkyGroupAction:
         self.group_size = action.group_size
         self.bind(prime_names)
 
-    @property
     def __deepcopy__(self, memo):
         # One action per proposal: the flow model holds it and the proposal
         # moves its frame (reference epoch) and rebinds it, so a copy of the
         # model (kept to undo a training or a reset) must not get its own.
-        return self
+        # A copy of the whole proposal (an i-nessai level) gets its own:
+        # see nessai_gw._ellipse.INDEPENDENT_COPY.
+        return shared_deepcopy(self, memo)
 
+    @property
     def sky_frame_rotation(self):
         return self._action.sky_frame_rotation
 

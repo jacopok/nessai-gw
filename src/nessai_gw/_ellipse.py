@@ -68,6 +68,28 @@ _TWO_PI = 2.0 * np.pi
 _MIN_CONDITION = 1e-9
 
 
+
+#: Key of a deep-copy ``memo`` that asks the shared instances (the classes in
+#: :data:`SHARED` and the group actions) for copies of their own.  Plain deep
+#: copies share them -- one fit per proposal, read by its reparameterisations
+#: and its group action -- but a proposal built as a copy of another (each
+#: level of nessai's i-nessai ``LevelFlowProposal``) needs its own fits: a
+#: shared fit refitted by a later level would change the density of every
+#: earlier level.  The memo keeps the sharing among the copies.
+INDEPENDENT_COPY = "nessai.independent_copy"
+
+
+def shared_deepcopy(obj, memo):
+    """``obj`` itself, or with :data:`INDEPENDENT_COPY` in ``memo`` a deep
+    copy of it (registered in ``memo``, so the objects that share ``obj``
+    share its copy)."""
+    if not memo.get(INDEPENDENT_COPY):
+        return obj
+    new = obj.__class__.__new__(obj.__class__)
+    memo[id(obj)] = new
+    new.__dict__.update(deepcopy(obj.__dict__, memo))
+    return new
+
 def detector_frame_basis(plane_normal, azimuth_offset: float = 0.0):
     """Orthonormal Earth-fixed basis ``[e1, e2, e3]`` with ``e3`` the normal.
 
@@ -152,8 +174,9 @@ class PolarisationEllipse:
         # mutable residual width: the reparameterisation fits it and the group
         # action reads it, and nessai deep-copies reparameterisation specs
         # (nessai.reparameterisations.utils).  Sharing one instance is the
-        # point, so a deep copy returns self.
-        return self
+        # point, so a deep copy returns self -- unless it asks for
+        # independent copies (see :data:`INDEPENDENT_COPY`).
+        return shared_deepcopy(self, memo)
 
     def __init__(self, plane_normal, reference_time, fiducial,
                  azimuth_offset: float = 0.0):
@@ -382,7 +405,7 @@ class SheetPhase:
         self.offset_sum = 0.0
 
     def __deepcopy__(self, memo):
-        return self
+        return shared_deepcopy(self, memo)
 
     @staticmethod
     def _angles(arg_alpha, arg_ratio):
@@ -512,7 +535,7 @@ class ObservedPhase:
         self.offset_sum = 0.0
 
     def __deepcopy__(self, memo):
-        return self
+        return shared_deepcopy(self, memo)
 
     def predict(self, ra, dec):
         """``(psi*, phase*)`` without the orientation-dependent part."""
@@ -695,7 +718,7 @@ class ResponseFit:
         self.offset_sum = 0.0
 
     def __deepcopy__(self, memo):
-        return self
+        return shared_deepcopy(self, memo)
 
     # -- the fit (numpy) --------------------------------------------------
     def _w(self, ra, dec):
