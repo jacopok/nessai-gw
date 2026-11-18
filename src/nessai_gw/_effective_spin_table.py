@@ -127,11 +127,19 @@ def _bracket(nodes, x):
     return i, lam
 
 
-def _locate(rows, values):
-    """Cell of each row (increasing along the last axis) containing
-    ``values``: index ``k`` with ``rows[k] <= value <= rows[k + 1]``."""
-    k = np.sum(rows <= values[:, None], axis=1) - 1
-    return np.clip(k, 0, rows.shape[1] - 2)
+def _bisect(value_at, values, n_knots):
+    """Cell of each point's row (increasing in ``k``) containing ``values``:
+    index ``k`` with ``row[k] <= value <= row[k + 1]``, clamped to the table.
+    ``value_at(k)`` gives each point's row value at its knot index ``k`` (an
+    array): ``O(n log K)`` gathers instead of building ``n x K`` rows."""
+    lo = np.zeros(len(values), dtype=np.intp)
+    hi = np.full(len(values), n_knots - 1, dtype=np.intp)
+    for _ in range(int(np.ceil(np.log2(max(n_knots - 1, 1)))) + 1):
+        mid = (lo + hi) // 2
+        below = value_at(mid) <= values
+        lo = np.where(below, mid, lo)
+        hi = np.where(below, hi, mid)
+    return np.clip(lo, 0, n_knots - 2)
 
 
 class TabulatedEffectiveSpinTransform:
@@ -164,19 +172,20 @@ class TabulatedEffectiveSpinTransform:
         return _build_tables(*self._config)
 
     # -- G -------------------------------------------------------------------
-    def _g_rows(self, q):
-        tab = self._tables
-        i, lam = _bracket(tab["q"], q)
-        return (1 - lam)[:, None] * tab["g"][i] + lam[:, None] * tab["g"][i + 1]
+    def _g_at(self, q):
+        """``G`` at knot indices ``k`` (one per point), interpolated in
+        ``q``."""
+        g = self._tables["g"]
+        i, lam = _bracket(self._tables["q"], q)
+        return lambda k: (1 - lam) * g[i, k] + lam * g[i + 1, k]
 
     def _u_and_slope(self, t, q):
         """``u`` and ``log dG/dt`` at ``t`` in [-1, 1]."""
         tab = self._tables
-        rows = self._g_rows(q)
+        g_at = self._g_at(q)
         tn = -np.abs(t)
         k, lam = _bracket(tab["t_u"], tn)
-        n = np.arange(len(t))
-        g0, g1 = rows[n, k], rows[n, k + 1]
+        g0, g1 = g_at(k), g_at(k + 1)
         g = g0 + lam * (g1 - g0)
         slope = (g1 - g0) / (tab["t_u"][k + 1] - tab["t_u"][k])
         u = ndtri(g)
@@ -184,30 +193,30 @@ class TabulatedEffectiveSpinTransform:
 
     def _t_of_u(self, u, q):
         tab = self._tables
-        rows = self._g_rows(q)
+        g_at = self._g_at(q)
         target = ndtr(-np.abs(u))
-        k = _locate(rows, target)
-        n = np.arange(len(u))
-        g0, g1 = rows[n, k], rows[n, k + 1]
+        k = _bisect(g_at, target, len(tab["t_u"]))
+        g0, g1 = g_at(k), g_at(k + 1)
         t0, t1 = tab["t_u"][k], tab["t_u"][k + 1]
         tn = t0 + (target - g0) / (g1 - g0) * (t1 - t0)
         return np.where(u > 0, -tn, tn)
 
     # -- F -------------------------------------------------------------------
-    def _f_rows(self, tn, q):
-        """Interpolated ``F`` and ``C`` rows at ``tn <= 0``."""
+    def _f_at(self, tn, q):
+        """``F`` and ``C`` at knot indices ``k`` (one per point),
+        interpolated in ``q`` and ``t``."""
         tab = self._tables
         i, a = _bracket(tab["q"], q)
         j, b = _bracket(tab["t_w"], tn)
-        out = []
-        for arr in (tab["f"], tab["c"]):
-            out.append(
-                ((1 - a) * (1 - b))[:, None] * arr[i, j]
-                + ((1 - a) * b)[:, None] * arr[i, j + 1]
-                + (a * (1 - b))[:, None] * arr[i + 1, j]
-                + (a * b)[:, None] * arr[i + 1, j + 1]
-            )
-        return out
+        w00, w01 = (1 - a) * (1 - b), (1 - a) * b
+        w10, w11 = a * (1 - b), a * b
+
+        def at(arr):
+            return lambda k: (w00 * arr[i, j, k] + w01 * arr[i, j + 1, k]
+                              + w10 * arr[i + 1, j, k]
+                              + w11 * arr[i + 1, j + 1, k])
+
+        return at(tab["f"]), at(tab["c"])
 
     def _segment(self, s, q):
         return (np.maximum(-self.a1, s - q * self.a2),
@@ -218,11 +227,10 @@ class TabulatedEffectiveSpinTransform:
         tab = self._tables
         flip = t > 0
         rn = np.where(flip, 1.0 - r, r)
-        f_rows, c_rows = self._f_rows(-np.abs(t), q)
+        f_at, c_at = self._f_at(-np.abs(t), q)
         k, lam = _bracket(tab["r"], rn)
-        n = np.arange(len(r))
-        f0, f1 = f_rows[n, k], f_rows[n, k + 1]
-        c0, c1 = c_rows[n, k], c_rows[n, k + 1]
+        f0, f1 = f_at(k), f_at(k + 1)
+        c0, c1 = c_at(k), c_at(k + 1)
         f = f0 + lam * (f1 - f0)
         cc = c0 + lam * (c1 - c0)
         slope = (f1 - f0) / (tab["r"][k + 1] - tab["r"][k])
@@ -233,15 +241,17 @@ class TabulatedEffectiveSpinTransform:
         tab = self._tables
         flip = t > 0
         wn = np.where(flip, -w, w)
-        f_rows, c_rows = self._f_rows(-np.abs(t), q)
-        n = np.arange(len(w))
+        f_at, c_at = self._f_at(-np.abs(t), q)
         low = wn <= 0
         # w <= 0: solve F(r) = Phi(w); else C(r) = Phi(-w) (C decreasing)
         target = ndtr(-np.abs(wn))
-        rows = np.where(low[:, None], f_rows, -c_rows)
-        k = _locate(rows, np.where(low, target, -target))
-        y0, y1 = rows[n, k], rows[n, k + 1]
+
+        def y_at(k):
+            return np.where(low, f_at(k), -c_at(k))
+
         yt = np.where(low, target, -target)
+        k = _bisect(y_at, yt, len(tab["r"]))
+        y0, y1 = y_at(k), y_at(k + 1)
         r0, r1 = tab["r"][k], tab["r"][k + 1]
         rn = r0 + (yt - y0) / (y1 - y0) * (r1 - r0)
         return np.where(flip, 1.0 - rn, rn)

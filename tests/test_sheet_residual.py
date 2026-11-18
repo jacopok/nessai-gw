@@ -1016,3 +1016,23 @@ def test_ellipse_fit_lock_slope():
     inc.update(x)
     assert ellipse.lock_slope < 0.1
     assert on_sheet > 0.9
+
+
+@pytest.mark.parametrize("which", ["sheet", "observed"])
+def test_preimages_with_domain_matches_full_encoding(which, action, observed_action,
+                                                     prime_points):
+    """The in-domain pre-images and the domain mask equal the full
+    encoding's (:meth:`preimages`, then :meth:`in_fundamental_domain` of each
+    row); the rows it leaves out are outside the domain."""
+    act = action if which == "sheet" else observed_action
+    k = act._action.group_size
+    full = act.preimages(prime_points, k)
+    rows, mask = act.preimages_with_domain(prime_points, k)
+    want = act.in_fundamental_domain(full).to(torch.bool)
+    assert torch.equal(mask, want)
+    for name in act._prime_names:
+        assert torch.equal(rows[name][mask], full[name][mask]), name
+    # each point has exactly one image in the domain (a partition)
+    n = len(prime_points["t_det"])
+    assert torch.all(mask.view(k, n).sum(dim=0) == 1)
+

@@ -684,6 +684,16 @@ class TriangularDetectorGroupAction:
 
         return out
 
+    def sky_in_fundamental_domain(self, point_dict: dict) -> torch.Tensor:
+        """The sky clauses of :meth:`in_fundamental_domain` alone (azimuth
+        in ``[0, pi / 2)``, ``beta >= 0``): a superset of the domain that
+        needs only ``ra`` and ``sin_dec``, bit-for-bit the same clauses."""
+        dec = torch.asin(torch.clamp(point_dict["sin_dec"], -1.0, 1.0))
+        lam_f, beta_f, _ = self._to_frame(
+            point_dict["ra"], dec, torch.zeros_like(dec)
+        )
+        return (torch.remainder(lam_f, _TWO_PI) < 0.5 * np.pi) & (beta_f >= 0.0)
+
     def in_fundamental_domain(self, point_dict: dict) -> torch.Tensor:
         """Boolean mask: is each point the canonical point of its orbit?
 
@@ -1093,7 +1103,10 @@ class PrimeSpaceTriangularGroupAction:
         }
         return acted, aux
 
-    def _encode(self, point_dict, mapped, aux):
+    def _encode(self, point_dict, mapped, aux, domain=None):
+        """The images' prime dict; with ``domain`` (a list) on the
+        sheet-residual path, also appends :meth:`in_fundamental_domain` of
+        each image, from the terms the encoding computes (no re-decoding)."""
         out = dict(point_dict)
 
         ra_t = mapped["ra"]
@@ -1161,6 +1174,30 @@ class PrimeSpaceTriangularGroupAction:
                 torch.remainder(r_psi + mapped["phase"] - phase_s, _TWO_PI)
                 / np.pi - 1.0
             )
+            if domain is not None:
+                # in_fundamental_domain of the image: its sky, the sign of
+                # its cos(theta_jn) (decoded at that sky), and the residuals
+                if not getattr(self._sheet, "orientation_dependent", False):
+                    u = point_dict[self._theta_jn]
+                    cos_ct = self._cos_theta_jn(
+                        torch.where(aux["reflected"], -u, u), ra_t, sin_dec_t
+                    )
+                if self._ellipse is None:
+                    sign_ct = torch.sign(-out[self._theta_jn])
+                else:
+                    sign_ct = torch.sign(cos_ct)
+                    sign_ct = torch.where(
+                        sign_ct == 0, torch.ones_like(sign_ct), sign_ct
+                    )
+                acted = {
+                    "ra": ra_t,
+                    "sin_dec": sin_dec_t,
+                    "cos_theta_jn": sign_ct,
+                    "psi": (out[self._sheet_res[0]] + 1.0) * (0.5 * np.pi)
+                    + self._action.polarisation_offset,
+                    "phase": (out[self._sheet_res[1]] + 1.0) * np.pi,
+                }
+                domain.append(self._action.in_fundamental_domain(acted))
             return {n: out[n] for n in self._prime_names}
 
         # delta_phase = phase_invariant + sign(cos theta_jn)_out * psi_out.
@@ -1231,6 +1268,69 @@ class PrimeSpaceTriangularGroupAction:
         mapped = self._action(acted, modes, inverse=True)
         aux["reflected"], aux["phase_step"] = self._mode_masks(modes, True)
         return self._encode(tiled, mapped, aux)
+
+    def preimages_with_domain(self, point_dict, k):
+        """:meth:`preimages` and, for each row, whether the pre-image is in
+        the fundamental domain (:meth:`in_fundamental_domain` of the row),
+        from the encoding's own terms; the mask is ``None`` off the
+        sheet-residual path."""
+        acted, aux = self._decode(point_dict)
+        b = next(iter(point_dict.values())).shape[0]
+
+        def tile(t):
+            if not torch.is_tensor(t) or t.dim() == 0 or t.shape[0] != b:
+                return t
+            return t.repeat(k, *([1] * (t.dim() - 1)))
+
+        acted = {n: tile(t) for n, t in acted.items()}
+        aux = {n: tile(t) for n, t in aux.items()}
+        tiled = {n: tile(t) for n, t in point_dict.items()}
+        device = next(iter(point_dict.values())).device
+        modes = torch.arange(k, device=device).repeat_interleave(b)
+        mapped = self._action(acted, modes, inverse=True)
+        aux["reflected"], aux["phase_step"] = self._mode_masks(modes, True)
+        if self._sheet_res is None or self._arg_ab is not None:
+            return self._encode(tiled, mapped, aux), None
+        n = k * b
+        # Only the images inside the fundamental domain reach the flow (and
+        # all of a point's images when none is): encode the images whose
+        # sky is in the domain's sky cell, then the rest of the points no
+        # image claims. The sky clauses are the domain's own, on the same
+        # mapped sky, so the encoded rows and the mask are those of the
+        # full encoding; the other rows are NaN (outside the domain).
+        sky_ok = self._action.sky_in_fundamental_domain(
+            {"ra": mapped["ra"], "sin_dec": torch.clamp(mapped["sin_dec"], -1.0, 1.0)}
+        )
+        out = {name: None for name in self._prime_names}
+        domain = torch.zeros(n, dtype=torch.bool, device=device)
+        done = torch.zeros(n, dtype=torch.bool, device=device)
+
+        def encode_rows(rows):
+            if not rows.numel():
+                return
+
+            def sub(d):
+                return {
+                    name: (t[rows] if torch.is_tensor(t) and t.dim() > 0
+                           and t.shape[0] == n else t)
+                    for name, t in d.items()
+                }
+
+            dom = []
+            enc = self._encode(sub(tiled), sub(mapped), sub(aux), domain=dom)
+            for name in self._prime_names:
+                if out[name] is None:
+                    out[name] = enc[name].new_full((n,), float("nan"))
+                out[name][rows] = enc[name]
+            domain[rows] = dom[0].to(torch.bool)
+            done[rows] = True
+
+        encode_rows(sky_ok.nonzero(as_tuple=True)[0])
+        unclaimed = ~domain.view(k, b).any(dim=0)
+        encode_rows((unclaimed.repeat(k) & ~done).nonzero(as_tuple=True)[0])
+        if out[self._prime_names[0]] is None:
+            return self._encode(tiled, mapped, aux), None
+        return out, domain
 
     def in_fundamental_domain(self, point_dict):
         # on the sheet-residual path the predicate tests the residuals, not
