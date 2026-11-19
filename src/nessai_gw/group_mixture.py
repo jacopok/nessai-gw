@@ -155,6 +155,7 @@ original one.
 
 from __future__ import annotations
 
+import copy
 import inspect
 
 import numpy as np
@@ -3618,6 +3619,9 @@ def _make_group_proposal_class(
             # sheet-residual: the action reads the reparameterisation's
             # SheetPhase -- after a resume that is the unpickled, fitted one,
             # not the instance the class was built with
+            from .reparameterisations.inclination import (
+                PolarisationEllipseReparameterisation,
+            )
             from .reparameterisations.phase import (
                 SheetResidualReparameterisation,
             )
@@ -3625,6 +3629,12 @@ def _make_group_proposal_class(
             for rep in (getattr(self, "_reparameterisation", None) or {}).values():
                 if isinstance(rep, SheetResidualReparameterisation):
                     action._sheet = rep.sheet
+                elif (
+                    isinstance(rep, PolarisationEllipseReparameterisation)
+                    and getattr(action, "_ellipse", None) is not None
+                ):
+                    # likewise the ellipse (fitted lock slope and width)
+                    action._ellipse = rep.ellipse
             model = getattr(self.flow, "model", None)
             prime = list(getattr(self, "prime_parameters", []) or [])
             if model is not None and prime:
@@ -3633,6 +3643,40 @@ def _make_group_proposal_class(
                     model.set_param_names(prime)
                 else:
                     model.param_names = prime
+
+        def own_group_action(self):
+            """Give this proposal's flow model a group action of its own,
+            wired to this proposal's fits (its reparameterisations' ellipse
+            and sheet). The flow model is built with the class's single
+            action, shared by every proposal of the class; one proposal per
+            sampler (nessai) is fine, but each i-nessai level is a proposal
+            with fits of its own, and a resume rebuilds every level's model
+            with the class's action."""
+            from ._ellipse import INDEPENDENT_COPY
+            from .reparameterisations.inclination import (
+                PolarisationEllipseReparameterisation,
+            )
+            from .reparameterisations.phase import (
+                SheetResidualReparameterisation,
+            )
+
+            flow = getattr(self, "flow", None)
+            model = getattr(flow, "model", None)
+            if model is None or action is None:
+                return
+            memo = {INDEPENDENT_COPY: True}
+            for rep in (getattr(self, "_reparameterisation", None) or {}).values():
+                if isinstance(rep, SheetResidualReparameterisation) and (
+                    getattr(action, "_sheet", None) is not None
+                ):
+                    memo[id(action._sheet)] = rep.sheet
+                elif isinstance(rep, PolarisationEllipseReparameterisation) and (
+                    getattr(action, "_ellipse", None) is not None
+                ):
+                    memo[id(action._ellipse)] = rep.ellipse
+            flow.model = copy.deepcopy(model, memo)
+            if hasattr(flow, "get_optimiser"):
+                flow._optimiser = flow.get_optimiser()
 
         def update_flow_config(self):
             """Also build the flow model in nessai's actual prime order (its
