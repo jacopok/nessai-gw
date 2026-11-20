@@ -108,8 +108,10 @@ class PolarisationEllipseReparameterisation(Reparameterisation):
         :meth:`update` only fits a width when ``corr(|cos iota*|, |residual|)``
         is at least this (default 0.15); below it -- early in a run, before the
         sheet has locked, when the residual is prior-wide everywhere -- the
-        width is reset to the constant 1 so a monotone ``s`` cannot
-        anti-whiten.
+        width is a constant (no fan, so a monotone ``s`` cannot anti-whiten)
+        at the residual's robust spread, capped at 1: ~1 early in a run, and
+        no jump in the coordinate's scale when the fan's correlation dips late
+        in one.
     prior : optional
         Accepted for registry compatibility and ignored.
     """
@@ -269,7 +271,9 @@ class PolarisationEllipseReparameterisation(Reparameterisation):
         run the residual is prior-wide *everywhere* and a monotone ``s`` would
         mildly anti-whiten it): it needs ``width_min_points`` finite points and
         a correlation of at least ``width_min_corr`` between ``|cos iota*|`` and
-        ``|residual|``.  Below that the width is reset to the constant ``1``.
+        ``|residual|``.  Below that the width is the constant robust spread of
+        the residual (capped at ``1``), so the coordinate's scale stays
+        continuous across the switch.
         """
         fit_lock = bool(getattr(self.ellipse, "fit_lock", False))
         if not (self.adaptive_width or fit_lock):
@@ -281,15 +285,20 @@ class PolarisationEllipseReparameterisation(Reparameterisation):
         cos_iota = self.ellipse.cos_iota(ra[finite], dec[finite])
         a = np.abs(np.clip(cos_iota, -1.0, 1.0))
         if fit_lock:
-            # Lock strength: the within-image regression slope of |cos theta_jn|
-            # on the folded cos iota* (folding by sign(cos theta_jn) keeps it odd
-            # under the reflection), clipped to [0, 1].  A thin sheet gives ~1;
-            # no lock (near face-on, or Earth rotation breaking the frozen-sky
-            # degeneracy) gives ~0, i.e. back to plain cos theta_jn.
+            # Lock strength: the within-image least-squares slope through the
+            # origin of |cos theta_jn| on the folded cos iota* (folding by
+            # sign(cos theta_jn) keeps it odd under the reflection), clipped to
+            # [0, 1].  A thin sheet gives ~1; no lock (near face-on, or Earth
+            # rotation breaking the frozen-sky degeneracy) gives ~0, i.e. back
+            # to plain cos theta_jn.  Through the origin because the centre is
+            # b cos iota*, a line through the origin: a slope fitted with a free
+            # intercept is the sheet's *local* slope, which on a live set
+            # narrow in |cos iota*| (late in a run) differs from the ratio and
+            # moves the centre off the sheet by several residual widths.
             c = np.cos(theta[finite])
             xs = np.clip(cos_iota, -1.0, 1.0) * np.sign(c)
-            var = np.var(xs)
-            b = np.cov(xs, np.abs(c))[0, 1] / var if var > 1e-12 else 0.0
+            ss = float(np.mean(xs * xs))
+            b = float(np.mean(xs * np.abs(c))) / ss if ss > 1e-12 else 0.0
             self.ellipse.set_lock_slope(b)
             logger.info(f"polarisation-ellipse lock slope {self.ellipse.lock_slope:.3f}")
         centre = self.ellipse.lock_centre(cos_iota)
@@ -302,7 +311,9 @@ class PolarisationEllipseReparameterisation(Reparameterisation):
         if np.std(a) < 1e-6 or (
             np.corrcoef(a, np.abs(resid))[0, 1] < self.width_min_corr
         ):
-            self.ellipse.set_width([0.0, 1.0], [1.0, 1.0])
+            mad = float(np.median(np.abs(resid - np.median(resid))))
+            s0 = min(1.4826 * mad, 1.0)
+            self.ellipse.set_width([0.0, 1.0], [s0, s0])
             return
         edges = np.quantile(a, np.linspace(0.0, 1.0, self.width_bins + 1))
         edges[-1] += 1e-9

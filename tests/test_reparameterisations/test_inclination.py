@@ -367,3 +367,72 @@ def test_adaptive_width_waits_for_enough_points():
     ra, dec, theta, _ = _hetero_sheet(e, n=1000, seed=3)
     r.update(structured(theta, ra, dec))
     assert _width_is_trivial(e)
+
+
+# ---------------------------------------------------------------------------
+# late-run stability of the fitted lock and width
+# ---------------------------------------------------------------------------
+def _narrow_band_sky(ellipse, lo=0.21, hi=0.24, n=4000, seed=0):
+    """Sky positions with |cos iota*| in [lo, hi] (a late live set)."""
+    rng = np.random.default_rng(seed)
+    ra, dec = random_sky(40 * n, seed=seed)
+    cs = ellipse.cos_iota(ra, dec)
+    keep = np.flatnonzero((np.abs(cs) >= lo) & (np.abs(cs) <= hi))
+    keep = rng.permutation(keep)[:n]
+    assert len(keep) == n
+    return ra[keep], dec[keep], cs[keep], rng
+
+
+def test_lock_slope_on_a_narrow_band_is_the_ratio():
+    """Late in a run the live points span a narrow band of |cos iota*|, and
+    the sheet's local slope there need not be 1 (here 0.7) while it passes
+    within 0.01 of |cos theta_jn| = |cos iota*|.  The centre is b cos iota*, so
+    the fit is the ratio through the origin (~1), not the local slope, which
+    would move the centre ~0.07 off the sheet."""
+    e = PolarisationEllipse(ET_EMR_PLANE_NORMAL, REFERENCE_TIME, FIDUCIAL)
+    e.fit_lock = True
+    r = PolarisationEllipseReparameterisation(
+        parameters="theta_jn", prior_bounds=[0.0, np.pi], ellipse=e,
+        adaptive_width=True, width_min_points=200,
+    )
+    ra, dec, cs, rng = _narrow_band_sky(e)
+    a = np.abs(cs)
+    ct = np.sign(cs) * (a - 0.3 * (a - 0.225)) + rng.normal(0.0, 0.003, len(a))
+    r.update(structured(np.arccos(ct), ra, dec))
+    assert e.lock_slope > 0.98
+    # the residual about the fitted centre stays as tight as the sheet
+    resid = np.arccos(ct) - np.arccos(e.lock_centre(cs))
+    assert 1.4826 * np.median(np.abs(resid - np.median(resid))) < 0.01
+
+
+def test_width_without_a_fan_keeps_the_residual_scale():
+    """With no fan (corr below width_min_corr) the width is the constant
+    robust spread of the residual, not 1: a tight sheet keeps its scale, so
+    the coordinate does not jump by the ratio of the two."""
+    e = PolarisationEllipse(ET_EMR_PLANE_NORMAL, REFERENCE_TIME, FIDUCIAL)
+    r = PolarisationEllipseReparameterisation(
+        parameters="theta_jn", prior_bounds=[0.0, np.pi], ellipse=e,
+        adaptive_width=True, width_min_points=200,
+    )
+    ra, dec, cs, rng = _narrow_band_sky(e, seed=1)
+    theta = np.arccos(cs) + rng.normal(0.0, 0.004, len(cs))
+    r.update(structured(theta, ra, dec))
+    s = e.residual_width(np.linspace(0.0, 1.0, 9))
+    assert np.allclose(s, s[0])
+    assert 0.0032 < s[0] < 0.0048
+
+
+def test_width_without_a_fan_is_at_most_one():
+    """Before the sheet locks (theta_jn independent of the sky) the constant
+    width is ~ the prior-wide spread, capped at 1."""
+    e = PolarisationEllipse(ET_EMR_PLANE_NORMAL, REFERENCE_TIME, FIDUCIAL)
+    r = PolarisationEllipseReparameterisation(
+        parameters="theta_jn", prior_bounds=[0.0, np.pi], ellipse=e,
+        adaptive_width=True, width_min_points=200,
+    )
+    ra, dec = random_sky(4000, seed=2)
+    theta = np.arccos(np.random.default_rng(3).uniform(-1, 1, 4000))
+    r.update(structured(theta, ra, dec))
+    s = e.residual_width(np.linspace(0.0, 1.0, 9))
+    assert np.allclose(s, s[0])
+    assert 0.4 < s[0] <= 1.0
