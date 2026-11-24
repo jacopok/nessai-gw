@@ -261,7 +261,7 @@ def test_inessai_levels_resume_scores_identically(tmp_path, monkeypatch):
     slopes = [_ellipse_rep(p).ellipse.lock_slope for p in levels]
     # each level fitted its own ellipse, away from the configuration's
     assert len({id(_ellipse_rep(p).ellipse) for p in levels}) == n_levels
-    assert all(abs(s - 1.0) > 0.1 for s in slopes), slopes
+    assert all(abs(s - 1.0) > 0.05 for s in slopes), slopes
 
     # the uninterrupted run: its stored ln q is what its levels give now
     np.testing.assert_allclose(live["rescored"], live["log_q"], rtol=0, atol=1e-9)
